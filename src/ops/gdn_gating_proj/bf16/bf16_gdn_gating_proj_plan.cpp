@@ -127,11 +127,41 @@ bool cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t
     return grid_ctas <= resident_ctas;
 }
 
+// Runtime residency check that uses the actual device SM count instead of hardcoded RTX 5090 values.
+// Split32 admits 2 CTAs/SM; all other cooperative schedules admit 4 CTAs/SM.
+static bool runtime_cooperative_grid_is_resident(Bf16GdnGatingScheduleId schedule,
+                                                 std::int32_t cols, std::int32_t tile_cols,
+                                                 std::int32_t row_tiles, int sm_count) noexcept {
+    const std::int64_t column_tiles =
+        (static_cast<std::int64_t>(cols) + tile_cols - 1) / tile_cols;
+    const std::int64_t grid_ctas =
+        column_tiles * row_tiles * static_cast<std::int64_t>(schedule_split_k(schedule));
+    const std::int32_t max_ctas =
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? sm_count * 2 : sm_count * 4;
+    return grid_ctas <= max_ctas;
+}
+
+static int device_sm_count() noexcept {
+    static int cached = -1;
+    if (cached < 0) {
+        cudaDeviceProp prop;
+        if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess) {
+            cached = prop.multiProcessorCount;
+        } else {
+            cached = 170; // fallback to RTX 5090 value
+        }
+    }
+    return cached;
+}
+
 bool cooperative_27_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
     // BN128 uses 40 KiB of dynamic shared memory. Split8 uses 71 registers with 256 threads;
     // split4/2 use 62 registers with 512 threads. Each specialization admits two CTAs/SM, hence
-    // 340 resident CTAs device-wide. There are three 16-row tiles per token tile.
-    return cooperative_grid_is_resident(schedule, cols, 128, 3, 340);
+    // 340 resident CTAs device-wide on RTX 5090. There are three 16-row tiles per token tile.
+    // Use runtime SM count for cross-GPU correctness.
+    int sm = device_sm_count();
+    const std::int32_t resident_ctas = sm * 2; // Split8 admits 2 CTAs/SM
+    return cooperative_grid_is_resident(schedule, cols, 128, 3, resident_ctas);
 }
 
 bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int32_t cols) noexcept {
@@ -139,8 +169,10 @@ bool cooperative_35_grid_is_resident(Bf16GdnGatingScheduleId schedule, std::int3
     // 13.1/sm_120a build, split32 uses 91/93 registers per thread and admits two CTAs/SM;
     // split16/8/4/2 use at most 62 registers and admit four CTAs/SM. Across 170 SMs the
     // device-wide limits are 340 and 680 CTAs respectively.
+    // Use runtime SM count for cross-GPU correctness.
+    int sm = device_sm_count();
     const std::int32_t resident_ctas =
-        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? 340 : 680;
+        schedule == Bf16GdnGatingScheduleId::MmaCooperativeSplit32 ? sm * 2 : sm * 4;
     return cooperative_grid_is_resident(schedule, cols, 64, 2, resident_ctas);
 }
 
@@ -395,19 +427,67 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         throw std::invalid_argument(
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
+
+    // Build the ordered schedule list for this problem variant.
+    // Most cooperative (highest split_k) to least (Unsplit = split_k 1).
+    std::array<Bf16GdnGatingScheduleId, 6> fallback_chain{};
+    std::size_t chain_len = 0;
+
+    if (is_27(problem)) {
+        fallback_chain = {{
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
+            Bf16GdnGatingScheduleId::MmaUnsplit,
+        }};
+        chain_len = 4;
+    } else {
+        fallback_chain = {{
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit16,
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
+            Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
+            Bf16GdnGatingScheduleId::MmaUnsplit,
+        }};
+        chain_len = 5;
+    }
+
+    // Find which schedule the route table selects for this problem's cols.
+    Bf16GdnGatingScheduleId preferred = Bf16GdnGatingScheduleId::MmaUnsplit;
     if (is_27(problem)) {
         for (const RouteSpec& route : k27Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                preferred = route.schedule;
+                break;
             }
         }
     } else {
         for (const RouteSpec& route : k35Routes) {
             if (route.cols.contains(problem.cols)) {
-                return bf16_gdn_gating_resolve_candidate(route.schedule, problem);
+                preferred = route.schedule;
+                break;
             }
         }
     }
+
+    // Try preferred schedule first, then fall back to less-cooperative schedules.
+    // This ensures we pick the most aggressive schedule that fits the current GPU.
+    bool tried_preferred = false;
+    for (std::size_t i = 0; i < chain_len; ++i) {
+        Bf16GdnGatingScheduleId s = fallback_chain[i];
+        if (s == preferred && !tried_preferred) {
+            tried_preferred = true;
+        } else if (s != preferred) {
+            continue;
+        }
+        try {
+            return bf16_gdn_gating_resolve_candidate(s, problem);
+        } catch (const std::invalid_argument&) {
+            // Schedule not legal for this problem on this device (e.g. residency limit).
+            // Continue to next fallback.
+        }
+    }
+
     throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
 }
 
