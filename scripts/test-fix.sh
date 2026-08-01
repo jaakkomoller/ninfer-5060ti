@@ -118,7 +118,7 @@ detect_model_id() {
     # Using the wrong id makes every request 404, so detect it from the log.
     local log
     log=$(cat "$NINFER_DIR/serve.log" 2>/dev/null || true)
-    MODEL_ID=$(echo "$log" | grep -o 'model id: [^)]*' | head -1 | sed 's/^model id: //' || true)
+    MODEL_ID=$(echo "$log" | grep -o 'model id: [^,)]*' | head -1 | sed 's/^model id: //' || true)
     if [ -z "$MODEL_ID" ]; then
         warn "Could not detect model id from serve.log; defaulting to 'qwen3.6-27b'"
         MODEL_ID="qwen3.6-27b"
@@ -130,7 +130,7 @@ run_inference_test() {
     local prompt="$1"
     local expected_pattern="$2"
     local test_name="$3"
-    local max_tokens="${4:-128}"
+    local max_tokens="${4:-512}"
 
     info "Running test: $test_name"
     info "Prompt: ${prompt:0:80}..."
@@ -157,7 +157,11 @@ run_inference_test() {
     fi
 
     local content
-    content=$(echo "$response" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || true)
+    content=$(echo "$response" | python3 -c "
+import sys, json
+msg = json.load(sys.stdin)['choices'][0]['message']
+print((msg.get('content') or '') + (msg.get('reasoning_content') or ''))
+" 2>/dev/null || true)
 
     if [ -z "$content" ]; then
         fail "Test '$test_name': Empty response"
