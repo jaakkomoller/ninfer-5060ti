@@ -37,6 +37,29 @@ token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixt
 seeds after one warm-up. The registered targets are reported independently and are not
 cross-target comparisons. The two 27B weight profiles are reported separately.
 
+### RTX 5060 Ti
+
+This branch also runs on an NVIDIA GeForce RTX 5060 Ti (16 GB). The cooperative-launch CTA
+residency checks that were hardcoded for the RTX 5090's 170 SMs are now resolved from the device's
+`multiProcessorCount`, and a cooperative schedule steps down to a less-aggressive split when the
+grid would not be resident. The RTX 5090 path is unchanged; the RTX 5090 numbers below are the
+published reference measurements.
+
+**Qwen3.5-9B (`groupwise-int`) on RTX 5060 Ti**
+
+Single-run verification through the OpenAI-compatible serving route with INT8 KV, a 4,096-token
+prefill chunk, a 262,144-token max context, MTP with 3 draft tokens, and greedy sampling:
+
+| Prompt tokens | Prefill tok/s | Decode tok/s | MTP acceptance | Note |
+|---:|---:|---:|---:|---|
+| 25,602 | 2,614.6 | 119.4 | 83.3% (3.50 tok/round) | cold cache, 200 gen |
+| 25,602 | — (cache hit) | 112.8 | 76.6% (3.30 tok/round) | warm prefix (25,600 cached), 1,500 gen |
+| 25,604 | 2,598.8 | 105.5 | 68.8% (3.06 tok/round) | thinking off, 50 gen |
+
+A 25,604-token needle-in-haystack request retrieved the planted code correctly with thinking
+disabled, confirming long-context correctness on this GPU. These are single-run measurements taken
+on a 40-SM consumer card, not the five-seed methodology used for the RTX 5090 tables above.
+
 **Qwen3.5-9B (`groupwise-int`)**
 
 - Greedy short-prompt serving (no speculation): **~793 prefill tok/s** and **~241 decode tok/s**.
@@ -89,7 +112,8 @@ notes.
 NInfer currently requires:
 
 - 64-bit Linux;
-- NVIDIA GeForce RTX 5090 (`sm_120a`);
+- NVIDIA GeForce RTX 5090 or RTX 5060 Ti (`sm_120a`); cooperative schedules are sized from the
+  device's SM count at runtime, so other `sm_120a` Blackwell GPUs are expected to work as well;
 - NVIDIA driver support for CUDA 13.1 and the CUDA Toolkit 13.1 or newer;
 - CMake 3.28 or newer and a C++20-capable host compiler;
 - `pkg-config`;
@@ -269,7 +293,8 @@ All registered model targets support:
 ## Current limits
 
 - Only the model targets listed above are accepted product targets.
-- Execution is specialized for one RTX 5090 and one CUDA device.
+- Execution is specialized for one Blackwell GPU and one CUDA device. Verified on the RTX 5090 and
+  RTX 5060 Ti (16 GB); other `sm_120a` devices are supported but not yet verified.
 - One Engine owns one resident sequence and runs one active request at a time.
 - Continuous batching, multi-GPU execution, CPU/GPU offload, and distributed serving are not
   implemented.
