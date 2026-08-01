@@ -107,6 +107,21 @@ Qwen3_6_27BInstance::Qwen3_6_27BInstance(std::unique_ptr<LoadedQwen3_6_27B> stab
 
 Qwen3_6_27BInstance::~Qwen3_6_27BInstance() = default;
 
+LoadedQwen3_5_9B::LoadedQwen3_5_9B(std::unique_ptr<Qwen3_5_9B::LoadedModel> stable_model)
+    : model(std::move(stable_model)), frontend(Qwen3_5_9B::make_frontend(*model)) {}
+
+LoadedQwen3_5_9B::~LoadedQwen3_5_9B() = default;
+
+Qwen3_5_9BInstance::Qwen3_5_9BInstance(std::unique_ptr<LoadedQwen3_5_9B> stable_loaded,
+                                        Qwen3_5_9B::SequencePlan sequence_plan,
+                                        DeviceContext& device)
+    : loaded(std::move(stable_loaded)),
+      request_memory(device, sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
+      program(Qwen3_5_9B::create_program(*loaded->model, std::move(sequence_plan), device)) {}
+
+Qwen3_5_9BInstance::~Qwen3_5_9BInstance() = default;
+
 LoadedQwen3_6_35BA3B::LoadedQwen3_6_35BA3B(
     std::unique_ptr<Qwen3_6_35BA3B::LoadedModel> stable_model)
     : model(std::move(stable_model)), frontend(Qwen3_6_35BA3B::make_frontend(*model)) {}
@@ -129,6 +144,10 @@ ConstructedTarget construct_target(const EngineOptions& options, DeviceContext& 
 
     artifact::Reader reader(options.artifact_path);
     const auto& identity = reader.identity();
+    if (identity.model_id == Qwen3_5_9B::model_id) {
+        return construct_registered<Qwen3_5_9B, LoadedQwen3_5_9B, Qwen3_5_9BInstance>(
+            options, device, reader, load_start);
+    }
     if (identity.model_id == Qwen3_6_27B::model_id) {
         return construct_registered<Qwen3_6_27B, LoadedQwen3_6_27B, Qwen3_6_27BInstance>(
             options, device, reader, load_start);

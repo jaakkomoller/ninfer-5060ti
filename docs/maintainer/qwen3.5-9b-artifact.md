@@ -1,0 +1,513 @@
+# Qwen3.5-9B Artifact Reference
+
+This reference defines the complete `.ninfer` object inventory for `qwen3.5-9b`: object
+names, order, shapes, numeric formats, storage layouts, fused row order, aliases, frontend
+resources, and source-to-object transforms. Common framing is defined in
+[`artifact-container.md`](artifact-container.md), numeric semantics in
+[`tensor-formats.md`](tensor-formats.md), byte packing in
+[`storage-layouts.md`](storage-layouts.md), and model mathematics in
+[`qwen3.5-9b-model.md`](qwen3.5-9b-model.md).
+
+## 1. Artifact identity and contents
+
+The registered hierarchical artifact identity is:
+
+```text
+qwen3.5-9b / groupwise-int
+```
+
+The source/tool/compiled target key is:
+
+```text
+qwen3_5_9b
+```
+
+Every conforming artifact is one complete product image containing Text, the optimized proposal
+head, MTP, Vision, and the six frontend resources in this document.
+
+## 2. Fixed target facts
+
+All matrix shapes use logical `[N,K] = [output rows,input columns]` notation. Quantization groups
+along `K`.
+
+| Fact | Value |
+|---|---:|
+| vocabulary matrix rows | 248320 |
+| tokenizer-addressable IDs | 248077 (`0..248076`) |
+| Text hidden width | 4096 |
+| Text layers | 32 |
+| full-attention layers | 8 |
+| GDN layers | 24 |
+| query heads / KV heads / head width | 16 / 4 / 256 |
+| query / output-gate / K / V widths | 4096 / 4096 / 512 / 512 |
+| GDN Q/K heads x width | 16 x 128 = 2048 |
+| GDN V heads x width | 32 x 128 = 4096 |
+| GDN Q/K/V / Z widths | 8192 / 4096 |
+| GDN convolution channels / retained taps | 8192 / 3 |
+| MLP intermediate width | 12288 |
+| MTP layers | 1 full-attention dense layer |
+| optimized draft-head rows | 131072 |
+| Vision depth / hidden / intermediate | 27 / 1152 / 4304 |
+| Vision heads / patch input | 16 / 1536 |
+| Vision merger input / output | 4608 / 4096 |
+| native context capacity | 262144 |
+
+Full-attention Text layers are:
+
+```text
+3, 7, 11, 15, 19, 23, 27, 31
+```
+
+Every other Text layer is GDN. Layer numbers in object names are unpadded decimal integers.
+
+The frontend token domain is `0..248076`. Both vocabulary matrices retain 248320 rows.
+
+## 3. Numeric formats and physical row order
+
+### 3.1 Format assignment
+
+| Role | Format |
+|---|---|
+| token embedding | `Q6G64_F16S` |
+| full output head | `Q6G64_F16S` |
+| full-attention query/key | `Q4G64_F16S` |
+| full-attention gate/value and output | `Q5G64_F16S` |
+| GDN query/key | `Q4G64_F16S` |
+| GDN value/z and output | `Q5G64_F16S` |
+| Text MLP gate/up | `Q4G64_F16S` |
+| Text MLP down | `Q5G64_F16S` |
+| Text norms, GDN convolution, and GDN A/B projections | `BF16` |
+| GDN `A_log` and `dt_bias` | `FP32` |
+| optimized MTP draft head | `Q4G64_F16S` |
+| optimized MTP draft-head id map | `I32` |
+| MTP matrices | `W8G32_F16S` |
+| MTP norms | `BF16` |
+| Vision block input/expansion matrices | `Q4G64_F16S` |
+| Vision block output/contraction matrices | `Q5G64_F16S` |
+| Vision patch projection | `Q6G64_F16S` |
+| Vision merger matrices | `W8G32_F16S` |
+| all other Vision weights and biases | `BF16` |
+
+Every quantized tensor uses encoder profile `MAXABS_F16_RECIP_RNE_V1` and storage layout
+`row-split-k128-v1`. Every direct tensor uses `contiguous-le-v1`.
+
+### 3.2 Fused row order
+
+The following concatenations define physical output-row order:
+
+- full-attention `query_key`: `[query,key]`;
+- full-attention `gate_value`: `[output_gate,value]`;
+- GDN `query_key`: `[query,key]`;
+- GDN `value_z`: `[value,z]`;
+- Text and MTP MLP input: `[gate,up]`;
+- MTP attention input: `[query,key,output_gate,value]`.
+
+Within every source full-attention q-projection, each of the 16 heads stores
+`[query_256,output_gate_256]`. The converter separates those per-head halves before constructing
+the artifact parents.
+
+`gdn/value_z` is one quantized parent. Its code and scale planes cover the complete
+`[8192,4096]` parent in `[value,z]` row order.
+
+Every GDN convolution is stored tap-major as `[4,8192]`.
+
+## 4. Object namespace, order, and frontend resources
+
+### 4.1 Namespace and writer order
+
+- `text/` contains the embedding, 32 Text layers, final norm, full output head, and optimized MTP
+  draft head.
+- `mtp/` contains MTP-private tensors.
+- `vision/` contains the Vision tower and merger.
+- `frontend/` contains the six raw frontend resources.
+
+Objects are written in this order:
+
+1. the six frontend resources in Section 4.2;
+2. `text/token_embedding`;
+3. Text layers `0..31`, using the applicable object order in Sections 5.2 and 5.3;
+4. `text/final_norm` and `text/output_head`;
+5. `text/draft_head` and `text/draft_head_token_ids`;
+6. the twelve MTP tensors in Section 6;
+7. the Vision stem, blocks `0..26`, and merger in Section 7.
+
+Readers bind by name. Object names contain no format spelling.
+
+### 4.2 Frontend resources
+
+The artifact contains exactly these `raw-bytes-v1` resources:
+
+| Order | Object name | Source filename | Meaning |
+|---:|---|---|---|
+| 0 | `frontend/tokenizer.json` | `tokenizer.json` | base BPE vocabulary, merges, token bytes, and its added-token subset |
+| 1 | `frontend/tokenizer_config.json` | `tokenizer_config.json` | complete added-token decoder, prefix, and special-token policy |
+| 2 | `frontend/chat_template.jinja` | `chat_template.jinja` | registered Qwen template |
+| 3 | `frontend/generation_config.json` | `generation_config.json` | default stop ids |
+| 4 | `frontend/preprocessor_config.json` | `preprocessor_config.json` | image preprocessing limits and constants |
+| 5 | `frontend/video_preprocessor_config.json` | `video_preprocessor_config.json` | video sampling and preprocessing |
+
+The artifact retains these resource payloads byte-for-byte.
+
+## 5. Text and optimized MTP draft inventory
+
+### 5.1 Text-global objects
+
+| Order | Object name | Shape | Format |
+|---:|---|---|---|
+| 0 | `text/token_embedding` | `[248320,4096]` | `Q6G64_F16S` |
+| after all layers | `text/final_norm` | `[4096]` | `BF16` |
+| next | `text/output_head` | `[248320,4096]` | `Q6G64_F16S` |
+
+### 5.2 Full-attention Text layer
+
+For every full-attention layer `l` in Section 2, emit these nine objects:
+
+| Order | Object-name pattern | Shape | Format |
+|---:|---|---|---|
+| 0 | `text/layers/{l}/input_norm` | `[4096]` | `BF16` |
+| 1 | `text/layers/{l}/attention/query_key` | `[4608,4096]` | `Q4G64_F16S` |
+| 2 | `text/layers/{l}/attention/gate_value` | `[4608,4096]` | `Q5G64_F16S` |
+| 3 | `text/layers/{l}/attention/query_norm` | `[256]` | `BF16` |
+| 4 | `text/layers/{l}/attention/key_norm` | `[256]` | `BF16` |
+| 5 | `text/layers/{l}/attention/output` | `[4096,4096]` | `Q5G64_F16S` |
+| 6 | `text/layers/{l}/post_attention_norm` | `[4096]` | `BF16` |
+| 7 | `text/layers/{l}/mlp/gate_up` | `[24576,4096]` | `Q4G64_F16S` |
+| 8 | `text/layers/{l}/mlp/down` | `[4096,12288]` | `Q5G64_F16S` |
+
+### 5.3 GDN Text layer
+
+For every other layer `l` in `0..31`, emit these thirteen objects:
+
+| Order | Object-name pattern | Shape | Format |
+|---:|---|---|---|
+| 0 | `text/layers/{l}/input_norm` | `[4096]` | `BF16` |
+| 1 | `text/layers/{l}/gdn/a_log` | `[32]` | `FP32` |
+| 2 | `text/layers/{l}/gdn/dt_bias` | `[32]` | `FP32` |
+| 3 | `text/layers/{l}/gdn/convolution` | `[4,8192]` | `BF16` |
+| 4 | `text/layers/{l}/gdn/a_projection` | `[32,4096]` | `BF16` |
+| 5 | `text/layers/{l}/gdn/b_projection` | `[32,4096]` | `BF16` |
+| 6 | `text/layers/{l}/gdn/query_key` | `[2048,4096]` | `Q4G64_F16S` |
+| 7 | `text/layers/{l}/gdn/value_z` | `[8192,4096]` | `Q5G64_F16S` |
+| 8 | `text/layers/{l}/gdn/norm` | `[128]` | `BF16` |
+| 9 | `text/layers/{l}/gdn/output` | `[4096,4096]` | `Q5G64_F16S` |
+| 10 | `text/layers/{l}/post_attention_norm` | `[4096]` | `BF16` |
+| 11 | `text/layers/{l}/mlp/gate_up` | `[24576,4096]` | `Q4G64_F16S` |
+| 12 | `text/layers/{l}/mlp/down` | `[4096,12288]` | `Q5G64_F16S` |
+
+### 5.4 Optimized MTP draft head
+
+| Order | Object name | Shape | Format |
+|---:|---|---|---|
+| 0 | `text/draft_head` | `[131072,4096]` | `Q4G64_F16S` |
+| 1 | `text/draft_head_token_ids` | `[131072]` | `I32` |
+
+Row `i` of `text/draft_head` represents full-head row
+`text/draft_head_token_ids[i]`. The ids are unique and lie in `0..248076`.
+
+## 6. MTP inventory
+
+The MTP module contains exactly twelve physical objects:
+
+| Order | Object name | Shape | Format |
+|---:|---|---|---|
+| 0 | `mtp/input_projection` | `[4096,8192]` | `W8G32_F16S` |
+| 1 | `mtp/embedding_norm` | `[4096]` | `BF16` |
+| 2 | `mtp/hidden_norm` | `[4096]` | `BF16` |
+| 3 | `mtp/layer/input_norm` | `[4096]` | `BF16` |
+| 4 | `mtp/layer/attention/query_key_gate_value` | `[12288,4096]` | `W8G32_F16S` |
+| 5 | `mtp/layer/attention/query_norm` | `[256]` | `BF16` |
+| 6 | `mtp/layer/attention/key_norm` | `[256]` | `BF16` |
+| 7 | `mtp/layer/attention/output` | `[4096,4096]` | `W8G32_F16S` |
+| 8 | `mtp/layer/post_attention_norm` | `[4096]` | `BF16` |
+| 9 | `mtp/layer/mlp/gate_up` | `[24576,4096]` | `W8G32_F16S` |
+| 10 | `mtp/layer/mlp/down` | `[4096,12288]` | `W8G32_F16S` |
+| 11 | `mtp/final_norm` | `[4096]` | `BF16` |
+
+MTP token embedding, full output head, and optimized proposal head are aliases listed in
+Section 8.2.
+
+## 7. Vision inventory
+
+### 7.1 Vision stem
+
+| Order | Object name | Shape | Format |
+|---:|---|---|---|
+| 0 | `vision/patch_embedding` | `[1152,1536]` | `Q6G64_F16S` |
+| 1 | `vision/patch_embedding_bias` | `[1152]` | `BF16` |
+| 2 | `vision/position_embedding` | `[2304,1152]` | `BF16` |
+
+### 7.2 Vision transformer block
+
+For every block `b` in `0..26`, emit these twelve objects:
+
+| Order | Object-name pattern | Shape | Format |
+|---:|---|---|---|
+| 0 | `vision/layers/{b}/attention/qkv` | `[3456,1152]` | `Q4G64_F16S` |
+| 1 | `vision/layers/{b}/attention/qkv_bias` | `[3456]` | `BF16` |
+| 2 | `vision/layers/{b}/attention/output` | `[1152,1152]` | `Q5G64_F16S` |
+| 3 | `vision/layers/{b}/attention/output_bias` | `[1152]` | `BF16` |
+| 4 | `vision/layers/{b}/mlp/fc1` | `[4304,1152]` | `Q4G64_F16S` |
+| 5 | `vision/layers/{b}/mlp/fc1_bias` | `[4304]` | `BF16` |
+| 6 | `vision/layers/{b}/mlp/fc2` | `[1152,4304]` | `Q5G64_F16S` |
+| 7 | `vision/layers/{b}/mlp/fc2_bias` | `[1152]` | `BF16` |
+| 8 | `vision/layers/{b}/norm1/weight` | `[1152]` | `BF16` |
+| 9 | `vision/layers/{b}/norm1/bias` | `[1152]` | `BF16` |
+| 10 | `vision/layers/{b}/norm2/weight` | `[1152]` | `BF16` |
+| 11 | `vision/layers/{b}/norm2/bias` | `[1152]` | `BF16` |
+
+### 7.3 Vision merger
+
+| Order | Object name | Shape | Format |
+|---:|---|---|---|
+| 0 | `vision/merger/fc1` | `[4608,4608]` | `W8G32_F16S` |
+| 1 | `vision/merger/fc1_bias` | `[4608]` | `BF16` |
+| 2 | `vision/merger/fc2` | `[4096,4608]` | `W8G32_F16S` |
+| 3 | `vision/merger/fc2_bias` | `[4096]` | `BF16` |
+| 4 | `vision/merger/norm/weight` | `[1152]` | `BF16` |
+| 5 | `vision/merger/norm/bias` | `[1152]` | `BF16` |
+
+No Vision deep-stack object exists.
+
+## 8. Logical views and aliases
+
+### 8.1 Fused row views
+
+| Parent object | Logical role | Stored row selection | Shape |
+|---|---|---|---|
+| `text/layers/{l}/attention/query_key` | query | `[0,4096)` | `[4096,4096]` |
+| same | key | `[4096,4608)` | `[512,4096]` |
+| `text/layers/{l}/attention/gate_value` | output gate | `[0,4096)` | `[4096,4096]` |
+| same | value | `[4096,4608)` | `[512,4096]` |
+| `text/layers/{l}/gdn/query_key` | GDN query | `[0,2048)` | `[2048,4096]` |
+| same | GDN key | `[2048,4096)` | `[2048,4096]` |
+| `text/layers/{l}/gdn/value_z` | GDN value | `[0,4096)` | `[4096,4096]` |
+| same | GDN z | `[4096,8192)` | `[4096,4096]` |
+| `text/layers/{l}/mlp/gate_up` | MLP gate | `[0,12288)` | `[12288,4096]` |
+| same | MLP up | `[12288,24576)` | `[12288,4096]` |
+| `mtp/layer/attention/query_key_gate_value` | query | `[0,4096)` | `[4096,4096]` |
+| same | key | `[4096,4608)` | `[512,4096]` |
+| same | output gate | `[4608,8704)` | `[4096,4096]` |
+| same | value | `[8704,12288)` | `[512,4096]` |
+| `mtp/layer/mlp/gate_up` | MTP MLP gate | `[0,12288)` | `[12288,4096]` |
+| same | MTP MLP up | `[12288,24576)` | `[12288,4096]` |
+
+### 8.2 Aliases
+
+| Logical consumer role | Stored object or view |
+|---|---|
+| MTP token embedding | `text/token_embedding` |
+| MTP full output head | `text/output_head` |
+| MTP optimized proposal head | `text/draft_head` plus `text/draft_head_token_ids` |
+| GDN channel-major convolution | transpose view of the stored `[4,8192]` convolution |
+
+## 9. Inventory summary
+
+### 9.1 Object counts
+
+| Component | Derivation | Tensor objects |
+|---|---:|---:|
+| Text globals | embedding + final norm + full head | 3 |
+| full-attention Text layers | `8 x 9` | 72 |
+| GDN Text layers | `24 x 13` | 312 |
+| main Text excluding draft | `3 + 72 + 312` | 387 |
+| optimized MTP draft head | weight + id map | 2 |
+| MTP | fixed inventory | 12 |
+| Vision stem | fixed inventory | 3 |
+| Vision blocks | `27 x 12` | 324 |
+| Vision merger | fixed inventory | 6 |
+| Vision total | `3 + 324 + 6` | 333 |
+| all tensors | `387 + 2 + 12 + 333` | 734 |
+| frontend resources | fixed inventory | 6 |
+| complete artifact | `734 + 6` | 740 |
+
+### 9.2 Numeric-format counts
+
+| Format | Text | draft | MTP | Vision | Total |
+|---|---:|---:|---:|---:|---:|
+| `BF16` | 207 | 0 | 7 | 222 | 436 |
+| `FP32` | 48 | 0 | 0 | 0 | 48 |
+| `I32` | 0 | 1 | 0 | 0 | 1 |
+| `Q4G64_F16S` | 40 | 1 | 0 | 54 | 95 |
+| `Q5G64_F16S` | 61 | 0 | 0 | 54 | 115 |
+| `Q6G64_F16S` | 2 | 0 | 0 | 1 | 3 |
+| `W8G32_F16S` | 0 | 0 | 5 | 2 | 7 |
+| total | 387 | 2 | 12 | 333 | 734 |
+
+The artifact contains 442 direct tensors using `contiguous-le-v1` and 292 quantized tensors using
+`row-split-k128-v1`.
+
+## 10. Source identity and numeric conversion
+
+### 10.1 Source identity
+
+Text, optimized MTP draft-head, MTP, Vision, and frontend content come from
+`Qwen/Qwen3.5-9B` (latest revision). Tensor sources are resolved through
+`model.safetensors.index.json` and its four BF16 shards.
+
+The checkpoint contributes approximately 1500 BF16 source tensors. Sections 11 and 12 account
+for every checkpoint tensor and every artifact tensor. The six frontend files in Section 4.2 are
+retained under their exact source filenames.
+
+### 10.2 Direct tensors
+
+- `BF16` objects preserve source BF16 words after the specified concatenate, reshape, or transpose.
+- GDN `a_log` and `dt_bias` expand source BF16 values to `FP32`.
+- `text/draft_head_token_ids` is stored as `I32`.
+
+### 10.3 Quantized tensors
+
+For every quantized artifact object:
+
+1. complete the specified split, concatenate, or reshape as a contiguous logical `[N,K]` BF16
+   matrix;
+2. apply `MAXABS_F16_RECIP_RNE_V1` independently to every output row and every G32 or G64 group
+   along `K`;
+3. encode the resulting codes and binary16 scales with `row-split-k128-v1`.
+
+Groups do not cross output rows. Layout padding does not change the logical shape recorded in the
+artifact descriptor.
+
+## 11. Text source mapping
+
+Let:
+
+```text
+P(l) = model.language_model.layers.{l}.
+```
+
+### 11.1 Text globals
+
+| Artifact object | Source | Transform |
+|---|---|---|
+| `text/token_embedding` | `model.language_model.embed_tokens.weight [248320,4096]` | quantize Q6 |
+| `text/final_norm` | `model.language_model.norm.weight [4096]` | preserve BF16 |
+| `text/output_head` | `lm_head.weight [248320,4096]` | quantize Q6 |
+
+### 11.2 Full-attention source transform
+
+The source q-projection is `[8192,4096]` with per-head `[query_256,output_gate_256]` rows:
+
+```text
+qg    = q_proj.reshape(16,512,4096)
+query = qg[:,0:256,:].reshape(4096,4096)
+gate  = qg[:,256:512,:].reshape(4096,4096)
+```
+
+| Artifact suffix under `text/layers/{l}/` | Source under `P(l)` | Transform |
+|---|---|---|
+| `input_norm` | `input_layernorm.weight [4096]` | preserve BF16 |
+| `attention/query_key` | `self_attn.q_proj.weight`, `k_proj.weight [512,4096]` | form `[query,key]`, quantize Q4 |
+| `attention/gate_value` | `self_attn.q_proj.weight`, `v_proj.weight [512,4096]` | form `[output_gate,value]`, quantize Q5 |
+| `attention/query_norm` | `self_attn.q_norm.weight [256]` | preserve BF16 |
+| `attention/key_norm` | `self_attn.k_norm.weight [256]` | preserve BF16 |
+| `attention/output` | `self_attn.o_proj.weight [4096,4096]` | quantize Q5 |
+| `post_attention_norm` | `post_attention_layernorm.weight [4096]` | preserve BF16 |
+| `mlp/gate_up` | `mlp.gate_proj.weight`, `up_proj.weight`, each `[12288,4096]` | concatenate `[gate,up]`, quantize Q4 |
+| `mlp/down` | `mlp.down_proj.weight [4096,12288]` | quantize Q5 |
+
+### 11.3 GDN source transform
+
+The source `linear_attn.in_proj_qkv.weight [8192,4096]` row order is:
+
+```text
+query = [0,2048)
+key   = [2048,4096)
+value = [4096,8192)
+```
+
+| Artifact suffix under `text/layers/{l}/` | Source under `P(l)` | Transform |
+|---|---|---|
+| `input_norm` | `input_layernorm.weight [4096]` | preserve BF16 |
+| `gdn/a_log` | `linear_attn.A_log [32]` | expand to FP32 |
+| `gdn/dt_bias` | `linear_attn.dt_bias [32]` | expand to FP32 |
+| `gdn/convolution` | `linear_attn.conv1d.weight [8192,1,4]` | take `[:,0,:]`, transpose to `[4,8192]` |
+| `gdn/a_projection` | `linear_attn.in_proj_a.weight [32,4096]` | preserve BF16 |
+| `gdn/b_projection` | `linear_attn.in_proj_b.weight [32,4096]` | preserve BF16 |
+| `gdn/query_key` | `linear_attn.in_proj_qkv.weight` | take rows `[0,4096)`, quantize Q4 |
+| `gdn/value_z` | `linear_attn.in_proj_qkv.weight`, `linear_attn.in_proj_z.weight [4096,4096]` | concatenate `[value,z]`, quantize Q5 |
+| `gdn/norm` | `linear_attn.norm.weight [128]` | preserve BF16 |
+| `gdn/output` | `linear_attn.out_proj.weight [4096,4096]` | quantize Q5 |
+| `post_attention_norm` | `post_attention_layernorm.weight [4096]` | preserve BF16 |
+| `mlp/gate_up` | `mlp.gate_proj.weight`, `up_proj.weight`, each `[12288,4096]` | concatenate `[gate,up]`, quantize Q4 |
+| `mlp/down` | `mlp.down_proj.weight [4096,12288]` | quantize Q5 |
+
+### 11.4 Optimized MTP draft-head construction
+
+The fixed ranking source is:
+
+```text
+tools/freq_corpus/fixtures/ranking/ranking.train.counts.i64
+```
+
+Interpret the file as a little-endian I64 array with row width 248320 and use row 0. Padded rows
+`248077..248319` are not candidates. Select ids from `0..248076` as follows:
+
+1. form the ascending forced-id set from entries whose merged
+   `added_tokens_decoder[id].special` value is true;
+2. stable-sort all candidate ids by descending row-0 count, with ascending-id count ties;
+3. take the first `131072 - len(forced)` non-forced ids;
+4. append the ascending forced ids and stable-sort the result by descending count;
+5. require exactly 131072 unique ids in `0..248076`;
+6. store those ids as `I32` in `text/draft_head_token_ids`;
+7. gather the same ordered BF16 rows from `lm_head.weight` and quantize them to
+   `text/draft_head`.
+
+## 12. MTP and Vision source mapping
+
+### 12.1 MTP
+
+Let `M = mtp.layers.0.`. Apply the Text full-attention q/gate extraction.
+
+| Artifact object | Source | Transform |
+|---|---|---|
+| `mtp/input_projection` | `mtp.fc.weight [4096,8192]` | quantize W8 |
+| `mtp/embedding_norm` | `mtp.pre_fc_norm_embedding.weight [4096]` | preserve BF16 |
+| `mtp/hidden_norm` | `mtp.pre_fc_norm_hidden.weight [4096]` | preserve BF16 |
+| `mtp/layer/input_norm` | `M + input_layernorm.weight [4096]` | preserve BF16 |
+| `mtp/layer/attention/query_key_gate_value` | `M + self_attn.{q,k,v}_proj.weight` | form `[query,key,output_gate,value]`, quantize W8 |
+| `mtp/layer/attention/query_norm` | `M + self_attn.q_norm.weight [256]` | preserve BF16 |
+| `mtp/layer/attention/key_norm` | `M + self_attn.k_norm.weight [256]` | preserve BF16 |
+| `mtp/layer/attention/output` | `M + self_attn.o_proj.weight [4096,4096]` | quantize W8 |
+| `mtp/layer/post_attention_norm` | `M + post_attention_layernorm.weight [4096]` | preserve BF16 |
+| `mtp/layer/mlp/gate_up` | `M + mlp.gate_proj.weight`, `up_proj.weight`, each `[12288,4096]` | concatenate `[gate,up]`, quantize W8 |
+| `mtp/layer/mlp/down` | `M + mlp.down_proj.weight [4096,12288]` | quantize W8 |
+| `mtp/final_norm` | `mtp.norm.weight [4096]` | preserve BF16 |
+
+### 12.2 Vision
+
+All sources begin with `model.visual.`. The Vision inventory is identical to the shared
+Qwen3.6 family Vision backbone; only the merger output width differs (4096 vs 5120).
+
+| Artifact object | Source suffix | Transform |
+|---|---|---|
+| `vision/patch_embedding` | `patch_embed.proj.weight [1152,3,2,16,16]` | contiguous reshape to `[1152,1536]`, quantize Q6 |
+| `vision/patch_embedding_bias` | `patch_embed.proj.bias [1152]` | preserve BF16 |
+| `vision/position_embedding` | `pos_embed.weight [2304,1152]` | preserve BF16 |
+
+For block `b`, use source prefix `model.visual.blocks.{b}.`:
+
+| Artifact suffix under `vision/layers/{b}/` | Source suffix | Transform |
+|---|---|---|
+| `attention/qkv` | `attn.qkv.weight [3456,1152]` | quantize Q4 |
+| `attention/qkv_bias` | `attn.qkv.bias [3456]` | preserve BF16 |
+| `attention/output` | `attn.proj.weight [1152,1152]` | quantize Q5 |
+| `attention/output_bias` | `attn.proj.bias [1152]` | preserve BF16 |
+| `mlp/fc1` | `mlp.linear_fc1.weight [4304,1152]` | quantize Q4 |
+| `mlp/fc1_bias` | `mlp.linear_fc1.bias [4304]` | preserve BF16 |
+| `mlp/fc2` | `mlp.linear_fc2.weight [1152,4304]` | quantize Q5 |
+| `mlp/fc2_bias` | `mlp.linear_fc2.bias [1152]` | preserve BF16 |
+| `norm1/weight` | `norm1.weight [1152]` | preserve BF16 |
+| `norm1/bias` | `norm1.bias [1152]` | preserve BF16 |
+| `norm2/weight` | `norm2.weight [1152]` | preserve BF16 |
+| `norm2/bias` | `norm2.bias [1152]` | preserve BF16 |
+
+For source prefix `model.visual.merger.`:
+
+| Artifact suffix under `vision/merger/` | Source suffix | Transform |
+|---|---|---|
+| `fc1` | `linear_fc1.weight [4608,4608]` | quantize W8 |
+| `fc1_bias` | `linear_fc1.bias [4608]` | preserve BF16 |
+| `fc2` | `linear_fc2.weight [4096,4608]` | quantize W8 |
+| `fc2_bias` | `linear_fc2.bias [4096]` | preserve BF16 |
+| `norm/weight` | `norm.weight [1152]` | preserve BF16 |
+| `norm/bias` | `norm.bias [1152]` | preserve BF16 |
