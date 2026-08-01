@@ -428,31 +428,23 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
             "BF16 GDN gating: exact problem or column count is not admitted");
     }
 
-    // Build the ordered schedule list for this problem variant.
-    // Most cooperative (highest split_k) to least (Unsplit = split_k 1).
-    std::array<Bf16GdnGatingScheduleId, 6> fallback_chain{};
-    std::size_t chain_len = 0;
+    // Ordered most-aggressive to least-aggressive cooperative Mma schedules for this
+    // variant. MmaUnsplit (split_k 1, no cooperative launch) is always legal and is
+    // used as a guaranteed terminal fallback below.
+    const std::array<Bf16GdnGatingScheduleId, 4> cooperative_chain =
+        is_27(problem)
+            ? std::array<Bf16GdnGatingScheduleId, 4>{
+                  {Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
+                   Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
+                   Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
+                   Bf16GdnGatingScheduleId::MmaUnsplit}}
+            : std::array<Bf16GdnGatingScheduleId, 4>{
+                  {Bf16GdnGatingScheduleId::MmaCooperativeSplit16,
+                   Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
+                   Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
+                   Bf16GdnGatingScheduleId::MmaCooperativeSplit2}};
 
-    if (is_27(problem)) {
-        fallback_chain = {{
-            Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
-            Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
-            Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
-            Bf16GdnGatingScheduleId::MmaUnsplit,
-        }};
-        chain_len = 4;
-    } else {
-        fallback_chain = {{
-            Bf16GdnGatingScheduleId::MmaCooperativeSplit16,
-            Bf16GdnGatingScheduleId::MmaCooperativeSplit8,
-            Bf16GdnGatingScheduleId::MmaCooperativeSplit4,
-            Bf16GdnGatingScheduleId::MmaCooperativeSplit2,
-            Bf16GdnGatingScheduleId::MmaUnsplit,
-        }};
-        chain_len = 5;
-    }
-
-    // Find which schedule the route table selects for this problem's cols.
+    // Find the schedule the route table prefers for this problem's cols.
     Bf16GdnGatingScheduleId preferred = Bf16GdnGatingScheduleId::MmaUnsplit;
     if (is_27(problem)) {
         for (const RouteSpec& route : k27Routes) {
@@ -470,25 +462,30 @@ Bf16GdnGatingPlan bf16_gdn_gating_resolve_plan(const Bf16GdnGatingProblem& probl
         }
     }
 
-    // Try preferred schedule first, then fall back to less-cooperative schedules.
-    // This ensures we pick the most aggressive schedule that fits the current GPU.
-    bool tried_preferred = false;
-    for (std::size_t i = 0; i < chain_len; ++i) {
-        Bf16GdnGatingScheduleId s = fallback_chain[i];
-        if (s == preferred && !tried_preferred) {
-            tried_preferred = true;
-        } else if (s != preferred) {
-            continue;
-        }
-        try {
-            return bf16_gdn_gating_resolve_candidate(s, problem);
-        } catch (const std::invalid_argument&) {
-            // Schedule not legal for this problem on this device (e.g. residency limit).
-            // Continue to next fallback.
-        }
+    // Non-cooperative schedules (Gemv/SmallT) or Unsplit carry no residency constraint.
+    if (!schedule_uses_mma(preferred) ||
+        preferred == Bf16GdnGatingScheduleId::MmaUnsplit) {
+        return bf16_gdn_gating_resolve_candidate(preferred, problem);
     }
 
-    throw std::logic_error("BF16 GDN gating: admitted problem has no covering route");
+    // Cooperative schedule: find its index in the chain, then step DOWN from there
+    // toward less-aggressive schedules until one fits this device's SM count.
+    // MmaUnsplit is guaranteed to fit and terminates the search.
+    std::size_t start = cooperative_chain.size();
+    for (std::size_t i = 0; i < cooperative_chain.size(); ++i) {
+        if (cooperative_chain[i] == preferred) {
+            start = i;
+            break;
+        }
+    }
+    for (std::size_t i = start; i < cooperative_chain.size(); ++i) {
+        try {
+            return bf16_gdn_gating_resolve_candidate(cooperative_chain[i], problem);
+        } catch (const std::invalid_argument&) {
+            // Residency check failed for this schedule on the current device; step down.
+        }
+    }
+    return bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId::MmaUnsplit, problem);
 }
 
 std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::int32_t input_rows,
