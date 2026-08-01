@@ -68,6 +68,20 @@ Q4Launch select_q4_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             break;
         }
         break;
+    case 4096:
+        switch (n) {
+        case 24576:
+            if (t == 1) { return launch_q4_gemv_r1_w8_direct; }
+            if (t <= 4) { return launch_q4_simt_r8_c4; }
+            if (t <= 16) { return launch_q4_simt_r8_c8; }
+            return launch_q4_mma_r64_c128;
+        case 131072:
+            if (t == 1) { return launch_q4_gemv_r4_w1_direct; }
+            return launch_q4_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
     default:
         break;
     }

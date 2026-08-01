@@ -22,6 +22,14 @@ Q6Launch select_q6_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_q6_mma_r64_c128;
         }
         break;
+    case 4096:
+        if (n == 248320) {
+            if (t <= 4) { return launch_q6_simt_r8_c4; }
+            if (t <= 8) { return launch_q6_simt_r8_c8; }
+            if (t <= 64) { return launch_q6_mma_r64_c64; }
+            return launch_q6_mma_r64_c128;
+        }
+        break;
     case 1536:
         if (n == 1152) {
             if (t < 4 || t > 131072 || (t % 4) != 0) { break; }

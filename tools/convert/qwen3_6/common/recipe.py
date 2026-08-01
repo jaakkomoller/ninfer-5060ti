@@ -103,8 +103,8 @@ class SourcePreflight:
     source_dtype_counts: dict[str, int]
 
 
-def source(name: str, shape: tuple[int, ...]) -> SourceTensor:
-    return SourceTensor(name=name, shape=shape)
+def source(name: str, shape: tuple[int, ...], *, dtype: str = SOURCE_DTYPE) -> SourceTensor:
+    return SourceTensor(name=name, shape=shape, dtype=dtype)
 
 
 def attention_qproj_part(
@@ -364,9 +364,11 @@ def materialize_expression(
 
     if isinstance(expression, Cast):
         tensor = materialize_expression(expression.source, reader, derived_tensors)
-        if expression.dtype != FP32:
-            raise ValueError(f"unsupported direct cast target {expression.dtype}")
-        return tensor.to(torch.float32)
+        if expression.dtype == FP32:
+            return tensor.to(torch.float32)
+        if expression.dtype == "BF16":
+            return tensor.to(torch.bfloat16)
+        raise ValueError(f"unsupported direct cast target {expression.dtype}")
 
     if isinstance(expression, DraftHeadTokenIds):
         if derived_tensors is None or "text/draft_head_token_ids" not in derived_tensors:

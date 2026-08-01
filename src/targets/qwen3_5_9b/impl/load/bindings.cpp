@@ -75,8 +75,8 @@ load_attention_projection(const FullAttentionPlan& plan,
                           const artifact::MaterializedArtifact& materialized) {
     const auto* split = std::get_if<SplitAttentionProjectionPlan>(&plan.projection);
     return SplitAttentionProjectionPayload{
-        .query_key  = materialized_weight(materialized, split->query_key, 4608, 4096),
-        .gate_value = materialized_weight(materialized, split->gate_value, 4608, 4096),
+        .query_key  = materialized_weight(materialized, split->query_key, 5120, 4096),
+        .gate_value = materialized_weight(materialized, split->gate_value, 5120, 4096),
     };
 }
 
@@ -84,7 +84,7 @@ GdnInputProjectionPayload
 load_gdn_input_projection(const GdnPlan& plan, const artifact::MaterializedArtifact& materialized) {
     const auto* split = std::get_if<SplitGdnInputProjectionPlan>(&plan.input_projection);
     return SplitGdnInputProjectionPayload{
-        .query_key = materialized_weight(materialized, split->query_key, 2048, 4096),
+        .query_key = materialized_weight(materialized, split->query_key, 4096, 4096),
         .value_z   = materialized_weight(materialized, split->value_z, 8192, 4096),
     };
 }
@@ -99,9 +99,9 @@ void bind_text_layers(artifact::Binder& binder, BindingPlan& out) {
         if (target.is_full_attention) {
             target.attention.projection = SplitAttentionProjectionPlan{
                 .query_key  = bind_weight(binder, prefix + "attention/query_key",
-                                          NumericFormat::Q4G64_F16S, {4608, 4096}),
+                                          NumericFormat::Q4G64_F16S, {5120, 4096}),
                 .gate_value = bind_weight(binder, prefix + "attention/gate_value",
-                                          NumericFormat::Q5G64_F16S, {4608, 4096}),
+                                          NumericFormat::Q5G64_F16S, {5120, 4096}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
@@ -122,7 +122,7 @@ void bind_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 binder, prefix + "gdn/b_projection", NumericFormat::BF16, {32, 4096});
             target.gdn.input_projection = SplitGdnInputProjectionPlan{
                 .query_key = bind_weight(binder, prefix + "gdn/query_key",
-                                         NumericFormat::Q4G64_F16S, {2048, 4096}),
+                                         NumericFormat::Q4G64_F16S, {4096, 4096}),
                 .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::Q5G64_F16S,
                                          {8192, 4096}),
             };
@@ -141,122 +141,110 @@ void bind_text_layers(artifact::Binder& binder, BindingPlan& out) {
 }
 
 RuntimeModelView build_runtime(BindingPlan const& plan,
-                                const artifact::MaterializedArtifact& materialized) {
+                               artifact::MaterializedArtifact& materialized) {
     RuntimeModelView view;
+    view.weights_arena = &materialized.device_arena();
+    view.features      = plan.features;
 
-    // Token embedding
+    auto& full_layers = view.full_layers;
+    auto& gdn_layers  = view.gdn_layers;
+
     view.token_embedding = materialized_weight(materialized, plan.token_embedding, 248320, 4096);
 
-    // Text layers
+    std::size_t full_index = 0;
+    std::size_t gdn_index  = 0;
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
-        auto& text_layer = view.text_layers[layer];
-        text_layer.input_norm =
-            Tensor{.data = materialized.device_data(plan.text_layers[layer].input_norm),
-                   .bytes = 4096 * 2};
-        text_layer.is_full_attention = plan.text_layers[layer].is_full_attention;
-
-        if (plan.text_layers[layer].is_full_attention) {
-            auto proj = load_attention_projection(
-                plan.text_layers[layer].attention, materialized);
-            text_layer.full_attention = std::get<SplitAttentionProjectionPayload>(proj);
-            text_layer.full_attention.query_norm.data =
-                materialized.device_data(plan.text_layers[layer].attention.query_norm);
-            text_layer.full_attention.key_norm.data =
-                materialized.device_data(plan.text_layers[layer].attention.key_norm);
+        const TextLayerPlan& source = plan.text_layers[layer];
+        if (source.is_full_attention) {
+            FullAttentionWeights& target = full_layers.at(full_index++);
+            target.input_norm            = artifact::materialized_tensor(
+                materialized, source.input_norm, NumericFormat::BF16, {4096});
+            target.projection = load_attention_projection(source.attention, materialized);
+            target.query_norm = artifact::materialized_tensor(
+                materialized, source.attention.query_norm, NumericFormat::BF16, {256});
+            target.key_norm = artifact::materialized_tensor(
+                materialized, source.attention.key_norm, NumericFormat::BF16, {256});
+            target.output = materialized_weight(materialized, source.attention.output, 4096, 4096);
+            target.post_attention_norm = artifact::materialized_tensor(
+                materialized, source.post_attention_norm, NumericFormat::BF16, {4096});
+            target.post_mixer = load_mlp(source.mlp, materialized);
         } else {
-            auto inp = load_gdn_input_projection(
-                plan.text_layers[layer].gdn, materialized);
-            text_layer.gdn.input_projection = inp;
-            text_layer.gdn.a_log.data = materialized.device_data(plan.text_layers[layer].gdn.a_log);
-            text_layer.gdn.dt_bias.data = materialized.device_data(plan.text_layers[layer].gdn.dt_bias);
-            text_layer.gdn.a_projection =
-                materialized_weight(materialized, plan.text_layers[layer].gdn.a_projection, 32, 4096);
-            text_layer.gdn.b_projection =
-                materialized_weight(materialized, plan.text_layers[layer].gdn.b_projection, 32, 4096);
-            text_layer.gdn.norm.data =
-                materialized.device_data(plan.text_layers[layer].gdn.norm);
-            text_layer.gdn.output =
-                materialized_weight(materialized, plan.text_layers[layer].gdn.output, 4096, 4096);
+            GdnWeights& target = gdn_layers.at(gdn_index++);
+            target.input_norm  = artifact::materialized_tensor(
+                materialized, source.input_norm, NumericFormat::BF16, {4096});
+            target.projection.a_log = artifact::materialized_tensor(
+                materialized, source.gdn.a_log, NumericFormat::FP32, {32});
+            target.projection.dt_bias = artifact::materialized_tensor(
+                materialized, source.gdn.dt_bias, NumericFormat::FP32, {32});
+            target.projection.a_projection = artifact::materialized_weight(
+                materialized, source.gdn.a_projection, NumericFormat::BF16, 32, 4096);
+            target.projection.b_projection = artifact::materialized_weight(
+                materialized, source.gdn.b_projection, NumericFormat::BF16, 32, 4096);
+            target.projection.input_projection =
+                load_gdn_input_projection(source.gdn, materialized);
+            target.convolution = artifact::materialized_tensor(
+                materialized, source.gdn.convolution, NumericFormat::BF16, {8192, 4});
+            target.norm = artifact::materialized_tensor(materialized, source.gdn.norm,
+                                                        NumericFormat::BF16, {128});
+            target.output = materialized_weight(materialized, source.gdn.output, 4096, 4096);
+            target.post_attention_norm = artifact::materialized_tensor(
+                materialized, source.post_attention_norm, NumericFormat::BF16, {4096});
+            target.post_mixer = load_mlp(source.mlp, materialized);
         }
-
-        text_layer.post_attention_norm.data =
-            materialized.device_data(plan.text_layers[layer].post_attention_norm);
-        text_layer.mlp = load_mlp(plan.text_layers[layer].mlp, materialized);
     }
-
-    // Final norm, output head, draft head
-    view.final_norm.data = materialized.device_data(plan.final_norm);
+    if (full_index != full_layers.size() || gdn_index != gdn_layers.size()) {
+        throw std::logic_error("text topology binding is incomplete");
+    }
+    view.final_norm  = artifact::materialized_tensor(materialized, plan.final_norm,
+                                                     NumericFormat::BF16, {4096});
     view.output_head = materialized_weight(materialized, plan.output_head, 248320, 4096);
-    view.draft_head = materialized_weight(materialized, plan.draft_head, 131072, 4096);
-    view.draft_head_token_ids.data =
-        materialized.device_data(plan.draft_head_token_ids);
 
-    // MTP
-    view.mtp.input_projection =
-        materialized_weight(materialized, plan.mtp.input_projection, 4096, 8192);
-    view.mtp.embedding_norm.data = materialized.device_data(plan.mtp.embedding_norm);
-    view.mtp.hidden_norm.data = materialized.device_data(plan.mtp.hidden_norm);
-    view.mtp.input_norm.data = materialized.device_data(plan.mtp.input_norm);
-    view.mtp.query_key_gate_value.data =
-        materialized.device_data(plan.mtp.query_key_gate_value);
-    view.mtp.query_norm.data = materialized.device_data(plan.mtp.query_norm);
-    view.mtp.key_norm.data = materialized.device_data(plan.mtp.key_norm);
-    view.mtp.output =
-        materialized_weight(materialized, plan.mtp.output, 4096, 4096);
-    view.mtp.post_attention_norm.data = materialized.device_data(plan.mtp.post_attention_norm);
-    view.mtp.mlp = load_mlp(plan.mtp.mlp, materialized);
-    view.mtp.final_norm.data = materialized.device_data(plan.mtp.final_norm);
-
-    // Vision
-    view.vision_backbone.patch_embedding =
-        materialized_weight(materialized, plan.vision_backbone.patch_embedding, 1152, 1536);
-    view.vision_backbone.patch_embedding_bias.data =
-        materialized.device_data(plan.vision_backbone.patch_embedding_bias);
-    view.vision_backbone.position_embedding =
-        materialized_weight(materialized, plan.vision_backbone.position_embedding, 2304, 1152);
-
-    for (std::size_t i = 0; i < 27; ++i) {
-        auto& block = view.vision_backbone.blocks[i];
-        std::string prefix = "vision/layers/" + std::to_string(i) + "/";
-        (void)prefix;
-        block.attention.qkv = materialized_weight(
-            materialized, plan.vision_backbone.blocks[i].attention.qkv, 3456, 1152);
-        block.attention.qkv_bias.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].attention.qkv_bias);
-        block.attention.output = materialized_weight(
-            materialized, plan.vision_backbone.blocks[i].attention.output, 1152, 1152);
-        block.attention.output_bias.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].attention.output_bias);
-        block.mlp.fc1 = materialized_weight(
-            materialized, plan.vision_backbone.blocks[i].mlp.fc1, 4304, 1152);
-        block.mlp.fc1_bias.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].mlp.fc1_bias);
-        block.mlp.fc2 = materialized_weight(
-            materialized, plan.vision_backbone.blocks[i].mlp.fc2, 1152, 4304);
-        block.mlp.fc2_bias.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].mlp.fc2_bias);
-        block.norm1.weight.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].norm1.weight);
-        block.norm1.bias.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].norm1.bias);
-        block.norm2.weight.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].norm2.weight);
-        block.norm2.bias.data =
-            materialized.device_data(plan.vision_backbone.blocks[i].norm2.bias);
+    if (plan.features.optimized_proposal()) {
+        auto& proposal     = view.optimized_proposal.emplace();
+        proposal.head      = artifact::materialized_weight(
+            materialized, plan.draft_head, NumericFormat::Q4G64_F16S, 131072, 4096);
+        proposal.token_ids = artifact::materialized_tensor(
+            materialized, plan.draft_head_token_ids, NumericFormat::I32, {131072});
     }
 
-    view.vision_merger.fc1 = materialized_weight(
-        materialized, plan.vision_merger_fc1, 4608, 4608);
-    view.vision_merger.fc1_bias.data =
-        materialized.device_data(plan.vision_merger_fc1_bias);
-    view.vision_merger.fc2 = materialized_weight(
-        materialized, plan.vision_merger_fc2, 4096, 4608);
-    view.vision_merger.fc2_bias.data =
-        materialized.device_data(plan.vision_merger_fc2_bias);
-    view.vision_merger.norm.weight.data =
-        materialized.device_data(plan.vision_merger_norm.weight);
-    view.vision_merger.norm.bias.data =
-        materialized.device_data(plan.vision_merger_norm.bias);
+    if (plan.features.mtp()) {
+        auto& mtp            = view.mtp.emplace();
+        mtp.input_projection = artifact::materialized_weight(
+            materialized, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 4096, 8192);
+        mtp.embedding_norm = artifact::materialized_tensor(materialized, plan.mtp.embedding_norm,
+                                                           NumericFormat::BF16, {4096});
+        mtp.hidden_norm = artifact::materialized_tensor(materialized, plan.mtp.hidden_norm,
+                                                        NumericFormat::BF16, {4096});
+        mtp.input_norm = artifact::materialized_tensor(materialized, plan.mtp.input_norm,
+                                                       NumericFormat::BF16, {4096});
+        mtp.attention.packed = artifact::materialized_weight(
+            materialized, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 10240, 4096);
+        mtp.attention.query       = row_view(mtp.attention.packed, 0, 4096);
+        mtp.attention.key         = row_view(mtp.attention.packed, 4096, 1024);
+        mtp.attention.output_gate = row_view(mtp.attention.packed, 5120, 4096);
+        mtp.attention.value       = row_view(mtp.attention.packed, 9216, 1024);
+        mtp.query_norm = artifact::materialized_tensor(materialized, plan.mtp.query_norm,
+                                                       NumericFormat::BF16, {256});
+        mtp.key_norm = artifact::materialized_tensor(materialized, plan.mtp.key_norm,
+                                                     NumericFormat::BF16, {256});
+        mtp.output = artifact::materialized_weight(
+            materialized, plan.mtp.output, NumericFormat::W8G32_F16S, 4096, 4096);
+        mtp.post_attention_norm = artifact::materialized_tensor(
+            materialized, plan.mtp.post_attention_norm, NumericFormat::BF16, {4096});
+        mtp.post_mixer = load_mlp(plan.mtp.mlp, materialized);
+        mtp.final_norm = artifact::materialized_tensor(materialized, plan.mtp.final_norm,
+                                                       NumericFormat::BF16, {4096});
+    }
+
+    if (plan.features.vision) {
+        auto& vision  = view.vision.emplace();
+        vision.common = qwen3_6::materialize_vision_common(
+            materialized, plan.vision_backbone, plan.vision_merger_input, plan.vision_merger_norm);
+        vision.merger_fc2 = artifact::materialized_weight(
+            materialized, plan.vision_merger_fc2, NumericFormat::W8G32_F16S, 4096, 4608);
+        vision.merger_fc2_bias = artifact::materialized_tensor(
+            materialized, plan.vision_merger_fc2_bias, NumericFormat::BF16, {4096});
+    }
 
     return view;
 }
@@ -273,7 +261,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features = features;
 
     // Frontend resources
-    out.frontend = qwen3_6::bind_frontend_resources(binder, features);
+    out.frontend = qwen3_6::bind_frontend_resources(binder);
 
     // Token embedding
     out.token_embedding = bind_weight(binder, "text/token_embedding",
@@ -291,60 +279,61 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                                    NumericFormat::Q6G64_F16S, {248320, 4096});
 
     // Draft head
-    out.draft_head = artifact::bind_device_tensor(binder, "text/draft_head",
-                                                   NumericFormat::Q4G64_F16S, {131072, 4096});
-    out.draft_head_token_ids = artifact::bind_device_tensor(binder,
-        "text/draft_head_token_ids", NumericFormat::I32, {131072});
+    const artifact::TensorPlacement proposal_placement =
+        features.optimized_proposal() ? artifact::TensorPlacement::Device
+                                      : artifact::TensorPlacement::ValidateOnly;
+    out.draft_head = artifact::bind_tensor(binder, "text/draft_head", NumericFormat::Q4G64_F16S,
+                                           {131072, 4096}, proposal_placement);
+    out.draft_head_token_ids = artifact::bind_tensor(
+        binder, "text/draft_head_token_ids", NumericFormat::I32, {131072}, proposal_placement);
 
     // MTP
-    out.mtp.input_projection = bind_weight(binder, "mtp/input_projection",
-                                            NumericFormat::W8G32_F16S, {4096, 8192});
-    out.mtp.embedding_norm = artifact::bind_device_tensor(binder, "mtp/embedding_norm",
-                                                           NumericFormat::BF16, {4096});
-    out.mtp.hidden_norm = artifact::bind_device_tensor(binder, "mtp/hidden_norm",
-                                                        NumericFormat::BF16, {4096});
-    out.mtp.input_norm = artifact::bind_device_tensor(binder, "mtp/layer/input_norm",
-                                                       NumericFormat::BF16, {4096});
-    out.mtp.query_key_gate_value = artifact::bind_device_tensor(
-        binder, "mtp/layer/attention/query_key_gate_value",
-        NumericFormat::W8G32_F16S, {12288, 4096});
-    out.mtp.query_norm = artifact::bind_device_tensor(binder, "mtp/layer/attention/query_norm",
-                                                       NumericFormat::BF16, {256});
-    out.mtp.key_norm = artifact::bind_device_tensor(binder, "mtp/layer/attention/key_norm",
-                                                     NumericFormat::BF16, {256});
-    out.mtp.output = bind_weight(binder, "mtp/layer/attention/output",
-                                  NumericFormat::W8G32_F16S, {4096, 4096});
-    out.mtp.post_attention_norm = artifact::bind_device_tensor(
-        binder, "mtp/layer/post_attention_norm", NumericFormat::BF16, {4096});
-    out.mtp.mlp.gate_up = bind_weight(binder, "mtp/layer/mlp/gate_up",
-                                       NumericFormat::W8G32_F16S, {24576, 4096});
-    out.mtp.mlp.down = bind_weight(binder, "mtp/layer/mlp/down",
-                                    NumericFormat::W8G32_F16S, {4096, 12288});
-    out.mtp.final_norm = artifact::bind_device_tensor(binder, "mtp/final_norm",
-                                                       NumericFormat::BF16, {4096});
+    const artifact::TensorPlacement mtp_placement = features.mtp()
+                                                        ? artifact::TensorPlacement::Device
+                                                        : artifact::TensorPlacement::ValidateOnly;
+    const auto bind_mtp = [&](std::string_view name, NumericFormat format,
+                              std::initializer_list<std::uint64_t> shape) {
+        return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
+    };
+    out.mtp.input_projection =
+        bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {4096, 8192});
+    out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {4096});
+    out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {4096});
+    out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {4096});
+    out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
+                                            NumericFormat::W8G32_F16S, {10240, 4096});
+    out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
+    out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
+    out.mtp.output =
+        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {4096, 4096});
+    out.mtp.post_attention_norm =
+        bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {4096});
+    out.mtp.mlp.gate_up = WeightPlan{
+        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {24576, 4096}),
+        .format = NumericFormat::W8G32_F16S};
+    out.mtp.mlp.down = WeightPlan{
+        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {4096, 12288}),
+        .format = NumericFormat::W8G32_F16S};
+    out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {4096});
 
     // Vision backbone
-    out.vision_backbone = qwen3_6::bind_vision_backbone(binder, features);
+    const artifact::TensorPlacement vision_placement =
+        features.vision ? artifact::TensorPlacement::Device
+                        : artifact::TensorPlacement::ValidateOnly;
+    out.vision_backbone = qwen3_6::bind_vision_backbone(binder, vision_placement);
 
     // Vision merger
-    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, features);
-    out.vision_merger_fc1 = artifact::bind_device_tensor(
-        binder, "vision/merger/fc1", NumericFormat::W8G32_F16S, {4608, 4608});
-    out.vision_merger_fc1_bias = artifact::bind_device_tensor(
-        binder, "vision/merger/fc1_bias", NumericFormat::BF16, {4608});
-    out.vision_merger_fc2 = artifact::bind_device_tensor(
-        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {4096, 4608});
-    out.vision_merger_fc2_bias = artifact::bind_device_tensor(
-        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {4096});
-    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, features);
+    out.vision_merger_input = qwen3_6::bind_vision_merger_input(binder, vision_placement);
+    out.vision_merger_fc2 = artifact::bind_tensor(
+        binder, "vision/merger/fc2", NumericFormat::W8G32_F16S, {4096, 4608}, vision_placement);
+    out.vision_merger_fc2_bias = artifact::bind_tensor(
+        binder, "vision/merger/fc2_bias", NumericFormat::BF16, {4096}, vision_placement);
+    out.vision_merger_norm = qwen3_6::bind_vision_merger_norm(binder, vision_placement);
 
     // Materialization plan
     ArtifactLoadPlan plan;
     plan.bindings = out;
-
-    for (auto& spec : plan.bindings) {
-        plan.materialization |= spec;
-    }
+    plan.materialization = binder.finish();
 
     return plan;
 }
@@ -352,7 +341,7 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
 LoadedModelData::LoadedModelData(BindingPlan plan,
                                   artifact::MaterializedArtifact materialized)
     : backing(std::move(materialized)),
-      frontend(qwen3_6::make_frontend_resources(backing, plan)),
+      frontend(qwen3_6::take_frontend_resources(backing, plan.frontend)),
       runtime(build_runtime(plan, backing)) {}
 
 } // namespace ninfer::targets::qwen3_5_9b::detail

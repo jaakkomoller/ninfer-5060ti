@@ -53,9 +53,39 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
         }
         break;
     case 4096:
-        if (n == 2048) {
+        switch (n) {
+        case 2048:
             if (t <= 56) { return launch_w8_simt_r8_c4; }
             if (t <= 895) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        case 4096:
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            return launch_w8_mma_r64_c128;
+        case 10240:
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            return launch_w8_mma_r64_c128;
+        case 12288:
+        case 24576:
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 8) { return launch_w8_simt_r8_c8; }
+            return launch_w8_mma_r64_c128;
+        default:
+            break;
+        }
+        break;
+    case 8192:
+        if (n == 4096) {
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
+            return launch_w8_mma_r64_c128;
+        }
+        break;
+    case 12288:
+        if (n == 4096) {
+            if (t <= 4) { return launch_w8_simt_r8_c4; }
+            if (t <= 16) { return launch_w8_simt_r8_c8; }
             return launch_w8_mma_r64_c128;
         }
         break;
@@ -87,6 +117,10 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_w8_mma_r64_c128;
         case 4608:
             if (t <= 8 || t == 12) { return launch_w8_simt_r8_c4; }
+            if (t <= 256) { return launch_w8_mma_r32_c128; }
+            return launch_w8_mma_r64_c128;
+        case 4096:
+            if (t <= 8) { return launch_w8_simt_r8_c4; }
             if (t <= 256) { return launch_w8_mma_r32_c128; }
             return launch_w8_mma_r64_c128;
         case 5120:

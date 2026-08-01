@@ -63,16 +63,17 @@ void require_snapshot_operands(const Tensor& conv_weight, const Tensor& conv_sta
     }
 }
 
-void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
+void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, std::int32_t k,
+                      const char* label) {
     const bool q4_planes =
         qtype != QType::Q4G64_F16S || (weight.qhigh == nullptr && weight.high_plane_bytes == 0);
     const bool q5_planes =
         qtype != QType::Q5G64_F16S || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
     if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 64 || weight.group != 64 ||
-        weight.ndim != 2 || weight.n != rows || weight.k != 5120 || weight.shape[0] != rows ||
-        weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
-        weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
+        weight.ndim != 2 || weight.n != rows || weight.k != k || weight.shape[0] != rows ||
+        weight.shape[1] != k || weight.padded_shape[0] != rows ||
+        weight.padded_shape[1] != k || !q4_planes || !q5_planes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
         (qtype == QType::Q5G64_F16S && !aligned_to(weight.qhigh, 16))) {
         throw std::invalid_argument(std::string("gdn_input_proj: invalid ") + label);
@@ -272,19 +273,36 @@ void dispatch_single_parent_snapshot(const Tensor& x, const Weight& weight,
 
 void gdn_input_proj(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                     Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQkRows     = 4096;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kQkvRows    = kQkRows + kValueRows;
-    constexpr std::int32_t kParentRows = kValueRows + kZRows;
-    const std::int32_t cols            = x.ne[1];
+    const std::int32_t cols = x.ne[1];
     if (cols <= 0) { throw std::invalid_argument("gdn_input_proj: T must be positive"); }
-    require_matrix(x, kHidden, cols, "x");
-    require_matrix(qkv, kQkvRows, cols, "qkv");
-    require_matrix(z, kZRows, cols, "z");
-    require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
+    switch (x.ne[0]) {
+    case 5120: {
+        constexpr std::int32_t kQkRows    = 4096;
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        require_matrix(x, 5120, cols, "x");
+        require_matrix(qkv, kQkRows + kValueRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, 5120, "qk weight");
+        require_rowsplit(value_z_weight, QType::Q5G64_F16S, kValueRows + kZRows, 5120,
+                         "value/z weight");
+        break;
+    }
+    case 4096: {
+        constexpr std::int32_t kQkRows    = 4096;
+        constexpr std::int32_t kValueRows = 4096;
+        constexpr std::int32_t kZRows     = 4096;
+        require_matrix(x, 4096, cols, "x");
+        require_matrix(qkv, kQkRows + kValueRows, cols, "qkv");
+        require_matrix(z, kZRows, cols, "z");
+        require_rowsplit(qk_weight, QType::Q4G64_F16S, kQkRows, 4096, "qk weight");
+        require_rowsplit(value_z_weight, QType::Q5G64_F16S, kValueRows + kZRows, 4096,
+                         "value/z weight");
+        break;
+    }
+    default:
+        throw std::invalid_argument("gdn_input_proj: unsupported input width");
+    }
 
     detail::q4_q5_gdn_input_dispatch(x, qk_weight, value_z_weight, qkv, z, stream);
 }
@@ -333,8 +351,10 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(std::int32_t q
                                                                   std::int32_t value_rows,
                                                                   std::int32_t min_tokens,
                                                                   std::int32_t max_tokens) {
-    const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
-    const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
+    const bool q4_q5 =
+        (query_rows == 2048 && key_rows == 2048 && value_rows == 6144) ||
+        (query_rows == 2048 && key_rows == 2048 && value_rows == 4096);
+    const bool w8 = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if ((!q4_q5 && !w8) || min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument(
             "gdn_input_proj_conv_snapshot: unregistered shape or invalid token interval");
@@ -373,25 +393,51 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   Tensor& conv_states, const Tensor& initial_slot, Tensor& query,
                                   Tensor& key, Tensor& value, Tensor& z, WorkspaceArena& ws,
                                   cudaStream_t stream) {
-    constexpr std::int32_t kHidden     = 5120;
-    constexpr std::int32_t kQueryRows  = 2048;
-    constexpr std::int32_t kKeyRows    = 2048;
-    constexpr std::int32_t kValueRows  = 6144;
-    constexpr std::int32_t kZRows      = 6144;
-    constexpr std::int32_t kChannels   = kQueryRows + kKeyRows + kValueRows;
-    constexpr std::int32_t kParentRows = kValueRows + kZRows;
-    const std::int32_t tokens          = x.ne[1];
+    const std::int32_t tokens = x.ne[1];
     if (tokens <= 0) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot: T must be positive");
     }
-    require_matrix(x, kHidden, tokens, "x");
-    require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, "qk weight");
-    require_rowsplit(value_z_weight, QType::Q5G64_F16S, kParentRows, "value/z weight");
-    require_snapshot_operands(conv_weight, conv_states, initial_slot, kChannels, tokens);
-    require_matrix(query, kQueryRows, tokens, "query");
-    require_matrix(key, kKeyRows, tokens, "key");
-    require_matrix(value, kValueRows, tokens, "value");
-    require_matrix(z, kZRows, tokens, "z");
+    std::int32_t channels = 0;
+    switch (x.ne[0]) {
+    case 5120: {
+        constexpr std::int32_t kQueryRows = 2048;
+        constexpr std::int32_t kKeyRows   = 2048;
+        constexpr std::int32_t kValueRows = 6144;
+        constexpr std::int32_t kZRows     = 6144;
+        constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        channels                          = kChannels;
+        require_matrix(x, 5120, tokens, "x");
+        require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, 5120, "qk weight");
+        require_rowsplit(value_z_weight, QType::Q5G64_F16S, kValueRows + kZRows, 5120,
+                         "value/z weight");
+        require_snapshot_operands(conv_weight, conv_states, initial_slot, kChannels, tokens);
+        require_matrix(query, kQueryRows, tokens, "query");
+        require_matrix(key, kKeyRows, tokens, "key");
+        require_matrix(value, kValueRows, tokens, "value");
+        require_matrix(z, kZRows, tokens, "z");
+        break;
+    }
+    case 4096: {
+        constexpr std::int32_t kQueryRows = 2048;
+        constexpr std::int32_t kKeyRows   = 2048;
+        constexpr std::int32_t kValueRows = 4096;
+        constexpr std::int32_t kZRows     = 4096;
+        constexpr std::int32_t kChannels  = kQueryRows + kKeyRows + kValueRows;
+        channels                          = kChannels;
+        require_matrix(x, 4096, tokens, "x");
+        require_rowsplit(qk_weight, QType::Q4G64_F16S, kQueryRows + kKeyRows, 4096, "qk weight");
+        require_rowsplit(value_z_weight, QType::Q5G64_F16S, kValueRows + kZRows, 4096,
+                         "value/z weight");
+        require_snapshot_operands(conv_weight, conv_states, initial_slot, kChannels, tokens);
+        require_matrix(query, kQueryRows, tokens, "query");
+        require_matrix(key, kKeyRows, tokens, "key");
+        require_matrix(value, kValueRows, tokens, "value");
+        require_matrix(z, kZRows, tokens, "z");
+        break;
+    }
+    default:
+        throw std::invalid_argument("gdn_input_proj_conv_snapshot: unsupported input width");
+    }
 
     const SnapshotRoute route = resolve_snapshot_route(true, tokens);
     if (route.workspace == SnapshotWorkspaceKind::None) {
@@ -401,8 +447,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
         return;
     }
 
-    auto scope                = ws.scope();
-    SnapshotWorkspace scratch = allocate_snapshot_workspace(ws, kChannels, tokens, route.workspace);
+    auto scope = ws.scope();
+    SnapshotWorkspace scratch = allocate_snapshot_workspace(ws, channels, tokens, route.workspace);
     gdn_input_proj(x, qk_weight, value_z_weight, scratch.projected, z, stream);
     if (route.workspace == SnapshotWorkspaceKind::Projected) {
         detail::q4_q5_gdn_input_t4_post_snapshot_launch(scratch.projected, conv_weight, conv_states,
@@ -411,8 +457,8 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
         causal_conv1d_silu_snapshot(scratch.projected, conv_weight, conv_states, initial_slot,
                                     scratch.convolved, stream);
         extract_bf16_columns(scratch.convolved, 0, query, stream);
-        extract_bf16_columns(scratch.convolved, kQueryRows, key, stream);
-        extract_bf16_columns(scratch.convolved, kQueryRows + kKeyRows, value, stream);
+        extract_bf16_columns(scratch.convolved, 2048, key, stream);
+        extract_bf16_columns(scratch.convolved, 4096, value, stream);
     }
 }
 

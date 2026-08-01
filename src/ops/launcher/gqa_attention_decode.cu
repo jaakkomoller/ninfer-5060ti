@@ -138,18 +138,42 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
     if constexpr (TokenTile == 6) {
         // Small grids need more warps per CTA. From 2K to 8K, Bc=64 halves key
         // loop iterations; dynamic smem avoids penalizing the long-context path.
-        if (implementation_window > 128 && implementation_window <= 160) {
-            launch.template operator()<24, 1, 32, false>();
-        } else if (implementation_window <= 2054) {
-            launch.template operator()<12, 1, 32, false>();
-        } else if (implementation_window <= 8198) {
-            launch.template operator()<12, 1, 64, true>();
+        if constexpr (Geometry::GroupSize == 4) {
+            // 9B group of four: RowCount = 24, two Q row tiles; only even warp
+            // counts dividing 2 tiles (8/16/32) satisfy the int8 PVNt layout.
+            if (implementation_window > 128 && implementation_window <= 160) {
+                launch.template operator()<16, 1, 32, false>();
+            } else if (implementation_window <= 2054) {
+                launch.template operator()<16, 1, 32, false>();
+            } else if (implementation_window <= 8198) {
+                launch.template operator()<16, 1, 64, true>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
         } else {
-            launch.template operator()<6, 2, 32, false>();
+            if (implementation_window > 128 && implementation_window <= 160) {
+                launch.template operator()<24, 1, 32, false>();
+            } else if (implementation_window <= 2054) {
+                launch.template operator()<12, 1, 32, false>();
+            } else if (implementation_window <= 8198) {
+                launch.template operator()<12, 1, 64, true>();
+            } else {
+                launch.template operator()<6, 2, 32, false>();
+            }
         }
     } else if constexpr (TokenTile == 5) {
         if constexpr (Geometry::GroupSize == 6) {
             // Two Q row tiles for the 27B group of six.
+            if (implementation_window > 128 && implementation_window <= 512) {
+                launch.template operator()<32, 1, 32, false>();
+            } else if (implementation_window <= 1029) {
+                launch.template operator()<16, 1, 32, false>();
+            } else {
+                launch.template operator()<8, 2, 32, false>();
+            }
+        } else if constexpr (Geometry::GroupSize == 4) {
+            // Two Q row tiles for the 9B group of four; only 8/16/32 warps
+            // satisfy the int8 PVNt layout.
             if (implementation_window > 128 && implementation_window <= 512) {
                 launch.template operator()<32, 1, 32, false>();
             } else if (implementation_window <= 1029) {
@@ -187,14 +211,18 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
 
 bool gqa_attention_uses_small_t(std::int32_t tokens) { return tokens >= 1 && tokens <= 6; }
 
-std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                          DType cache_dtype, GqaExecutionEnvelope envelope) {
+std::int32_t gqa_attention_split_capacity(std::int32_t q_heads, std::int32_t kv_heads,
+                                          std::int32_t tokens, DType cache_dtype,
+                                          GqaExecutionEnvelope envelope) {
     if (tokens < 1 || tokens > 6 || (cache_dtype != DType::BF16 && cache_dtype != DType::I8) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys) {
         throw std::invalid_argument("gqa_attention split capacity: invalid profile");
     }
     if (q_heads == Gqa27Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa27Geometry>(envelope, tokens, cache_dtype);
+    }
+    if (kv_heads == Gqa9Geometry::KVHeads) {
+        return gqa_small_t_launch_capacity<Gqa9Geometry>(envelope, tokens, cache_dtype);
     }
     if (q_heads == Gqa35Geometry::QHeads) {
         return gqa_small_t_launch_capacity<Gqa35Geometry>(envelope, tokens, cache_dtype);
@@ -287,6 +315,11 @@ void gqa_attention_small_t_launch(const Tensor& q, const Tensor& k, const Tensor
             q, input, pos, scale, cache, envelope, partial_acc, partial_m, partial_l, out, stream);
         return;
     }
+    if (k.ne[1] == Gqa9Geometry::KVHeads) {
+        gqa_attention_small_t_launch_for<Gqa9Geometry>(
+            q, input, pos, scale, cache, envelope, partial_acc, partial_m, partial_l, out, stream);
+        return;
+    }
     gqa_attention_small_t_launch_for<Gqa35Geometry>(q, input, pos, scale, cache, envelope,
                                                     partial_acc, partial_m, partial_l, out, stream);
 }
@@ -299,6 +332,11 @@ void gqa_attention_cached_small_t_launch(const Tensor& q, const Tensor& pos, flo
     const GqaCachedInput input{};
     if (q.ne[1] == Gqa27Geometry::QHeads) {
         gqa_attention_small_t_launch_for<Gqa27Geometry>(
+            q, input, pos, scale, cache, envelope, partial_acc, partial_m, partial_l, out, stream);
+        return;
+    }
+    if (cache.num_kv_heads == Gqa9Geometry::KVHeads) {
+        gqa_attention_small_t_launch_for<Gqa9Geometry>(
             q, input, pos, scale, cache, envelope, partial_acc, partial_m, partial_l, out, stream);
         return;
     }

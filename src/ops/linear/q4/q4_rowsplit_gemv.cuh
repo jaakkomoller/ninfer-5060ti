@@ -97,11 +97,19 @@ using Q4GemvR4W1DirectSchedule =
                            Q4GemvLaneMapping::PackedWord8, Q4GemvDecodeMode::Fp16Mantissa,
                            Q4GemvCodeTransfer::AsyncVector16, Q4GemvScaleAccess::SharedPair32,
                            Cache::ca, 0, 1>;
+// Static per-row group ownership must match the weight's K: 80 groups (K=5120) for
+// Qwen3.6-27B/35B-A3B, 64 groups (K=4096) for Qwen3.5-9B. The kernel ignores the
+// runtime k in the static-ownership branch, so each K must use its own schedule.
 using Q4GemvR1W8DirectSchedule =
     Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
                            Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
                            Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
                            Cache::ca, 80, 1>;
+using Q4GemvR1W8DirectK64Schedule =
+    Q4RowSplitGemvSchedule<1, 8, 16, 1, Q4GemvActivationAccess::Direct,
+                           Q4GemvLaneMapping::PackedByte2, Q4GemvDecodeMode::ScalarInteger,
+                           Q4GemvCodeTransfer::SyncVector16, Q4GemvScaleAccess::Scalar16Shuffle,
+                           Cache::ca, 64, 1>;
 
 template <class Schedule, Q4GemvScaleAccess ScaleAccess = Schedule::kScaleAccess>
 struct Q4GemvTileStorage;

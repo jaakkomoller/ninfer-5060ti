@@ -69,6 +69,10 @@ bool is_35(const Bf16GdnGatingProblem& problem) noexcept {
     return problem.heads == 32 && problem.input_rows == 2048;
 }
 
+bool is_9(const Bf16GdnGatingProblem& problem) noexcept {
+    return problem.heads == 32 && problem.input_rows == 4096;
+}
+
 bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
     switch (schedule) {
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
@@ -88,7 +92,7 @@ bool schedule_uses_mma(Bf16GdnGatingScheduleId schedule) noexcept {
 }
 
 std::int32_t mma_tile_cols(const Bf16GdnGatingProblem& problem) noexcept {
-    return is_35(problem) ? 64 : 128;
+    return (is_35(problem) || is_9(problem)) ? 64 : 128;
 }
 
 std::int32_t schedule_split_k(Bf16GdnGatingScheduleId schedule) {
@@ -144,7 +148,28 @@ bool candidate_is_legal(Bf16GdnGatingScheduleId schedule,
                         const Bf16GdnGatingProblem& problem) noexcept {
     if (!bf16_gdn_gating_admits(problem)) { return false; }
     if (is_27(problem)) {
+    if (is_9(problem)) {
+        // The 9B profile shares the 32-head/BN64 cooperative residency profile of the 35B
+        // routes, but its input rows are twice as wide and its gating never uses the fused
+        // norm split-32 or the 27B small-T/GEMV lanes.
         switch (schedule) {
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit4:
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit2:
+            return cooperative_35_grid_is_resident(schedule, problem.cols);
+        case Bf16GdnGatingScheduleId::MmaUnsplit:
+            return true;
+        case Bf16GdnGatingScheduleId::GemvPairedRows:
+        case Bf16GdnGatingScheduleId::SmallTSplit10:
+        case Bf16GdnGatingScheduleId::SimtWarpRowC4:
+        case Bf16GdnGatingScheduleId::SimtWarpRowC8:
+        case Bf16GdnGatingScheduleId::MmaCooperativeSplit32:
+            return false;
+        }
+    }
+
+    switch (schedule) {
         case Bf16GdnGatingScheduleId::GemvPairedRows:
             return problem.cols == 1;
         case Bf16GdnGatingScheduleId::SmallTSplit10:
@@ -227,14 +252,24 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
                                                    dt_bias, scratch.data, g, beta, stream);
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit16:
-        bf16_gdn_gating_proj_35_mma_split16_launch(plan.token_variant, x, a_weight, b_weight, A_log,
-                                                   dt_bias, scratch.data, g, beta, stream);
+        if (is_9(problem)) {
+            bf16_gdn_gating_proj_9_mma_split16_launch(plan.token_variant, x, a_weight, b_weight,
+                                                      A_log, dt_bias, scratch.data, g, beta,
+                                                      stream);
+        } else {
+            bf16_gdn_gating_proj_35_mma_split16_launch(plan.token_variant, x, a_weight, b_weight,
+                                                       A_log, dt_bias, scratch.data, g, beta,
+                                                       stream);
+        }
         return;
     case Bf16GdnGatingScheduleId::MmaCooperativeSplit8:
         if (is_35(problem)) {
             bf16_gdn_gating_proj_35_mma_split8_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
                                                       stream);
+        } else if (is_9(problem)) {
+            bf16_gdn_gating_proj_9_mma_split8_launch(plan.token_variant, x, a_weight, b_weight,
+                                                     A_log, dt_bias, scratch.data, g, beta, stream);
         } else {
             bf16_gdn_gating_proj_mma_split8_launch(plan.token_variant, x, a_weight, b_weight, A_log,
                                                    dt_bias, scratch.data, g, beta, stream);
@@ -245,6 +280,9 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
             bf16_gdn_gating_proj_35_mma_split4_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
                                                       stream);
+        } else if (is_9(problem)) {
+            bf16_gdn_gating_proj_9_mma_split4_launch(plan.token_variant, x, a_weight, b_weight,
+                                                     A_log, dt_bias, scratch.data, g, beta, stream);
         } else {
             bf16_gdn_gating_proj_mma_split4_launch(plan.token_variant, x, a_weight, b_weight, A_log,
                                                    dt_bias, scratch.data, g, beta, stream);
@@ -255,6 +293,9 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
             bf16_gdn_gating_proj_35_mma_split2_launch(plan.token_variant, x, a_weight, b_weight,
                                                       A_log, dt_bias, scratch.data, g, beta,
                                                       stream);
+        } else if (is_9(problem)) {
+            bf16_gdn_gating_proj_9_mma_split2_launch(plan.token_variant, x, a_weight, b_weight,
+                                                     A_log, dt_bias, scratch.data, g, beta, stream);
         } else {
             bf16_gdn_gating_proj_mma_split2_launch(plan.token_variant, x, a_weight, b_weight, A_log,
                                                    dt_bias, scratch.data, g, beta, stream);
@@ -264,6 +305,9 @@ void execute_resolved(const Bf16GdnGatingPlan& plan, const Bf16GdnGatingProblem&
         if (is_35(problem)) {
             bf16_gdn_gating_proj_35_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
                                                        A_log, dt_bias, g, beta, stream);
+        } else if (is_9(problem)) {
+            bf16_gdn_gating_proj_9_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
+                                                      A_log, dt_bias, g, beta, stream);
         } else {
             bf16_gdn_gating_proj_mma_unsplit_launch(plan.token_variant, x, a_weight, b_weight,
                                                     A_log, dt_bias, g, beta, stream);
@@ -327,7 +371,7 @@ const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId sched
 
 bool bf16_gdn_gating_admits(const Bf16GdnGatingProblem& problem) noexcept {
     if (problem.cols < 1) { return false; }
-    return is_27(problem) || is_35(problem);
+    return is_27(problem) || is_35(problem) || is_9(problem);
 }
 
 Bf16GdnGatingPlan bf16_gdn_gating_resolve_candidate(Bf16GdnGatingScheduleId schedule,

@@ -33,6 +33,9 @@ constexpr int k35N           = 32;
 constexpr int k35K           = 2048;
 constexpr int k35LogicalRows = 2 * k35N;
 
+constexpr int k9N = 32;
+constexpr int k9K = 4096;
+
 template <int TokenTile, int KSlice, int RowsPerBlock>
 __global__ void bf16_gdn_gating_proj_small_t_partial_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ a_weight,
@@ -252,6 +255,13 @@ void require_shape35(const Weight& w, const char* name) {
     if (w.n != k35N || w.k != k35K || w.shape[0] != k35N || w.shape[1] != k35K) {
         throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
                                     " requires contiguous BF16 [32,2048]");
+    }
+}
+
+void require_shape9(const Weight& w, const char* name) {
+    if (w.n != k9N || w.k != k9K || w.shape[0] != k9N || w.shape[1] != k9K) {
+        throw std::invalid_argument(std::string("gdn_gating_proj: ") + name +
+                                    " requires contiguous BF16 [32,4096]");
     }
 }
 
@@ -538,14 +548,73 @@ void bf16_gdn_gating_proj_35_mma_split2_launch(Bf16GdnGatingTokenVariant variant
 }
 
 void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
-                                                const Weight& a_weight, const Weight& b_weight,
-                                                const Tensor& A_log, const Tensor& dt_bias,
-                                                Tensor& g, Tensor& beta, cudaStream_t stream) {
+                                                 const Weight& a_weight, const Weight& b_weight,
+                                                 const Tensor& A_log, const Tensor& dt_bias,
+                                                 Tensor& g, Tensor& beta, cudaStream_t stream) {
     require_shape35(a_weight, "a_weight");
     require_shape35(b_weight, "b_weight");
     launch_bf16_prefill_mma<Bf16Gdn35Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
-                                                     b_weight, A_log, dt_bias, nullptr, g, beta,
+                                                      b_weight, A_log, dt_bias, nullptr, g, beta,
+                                                      stream);
+}
+
+void bf16_gdn_gating_proj_9_mma_split16_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               void* workspace, Tensor& g, Tensor& beta,
+                                               cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    launch_bf16_prefill_mma<Bf16Gdn9Geometry, 16, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                     b_weight, A_log, dt_bias, workspace, g, beta,
                                                      stream);
+}
+
+void bf16_gdn_gating_proj_9_mma_split8_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                              const Weight& a_weight, const Weight& b_weight,
+                                              const Tensor& A_log, const Tensor& dt_bias,
+                                              void* workspace, Tensor& g, Tensor& beta,
+                                              cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    launch_bf16_prefill_mma<Bf16Gdn9Geometry, 8, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                    b_weight, A_log, dt_bias, workspace, g, beta,
+                                                    stream);
+}
+
+void bf16_gdn_gating_proj_9_mma_split4_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                              const Weight& a_weight, const Weight& b_weight,
+                                              const Tensor& A_log, const Tensor& dt_bias,
+                                              void* workspace, Tensor& g, Tensor& beta,
+                                              cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    launch_bf16_prefill_mma<Bf16Gdn9Geometry, 4, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                    b_weight, A_log, dt_bias, workspace, g, beta,
+                                                    stream);
+}
+
+void bf16_gdn_gating_proj_9_mma_split2_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                              const Weight& a_weight, const Weight& b_weight,
+                                              const Tensor& A_log, const Tensor& dt_bias,
+                                              void* workspace, Tensor& g, Tensor& beta,
+                                              cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    launch_bf16_prefill_mma<Bf16Gdn9Geometry, 2, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                    b_weight, A_log, dt_bias, workspace, g, beta,
+                                                    stream);
+}
+
+void bf16_gdn_gating_proj_9_mma_unsplit_launch(Bf16GdnGatingTokenVariant variant, const Tensor& x,
+                                               const Weight& a_weight, const Weight& b_weight,
+                                               const Tensor& A_log, const Tensor& dt_bias,
+                                               Tensor& g, Tensor& beta, cudaStream_t stream) {
+    require_shape9(a_weight, "a_weight");
+    require_shape9(b_weight, "b_weight");
+    launch_bf16_prefill_mma<Bf16Gdn9Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr, a_weight,
+                                                    b_weight, A_log, dt_bias, nullptr, g, beta,
+                                                    stream);
 }
 
 } // namespace ninfer::ops::detail

@@ -428,7 +428,7 @@ W8PairProblem w8_pair_problem(const Tensor& x, const Weight& first_weight,
 }
 
 bool w8_pair_admits(const W8PairProblem& problem) noexcept {
-    return problem.rows == 1024 && (problem.k == 5120 || problem.k == 2048) &&
+    return problem.rows == 1024 && (problem.k == 5120 || problem.k == 4096 || problem.k == 2048) &&
            problem.padded_k == problem.k && problem.cols >= 1;
 }
 

@@ -30,13 +30,15 @@ void mtp_pack_fc_input_launch(const Tensor& embedding_norm, const Tensor& hidden
 void mtp_split_attn_in_launch(const Tensor& attn_in, Tensor& q, Tensor& k, Tensor& gate, Tensor& v,
                               cudaStream_t stream) {
     constexpr int kBlock = 256;
+    const std::int32_t q_rows  = q.ne[0] * q.ne[1];
+    const std::int32_t kv_rows = k.ne[0] * k.ne[1];
     const std::int64_t n = static_cast<std::int64_t>(attn_in.ne[0]) * attn_in.ne[1];
     const int grid =
         static_cast<int>(std::max<std::int64_t>(1, div_up(n, static_cast<std::int64_t>(kBlock))));
     mtp_split_attn_in_kernel<<<grid, kBlock, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(attn_in.data), static_cast<__nv_bfloat16*>(q.data),
         static_cast<__nv_bfloat16*>(k.data), static_cast<__nv_bfloat16*>(gate.data),
-        static_cast<__nv_bfloat16*>(v.data), attn_in.ne[1]);
+        static_cast<__nv_bfloat16*>(v.data), attn_in.ne[1], q_rows, kv_rows);
     CUDA_CHECK(cudaGetLastError());
 }
 

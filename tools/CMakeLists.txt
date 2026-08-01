@@ -13,3 +13,18 @@ target_link_libraries(ninfer-qwen3_6_27b-dump PRIVATE
   ninfer_artifact
   ninfer_core
   CUDA::cudart)
+
+add_executable(ninfer-qwen3_5_9b-logits qwen3_5_9b_logits/main.cpp)
+target_include_directories(ninfer-qwen3_5_9b-logits PRIVATE
+  ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_SOURCE_DIR}/third_party
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_5_9b/impl
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_5_9b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
+target_link_libraries(ninfer-qwen3_5_9b-logits PRIVATE
+  ninfer_engine
+  ninfer_product_prompt_input
+  ninfer_artifact
+  ninfer_core
+  CUDA::cudart)

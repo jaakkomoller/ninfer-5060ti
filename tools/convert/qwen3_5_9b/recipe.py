@@ -78,7 +78,7 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
                         Concat(
                             (
                                 query,
-                                _source(source_prefix + "self_attn.k_proj.weight", (512, 4096)),
+                                _source(source_prefix + "self_attn.k_proj.weight", (1024, 4096)),
                             ),
                             0,
                         ),
@@ -88,7 +88,7 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
                         Concat(
                             (
                                 gate,
-                                _source(source_prefix + "self_attn.v_proj.weight", (512, 4096)),
+                                _source(source_prefix + "self_attn.v_proj.weight", (1024, 4096)),
                             ),
                             0,
                         ),
@@ -120,7 +120,14 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
                 (
                     TensorRecipe(
                         object_prefix + "gdn/a_log",
-                        Cast(_source(source_prefix + "linear_attn.A_log", (32,)), inventory.FP32),
+                        Cast(
+                            _source(
+                                source_prefix + "linear_attn.A_log",
+                                (32,),
+                                dtype="F32",
+                            ),
+                            inventory.FP32,
+                        ),
                     ),
                     TensorRecipe(
                         object_prefix + "gdn/dt_bias",
@@ -160,7 +167,14 @@ def _build_text_recipes() -> tuple[TensorRecipe, ...]:
                     ),
                     TensorRecipe(
                         object_prefix + "gdn/norm",
-                        _source(source_prefix + "linear_attn.norm.weight", (128,)),
+                        Cast(
+                            _source(
+                                source_prefix + "linear_attn.norm.weight",
+                                (128,),
+                                dtype="F32",
+                            ),
+                            inventory.BF16,
+                        ),
                     ),
                     TensorRecipe(
                         object_prefix + "gdn/output",
@@ -252,9 +266,9 @@ def _build_mtp_recipes() -> tuple[TensorRecipe, ...]:
             Concat(
                 (
                     _attention_qproj_part(q_proj, gate=False),
-                    _source(source_prefix + "self_attn.k_proj.weight", (512, 4096)),
+                    _source(source_prefix + "self_attn.k_proj.weight", (1024, 4096)),
                     _attention_qproj_part(q_proj, gate=True),
-                    _source(source_prefix + "self_attn.v_proj.weight", (512, 4096)),
+                    _source(source_prefix + "self_attn.v_proj.weight", (1024, 4096)),
                 ),
                 0,
             ),

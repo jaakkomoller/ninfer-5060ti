@@ -50,6 +50,7 @@ struct GqaExecutionEnvelope {
  * profiles or intervals throw; a legal prompt route may return zero.
  */
 [[nodiscard]] std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads,
+                                                                 std::int32_t kv_heads,
                                                                  DType cache_dtype,
                                                                  GqaExecutionEnvelope envelope,
                                                                  std::int32_t min_tokens,

@@ -125,7 +125,7 @@ def verify_structure(artifact_path: str | Path) -> tuple[Artifact, StructureSumm
         objects=len(artifact.objects),
         tensors=tensor_count,
         resources=resource_count,
-        payload_bytes=artifact.payload_bytes,
+        payload_bytes=artifact.file_bytes - artifact.payload_offset,
         row_view_templates=len(inventory.LOGICAL_ROW_VIEW_SPECS),
         row_view_bindings=sum(
             1
@@ -141,32 +141,42 @@ def verify_structure(artifact_path: str | Path) -> tuple[Artifact, StructureSumm
     )
 
 
+def _logical_words(tensor: torch.Tensor, format_name: str) -> torch.Tensor:
+    contiguous = tensor.detach().contiguous().cpu()
+    if format_name == inventory.BF16:
+        return contiguous.view(torch.int16)
+    if format_name in (inventory.FP32, inventory.I32):
+        return contiguous.view(torch.int32)
+    raise TypeError(f"{format_name} is not a direct format")
+
+
+def _three_indices(count: int) -> tuple[int, ...]:
+    return tuple(dict.fromkeys((0, count // 2, count - 1)))
+
+
 def verify_direct_tensors(
     artifact: Artifact, source_reader: ShardReader
 ) -> PayloadSummary:
-    by_name = {spec.name: spec for spec in inventory.TENSOR_SPECS}
     direct_count = 0
-    for obj in artifact.objects:
+    for object_name in DIRECT_PROBE_OBJECTS:
+        obj = artifact.find(object_name)
         if not isinstance(obj, TensorObject):
-            continue
-        spec = by_name.get(obj.name)
-        if not spec or spec.format not in ("BF16", "FP32", "I32"):
-            continue
-        if obj.name not in DIRECT_PROBE_OBJECTS:
-            continue
-        payload = artifact.read_object(obj.name)
-        tensor = decode_direct(payload, spec.shape, spec.format)
-        source_tensor = source_reader.get(obj.name.replace("text/", "").replace("mtp/", "").replace("vision/", ""))
-        if source_tensor is not None:
-            diff = (tensor.float() - source_tensor.float()).abs().max().item()
-            if spec.format == "BF16":
-                threshold = 0.01
-            else:
-                threshold = 1e-4
-            if diff > threshold:
-                raise VerificationError(
-                    f"{obj.name}: direct tensor max diff {diff} > {threshold}"
-                )
+            raise VerificationError(f"{object_name} is not a tensor")
+        expected = recipe.materialize_recipe(
+            recipe.RECIPES_BY_NAME[object_name],
+            source_reader,
+        )
+        stored = decode_direct(artifact.payload(obj), obj.format, obj.shape)
+        expected_words = _logical_words(expected, obj.format).reshape(-1)
+        stored_words = _logical_words(stored, obj.format).reshape(-1)
+        indices = torch.tensor(_three_indices(stored_words.numel()), dtype=torch.long)
+        if not torch.equal(
+            stored_words.index_select(0, indices),
+            expected_words.index_select(0, indices),
+        ):
+            raise VerificationError(
+                f"{object_name}: representative direct words differ"
+            )
         direct_count += 1
     return PayloadSummary(
         direct_probes=direct_count,
@@ -192,10 +202,10 @@ def verify_quantized_tensors(
         spec = by_name.get(obj.name)
         if not spec or spec.format in ("BF16", "FP32", "I32"):
             continue
-        payload = artifact.read_object(obj.name)
-        codes, scales, shape = decode_row_split_codes(payload, spec.shape, spec.format)
-        quant_rows += shape[0]
-        quant_groups += int(np.ceil(shape[1] / 64) * shape[0])
+        payload = artifact.payload(obj)
+        scales, codes = decode_row_split_codes(payload, spec.format, spec.shape)
+        quant_rows += spec.shape[0]
+        quant_groups += int(np.ceil(spec.shape[1] / 64) * spec.shape[0])
         if obj.name in QUANT_PROBE_OBJECTS:
             quant_probes += 1
     return PayloadSummary(

@@ -107,6 +107,11 @@ void gqa_attention_prompt_attention_launch(const Tensor& q, const Tensor& positi
                                                                  stream);
         return;
     }
+    if (cache.num_kv_heads == Gqa9Geometry::KVHeads) {
+        gqa_attention_prompt_attention_launch_for<Gqa9Geometry>(q, positions, scale, cache, out,
+                                                                stream);
+        return;
+    }
     gqa_attention_prompt_attention_launch_for<Gqa35Geometry>(q, positions, scale, cache, out,
                                                              stream);
 }

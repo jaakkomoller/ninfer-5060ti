@@ -14,11 +14,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kN                 = 34816;
-constexpr int kK                 = 5120;
-constexpr int kIntermediate      = kN / 2;
 constexpr int kGroupK            = 64;
-constexpr int kGroups            = kK / kGroupK;
 constexpr int kBytesPerGroup     = 32;
 constexpr int kVecBytes          = 16;
 constexpr int kGroupsPerWarpTile = 16;
@@ -26,13 +22,10 @@ constexpr int kVecsPerWarpTile   = kGroupsPerWarpTile * kBytesPerGroup / kVecByt
 constexpr int kWarpsPerBlock     = 4;
 constexpr int kBlockThreads      = kWarpsPerBlock * 32;
 constexpr int kPairsPerBlock     = kWarpsPerBlock;
-constexpr int kXVecs             = kK / 8; // x as uint4 (8 bf16 each)
-constexpr int kTiles             = kGroups / kGroupsPerWarpTile;
-static_assert(kIntermediate % kPairsPerBlock == 0);
 static_assert(kBytesPerGroup == 2 * kVecBytes);
-static_assert(kGroups % kGroupsPerWarpTile == 0);
 static_assert(kVecsPerWarpTile == 32);
 
+template <int kN, int kK>
 __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[kVecsPerWarpTile],
                                                    uint4 (*__restrict__ s_scale)[2],
                                                    const std::uint8_t* __restrict__ gate_code_row,
@@ -54,10 +47,18 @@ __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[
     pipe_commit();
 }
 
+template <int kN, int kK>
 __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restrict__ x,
                                                   const std::uint8_t* __restrict__ codes,
                                                   const std::uint8_t* __restrict__ scales,
                                                   __nv_bfloat16* __restrict__ out) {
+    constexpr int kIntermediate  = kN / 2;
+    constexpr int kGroups        = kK / kGroupK;
+    constexpr int kXVecs         = kK / 8; // x as uint4 (8 bf16 each)
+    constexpr int kTiles         = kGroups / kGroupsPerWarpTile;
+    static_assert(kIntermediate % kPairsPerBlock == 0);
+    static_assert(kGroups % kGroupsPerWarpTile == 0);
+
     constexpr int kStages   = 3;
     constexpr int kPrefetch = kStages - 1;
     __shared__ __align__(16) __nv_bfloat16 x_sh[kK];
@@ -89,8 +90,8 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
         if (p < kTiles) {
-            q4_issue_pair_tile(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
-                               gate_scale_row, up_code_row, up_scale_row, p, lane);
+            q4_issue_pair_tile<kN, kK>(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
+                                       gate_scale_row, up_code_row, up_scale_row, p, lane);
         } else {
             pipe_commit();
         }
@@ -101,8 +102,8 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         const int fetch = tile + kPrefetch;
         if (fetch < kTiles) {
             const int buf = fetch % kStages;
-            q4_issue_pair_tile(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
-                               gate_scale_row, up_code_row, up_scale_row, fetch, lane);
+            q4_issue_pair_tile<kN, kK>(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
+                                       gate_scale_row, up_code_row, up_scale_row, fetch, lane);
         } else {
             pipe_commit();
         }
@@ -143,18 +144,36 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
     if (lane == 0) { out[out_row] = __float2bfloat16(silu(gate_acc) * up_acc); }
 }
 
+template <int kN, int kK>
+void launch_gemv(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    constexpr int kIntermediate = kN / 2;
+    const int grid = kIntermediate / kPairsPerBlock;
+    q4_linear_swiglu_gemv_pair_kernel<kN, kK><<<grid, kBlockThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace
 
 void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor& out,
                                        cudaStream_t stream) {
-    if (w.n != kN || w.k != kK || w.padded_shape[1] != kK) {
-        throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
+    switch (w.n) {
+    case 34816:
+        if (w.k != 5120 || w.padded_shape[1] != 5120) {
+            throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [34816,5120]");
+        }
+        launch_gemv<34816, 5120>(x, w, out, stream);
+        return;
+    case 24576:
+        if (w.k != 4096 || w.padded_shape[1] != 4096) {
+            throw std::invalid_argument("q4 linear_swiglu GEMV requires weight [24576,4096]");
+        }
+        launch_gemv<24576, 4096>(x, w, out, stream);
+        return;
+    default:
+        throw std::invalid_argument("q4 linear_swiglu GEMV: unsupported weight shape");
     }
-    const int grid = kIntermediate / kPairsPerBlock;
-    q4_linear_swiglu_gemv_pair_kernel<<<grid, kBlockThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data));
-    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

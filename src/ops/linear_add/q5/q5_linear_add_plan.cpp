@@ -35,9 +35,11 @@ struct RouteSpec {
     Q5LinearAddScheduleId schedule;
 };
 
-constexpr std::array<SupportSpec, 2> kSupports{{
+constexpr std::array<SupportSpec, 4> kSupports{{
     {5120, 6144, 6144},
     {5120, 17408, 17408},
+    {4096, 4096, 4096},
+    {4096, 12288, 12288},
 }};
 
 constexpr std::array<RouteSpec, 4> kRoutes{{

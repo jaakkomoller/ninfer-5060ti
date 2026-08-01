@@ -33,9 +33,9 @@ RowSplitGroupedMmaJob make_job(const Weight& weight, std::int32_t weight_row_off
     };
 }
 
-void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
-                  Tensor& qkv, Tensor& z, cudaStream_t stream) {
-    constexpr std::int32_t kValueRows = 6144;
+template <std::int32_t kValueRows>
+void launch_slice(bool full, const Tensor& x, const Weight& qk_weight,
+                  const Weight& value_z_weight, Tensor& qkv, Tensor& z, cudaStream_t stream) {
     using Schedule                    = GemmCfg<64, 128, 64, 64, 16, 2, 1, false, true, true>;
     const RowSplitGroupedMmaJob qk    = make_job(qk_weight, 0, qk_weight.n, qkv, 0);
     const RowSplitGroupedMmaJob value = make_job(value_z_weight, 0, kValueRows, qkv, qk_weight.n);
@@ -62,18 +62,32 @@ void launch_slice(bool full, const Tensor& x, const Weight& qk_weight, const Wei
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_slice_geometry(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
+                           Tensor& qkv, Tensor& z, cudaStream_t stream) {
+    const bool full = (x.ne[1] % 128) == 0;
+    switch (x.ne[0]) {
+    case 5120:
+        launch_slice<6144>(full, x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
+    case 4096:
+        launch_slice<4096>(full, x, qk_weight, value_z_weight, qkv, z, stream);
+        return;
+    default:
+        throw std::invalid_argument("GDN Q4/Q5 grouped MMA: unsupported input width");
+    }
+}
+
 } // namespace
 
 void q4_q5_gdn_input_grouped_mma_launch(const Tensor& x, const Weight& qk_weight,
                                         const Weight& value_z_weight, Tensor& qkv, Tensor& z,
                                         cudaStream_t stream) {
     constexpr std::int32_t kTileCols = 128;
-    const bool full                  = (x.ne[1] % kTileCols) == 0;
     for_each_token_slice(x.ne[1], kTileCols, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor qkv_slice     = qkv.slice(1, offset, count);
         Tensor z_slice       = z.slice(1, offset, count);
-        launch_slice(full, x_slice, qk_weight, value_z_weight, qkv_slice, z_slice, stream);
+        launch_slice_geometry(x_slice, qk_weight, value_z_weight, qkv_slice, z_slice, stream);
     });
 }
 

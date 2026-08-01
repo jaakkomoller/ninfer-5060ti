@@ -26,9 +26,8 @@ from tools.artifact.container import (
 from tools.convert.common.quantize import pick_device
 from tools.convert.common.safetensors import ShardReader
 from tools.convert.qwen3_6.common import conversion as family_conversion
-from tools.convert.qwen3_6.common import official_resources
 
-from . import draft_head, inventory, recipe
+from . import draft_head, inventory, official_resources, recipe
 
 
 RECIPE_ID = "qwen3_5_9b-v1"
@@ -36,7 +35,6 @@ RECIPE_ID = "qwen3_5_9b-v1"
 _ROOT_CONFIG = {
     "architectures": ["Qwen3_5ForConditionalGeneration"],
     "model_type": "qwen3_5",
-    "language_model_only": False,
     "tie_word_embeddings": False,
     "vision_start_token_id": 248053,
     "vision_end_token_id": 248054,
@@ -60,7 +58,6 @@ _TEXT_CONFIG = {
     "mamba_ssm_dtype": "float32",
     "mtp_num_hidden_layers": 1,
     "mtp_use_dedicated_embeddings": False,
-    "tie_word_embeddings": False,
     "max_position_embeddings": 262144,
     "rms_norm_eps": 1e-6,
 }
@@ -175,7 +172,7 @@ def preflight_inventory() -> None:
             len(inventory.TENSOR_SPECS),
             len(inventory.OBJECT_SPECS),
         )
-        != (6, 344, 2, 12, 333, 691, 697)
+        != (6, 387, 2, 12, 333, 734, 740)
     ):
         raise ValueError("registered inventory is incomplete")
     recipe.validate_recipe_coverage()

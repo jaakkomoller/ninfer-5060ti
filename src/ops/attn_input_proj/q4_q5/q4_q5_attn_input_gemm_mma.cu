@@ -52,16 +52,35 @@ void launch_pair(bool full, const Tensor& x, RowSplitGroupedMmaJob first,
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <std::int32_t kQueryRows, std::int32_t kKvRows>
 void launch_slice(bool full, const Tensor& x, const Weight& query_key_weight,
                   const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                   cudaStream_t stream) {
     using Schedule = GemmCfg<64, 128, 64, 64, 32, 2, 1, false, true, true>;
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
-        full, x, make_job(query_key_weight, 0, 6144, q), make_job(query_key_weight, 6144, 1024, k),
-        stream);
+        full, x, make_job(query_key_weight, 0, kQueryRows, q),
+        make_job(query_key_weight, kQueryRows, kKvRows, k), stream);
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
-        full, x, make_job(gate_value_weight, 0, 6144, gate),
-        make_job(gate_value_weight, 6144, 1024, v), stream);
+        full, x, make_job(gate_value_weight, 0, kQueryRows, gate),
+        make_job(gate_value_weight, kQueryRows, kKvRows, v), stream);
+}
+
+void launch_slice_geometry(const Tensor& x, const Weight& query_key_weight,
+                           const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k,
+                           Tensor& v, cudaStream_t stream) {
+    const bool full = (x.ne[1] % 128) == 0;
+    switch (x.ne[0]) {
+    case 5120:
+        launch_slice<6144, 1024>(full, x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                 stream);
+        return;
+    case 4096:
+        launch_slice<4096, 1024>(full, x, query_key_weight, gate_value_weight, q, gate, k, v,
+                                 stream);
+        return;
+    default:
+        throw std::invalid_argument("attention Q4/Q5 grouped MMA: unsupported input width");
+    }
 }
 
 } // namespace
@@ -70,15 +89,14 @@ void q4_q5_attn_input_grouped_mma_launch(const Tensor& x, const Weight& query_ke
                                          const Weight& gate_value_weight, Tensor& q, Tensor& gate,
                                          Tensor& k, Tensor& v, cudaStream_t stream) {
     constexpr std::int32_t kTileCols = 128;
-    const bool full                  = (x.ne[1] % kTileCols) == 0;
     for_each_token_slice(x.ne[1], kTileCols, [&](std::int32_t offset, std::int32_t count) {
         const Tensor x_slice = x.slice(1, offset, count);
         Tensor q_slice       = q.slice(1, offset, count);
         Tensor gate_slice    = gate.slice(1, offset, count);
         Tensor k_slice       = k.slice(1, offset, count);
         Tensor v_slice       = v.slice(1, offset, count);
-        launch_slice(full, x_slice, query_key_weight, gate_value_weight, q_slice, gate_slice,
-                     k_slice, v_slice, stream);
+        launch_slice_geometry(x_slice, query_key_weight, gate_value_weight, q_slice, gate_slice,
+                              k_slice, v_slice, stream);
     });
 }
 
