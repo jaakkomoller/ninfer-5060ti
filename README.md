@@ -2,30 +2,45 @@
 
 > Selected checkpoints. Maximum single-GPU inference performance.
 
-NInfer is a from-scratch C++/CUDA inference engine for two exact Qwen3.6 checkpoints on a single
-NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local CLI or
-OpenAI-/Anthropic-compatible HTTP APIs.
+NInfer is a from-scratch C++/CUDA inference engine for the Qwen3.5/Qwen3.6 checkpoints listed
+below on a single NVIDIA GeForce RTX 5090. It runs text, image, and video prompts through a local
+CLI or OpenAI-/Anthropic-compatible HTTP APIs.
 
 NInfer deliberately supports a closed set of model artifacts instead of acting as a general model
 runtime:
 
 | Model | Weights | NInfer artifact | Size | SHA-256 |
 |---|---|---|---:|---|
+| [Qwen3.5-9B](https://huggingface.co/ruwwww/qwen3.5-9b-ninfer) | `groupwise-int` | `qwen3_5_9b.ninfer` | 6,514,051,328 bytes (6.07 GiB) | `5e823ea5b4df7c75c630cb5ff90017cf17769c68bbf9545640cf981af5ec7bd6` |
 | [Qwen3.6-27B](https://huggingface.co/neroued/Qwen3.6-27B-NInfer) | `groupwise-int` | `qwen3_6_27b.ninfer` | 17,495,365,888 bytes (16.29 GiB) | `7b51600ffd10632b9660f56085efdd9b751d79733ad32036a652234b64bebe7b` |
 | [Qwen3.6-27B NVFP4](https://huggingface.co/neroued/Qwen3.6-27B-nvfp4-NInfer) | `nvfp4` | `qwen3_6_27b_nvfp4.ninfer` | 18,324,064,000 bytes (17.07 GiB) | `bce5f00d066c0f20f1317bf1fdcb458264cf95837c3b1f3fbec163694627893a` |
 | [Qwen3.6-35B-A3B](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | `groupwise-int` | `qwen3_6_35b_a3b.ninfer` | 22,783,246,080 bytes (21.22 GiB) | `1fb9ea0b5b8561e49d9604115ec89e5d9f2b6f6434e32c37c57fffd480a325d2` |
 
+The 9B artifact binds to the registered `qwen3_5_9b` target: a 4,096-wide, 32-layer dense model
+with a mixed linear/full-attention backbone (24 linear-attention and 8 full-attention layers) and
+one MTP layer, quantized to the same groupwise-int profile as the 27B/35B-A3B targets. Prefill
+activations match the source BF16 model exactly (top-10 logits byte-identical), and greedy decode
+tracks the reference until near-tie logits fall within quantization drift.
+
 Both 27B artifacts bind to the same registered `qwen3_6_27b` target; the version-2 artifact identity
 selects the weight profile without a separate target or runtime flag. The `nvfp4` profile uses W4A4
 Tensor Core MMA for prefill and A16 NVFP4 kernels for decode while retaining the same Text, Vision,
-MTP, prefix-reuse, CLI, and serving paths.
+MTP, prefix-reuse, CLI, and serving paths. The `qwen3_5_9b` target is a peer of these two: it
+shares the family Text/Vision/MTP schedules and the groupwise-int execution leaves, specialized
+for its own dimensions (see the
+[9B artifact reference](docs/maintainer/qwen3.5-9b-artifact.md)).
 
 ## Performance
 
 Serving performance was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs, a 1,024-
 token prefill chunk, and a maximum context of 262,144 tokens. Each reported fixture uses five fixed
-seeds after one warm-up. The two registered targets are reported independently and are not
+seeds after one warm-up. The registered targets are reported independently and are not
 cross-target comparisons. The two 27B weight profiles are reported separately.
+
+**Qwen3.5-9B (`groupwise-int`)**
+
+- Greedy short-prompt serving (no speculation): **~793 prefill tok/s** and **~241 decode tok/s**.
+- MTP3 short-prompt decode: **~450 decode tok/s** with **~84% acceptance** (3.5 tokens/round).
 
 **Qwen3.6-35B-A3B**
 
@@ -145,6 +160,11 @@ docker run --rm \
 Use the Hugging Face CLI to download one of the registered artifacts:
 
 ```bash
+hf download ruwwww/qwen3.5-9b-ninfer \
+  qwen3_5_9b.ninfer \
+  --local-dir models
+
+# Or the 27B weight variants:
 hf download neroued/Qwen3.6-27B-NInfer \
   qwen3_6_27b.ninfer \
   --local-dir models
@@ -160,7 +180,7 @@ hf download neroued/Qwen3.6-35B-A3B-NInfer \
   --local-dir models
 ```
 
-Current NInfer builds accept only the version-2 artifact container, and all three downloads above
+Current NInfer builds accept only the version-2 artifact container, and all four downloads above
 are version 2. If an older 27B or 35B-A3B artifact was downloaded before this publication, migrate
 that exact local file in place:
 
@@ -234,7 +254,7 @@ function-tool request/response translation. See [HTTP serving](docs/serving.md).
 
 ## Capabilities
 
-Both registered model targets support:
+All registered model targets support:
 
 - text generation with thinking and non-thinking prompt modes;
 - image, multi-image, video, and mixed multimodal messages;
@@ -248,7 +268,7 @@ Both registered model targets support:
 
 ## Current limits
 
-- Only the two model targets listed above are accepted product targets.
+- Only the model targets listed above are accepted product targets.
 - Execution is specialized for one RTX 5090 and one CUDA device.
 - One Engine owns one resident sequence and runs one active request at a time.
 - Continuous batching, multi-GPU execution, CPU/GPU offload, and distributed serving are not
@@ -272,6 +292,7 @@ Both registered model targets support:
 NInfer is licensed under the [Apache License 2.0](LICENSE).
 
 The published artifacts are derived from
+[Qwen/Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B),
 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B) and
 [Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B). The 27B NVFP4 artifact also
 uses the fixed packed weights from
