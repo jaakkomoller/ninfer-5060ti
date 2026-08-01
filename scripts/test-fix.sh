@@ -11,9 +11,9 @@ set -euo pipefail
 NINFER_DIR="$HOME/ninfer"
 SERVE_PID_FILE="$HOME/ninfer/ninfer-serve.pid"
 PORT=8090
-MODEL_PATH="$HOME/ninfer/models/qwen3_3_9b.ninfer"
+MODEL_PATH="$HOME/ninfer/models/qwen3_5_9b.ninfer"
 BRANCH="fix/cooperative-launch-sm-count"
-TIMEOUT=600  # seconds to wait for build + startup
+TIMEOUT=120  # seconds to wait for server startup
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -47,38 +47,61 @@ cleanup_on_fail() {
 
 stop_serve() {
     info "Stopping existing ninfer-serve..."
+
+    # Kill whatever is listening on our port (works regardless of PID file).
+    local port_pid
+    port_pid=$(ss -tlnp 2>/dev/null | awk -v p=":$PORT " '$4 ~ p {print $NF}' | grep -o '[0-9]*' | head -1 || true)
+    if [ -n "$port_pid" ] && kill -0 "$port_pid" 2>/dev/null; then
+        kill "$port_pid" 2>/dev/null || true
+        sleep 3
+        kill -9 "$port_pid" 2>/dev/null || true
+        log "Stopped serve on port $PORT (PID $port_pid)"
+    fi
+
+    # Clean up any PID file from a previous run.
     if [ -f "$SERVE_PID_FILE" ]; then
-        local pid
-        pid=$(cat "$SERVE_PID_FILE" 2>/dev/null || true)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
+        local saved_pid
+        saved_pid=$(cat "$SERVE_PID_FILE" 2>/dev/null || true)
+        if [ -n "$saved_pid" ] && [ "$saved_pid" != "$port_pid" ] && kill -0 "$saved_pid" 2>/dev/null; then
+            kill "$saved_pid" 2>/dev/null || true
             sleep 3
-            kill -9 "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            log "Stopped existing serve (PID $pid)"
-        else
-            warn "Stale PID file found ($pid), removing"
+            kill -9 "$saved_pid" 2>/dev/null || true
+            log "Stopped stale serve (PID $saved_pid)"
         fi
         rm -f "$SERVE_PID_FILE"
     fi
 
-    # Also kill any remaining serve processes
-    pkill -f "ninfer-serve.*$PORT" 2>/dev/null || true
-    sleep 2
+    # Belt-and-suspenders: kill any remaining ninfer-serve process.
+    pkill -f "ninfer-serve" 2>/dev/null || true
+
+    # Wait until the port is actually free.
+    local attempts=0
+    while ss -tln | grep -q ":$PORT " && [ $attempts -lt 15 ]; do
+        sleep 1
+        attempts=$((attempts + 1))
+    done
+    if ss -tln | grep -q ":$PORT "; then
+        fail "Port $PORT still in use after stopping serve"
+        return 1
+    fi
+    log "Port $PORT is free"
 }
 
 wait_for_ready() {
     local elapsed=0
     local interval=5
-    info "Waiting for ninfer-serve to be ready (timeout: ${TIMEOUT}s)..."
+    local pid
+    pid=$(cat "$SERVE_PID_FILE" 2>/dev/null || true)
+    info "Waiting for ninfer-serve to be ready (timeout: ${TIMEOUT}s, PID $pid)..."
 
     while [ $elapsed -lt $TIMEOUT ]; do
         if curl -sf "http://localhost:$PORT/health" > /dev/null 2>&1; then
             log "Server is ready after ${elapsed}s"
             return 0
         fi
-        if ! [ -f "$SERVE_PID_FILE" ]; then
-            fail "Serve process died unexpectedly"
+        # If we have a PID and the process is no longer alive, it died — fail fast.
+        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+            fail "Serve process (PID $pid) died unexpectedly after ${elapsed}s"
             return 1
         fi
         sleep $interval
@@ -246,6 +269,15 @@ if [ ! -x "$NINFER_DIR/build/apps/ninfer-serve" ]; then
     exit 1
 fi
 log "Binary verified"
+
+# Verify the model file exists before we start the server.
+if [ ! -f "$MODEL_PATH" ]; then
+    fail "Model file not found: $MODEL_PATH"
+    info "Available models in $HOME/ninfer/models/:"
+    ls -1 "$HOME/ninfer/models/" 2>/dev/null || true
+    exit 1
+fi
+log "Model verified: $MODEL_PATH"
 
 # Step 4: Stop existing serve
 stop_serve
