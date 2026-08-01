@@ -14,6 +14,7 @@ PORT=8090
 MODEL_PATH="$HOME/ninfer/models/qwen3_5_9b.ninfer"
 BRANCH="fix/cooperative-launch-sm-count"
 TIMEOUT=120  # seconds to wait for server startup
+MODEL_ID=""  # auto-detected from the serve startup log
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -112,6 +113,19 @@ wait_for_ready() {
     return 1
 }
 
+detect_model_id() {
+    # The server logs its model id at startup, e.g. "(model id: qwen3.6-27b, ...)".
+    # Using the wrong id makes every request 404, so detect it from the log.
+    local log
+    log=$(cat "$NINFER_DIR/serve.log" 2>/dev/null || true)
+    MODEL_ID=$(echo "$log" | grep -o 'model id: [^)]*' | head -1 | sed 's/^model id: //' || true)
+    if [ -z "$MODEL_ID" ]; then
+        warn "Could not detect model id from serve.log; defaulting to 'qwen3.6-27b'"
+        MODEL_ID="qwen3.6-27b"
+    fi
+    log "Using model id: $MODEL_ID"
+}
+
 run_inference_test() {
     local prompt="$1"
     local expected_pattern="$2"
@@ -125,7 +139,7 @@ run_inference_test() {
     response=$(curl -sf -X POST "http://localhost:$PORT/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "{
-            \"model\": \"qwen3_5_9b\",
+            \"model\": \"$MODEL_ID\",
             \"messages\": [{\"role\": \"user\", \"content\": \"$prompt\"}],
             \"max_tokens\": $max_tokens,
             \"temperature\": 0.1,
@@ -177,7 +191,7 @@ run_benchmark() {
         response=$(curl -sf -X POST "http://localhost:$PORT/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -d "{
-                \"model\": \"qwen3_5_9b\",
+                \"model\": \"$MODEL_ID\",
                 \"messages\": [{\"role\": \"user\", \"content\": \"Write a numbered list from 1 to $((i * 5))\"}],
                 \"max_tokens\": $tokens,
                 \"temperature\": 0.1,
@@ -309,6 +323,7 @@ if ! wait_for_ready; then
     cleanup_on_fail
     exit 1
 fi
+detect_model_id
 
 # Step 7: Run inference tests
 info ""
