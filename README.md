@@ -61,24 +61,63 @@ At C=8, Qwen3.6-35B-A3B reaches **1,313.8 aggregate decode tok/s**. Qwen3.6-27B 
 acceptance, versus **67.2–71.4%** across the other measured profiles, so aggregate committed
 throughput reflects both execution performance and speculative acceptance.
 
-### Single-request serving
+### Single-request serving (RTX 5090)
 
-The single-request corpus was measured on the same GPU with INT8 group-64 KV cache, CUDA Graphs,
+The single-request corpus was measured on an RTX 5090 with INT8 group-64 KV cache, CUDA Graphs,
 and a 1,024-token prefill chunk. Each reported fixture uses five fixed seeds after server warm-up.
 Targets and weight profiles are reported independently rather than as cross-target comparisons.
 Requests were submitted serially to a persistent server. The Qwen3.8-27B NVFP4 MTP0 results use the
 same dedicated serial corpus runner as the Qwen3.6 profiles; its MTP3 results come from the C=1 point
 of the fixed concurrent-corpus campaign documented in [Performance](docs/performance.md).
 
-### RTX 5060 Ti
+**Qwen3.5-9B (`groupwise-int`) on RTX 5090**
+
+- Greedy short-prompt serving (no speculation): **~793 prefill tok/s** and **~241 decode tok/s**.
+- MTP3 short-prompt decode: **~450 decode tok/s** with **~84% acceptance** (3.5 tokens/round).
+
+**Qwen3.6-35B-A3B on RTX 5090**
+
+- MTP0 at a 7,680-token prompt: **15,544.3 prefill tok/s** and **271.1 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **5,157.1 prefill tok/s** and **188.2 decode tok/s**.
+- MTP3 long reasoning: **620.3–726.2 decode tok/s** with **72.7–82.8% acceptance**.
+- MTP3 structured output: **770.9 decode tok/s**, **89.1% acceptance**, and **3.67 tokens/round**.
+
+**Qwen3.6-27B (`groupwise-int`) on RTX 5090**
+
+- MTP0 at a 7,680-token prompt: **3,218.1 prefill tok/s** and **77.6 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **1,614.8 prefill tok/s** and **54.8 decode tok/s**.
+- MTP3 long reasoning: **161.9–175.4 decode tok/s** with **73.4–78.8% acceptance**.
+- MTP3 structured output: **193.0 decode tok/s**, **88.7% acceptance**, and **3.66 tokens/round**.
+
+**Qwen3.6-27B (`nvfp4`) on RTX 5090**
+
+- MTP0 at a 7,680-token prompt: **11,191.5 prefill tok/s** and **86.4 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **2,510.6 prefill tok/s** and **59.9 decode tok/s**.
+- MTP3 long reasoning: **213.1–231.0 decode tok/s** with **76.3–81.1% acceptance**.
+- MTP3 structured output: **252.2 decode tok/s**, **89.8% acceptance**, and **3.69 tokens/round**.
+- Against groupwise-int on the same corpus and runtime options: **3.48× the 7,680-token prefill
+  throughput**, **1.55× the 260,096-token prefill throughput**, and **30–32% higher MTP3 decode
+  throughput**.
+
+**Qwen3.8-27B (`nvfp4`) on RTX 5090**
+
+- MTP0 at a 7,680-token prompt: **8,340.4 prefill tok/s** and **71.2 decode tok/s**.
+- MTP0 at a 260,096-token prompt: **2,203.1 prefill tok/s** and **52.9 decode tok/s**.
+- MTP3 long reasoning: **151.4–195.2 decode tok/s** with **56.2–76.0% acceptance**.
+- MTP3 structured output: **219.8 decode tok/s**, **90.8% acceptance**, and **3.72 tokens/round**.
+
+See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
+and per-fixture results.
+
+### RTX 5060 Ti Verification & Benchmarks
 
 This branch also runs on an NVIDIA GeForce RTX 5060 Ti (16 GB). The cooperative-launch CTA
 residency checks that were hardcoded for the RTX 5090's 170 SMs are now resolved from the device's
 `multiProcessorCount`, and a cooperative schedule steps down to a less-aggressive split when the
-grid would not be resident. The RTX 5090 path is unchanged; the RTX 5090 numbers below are the
+grid would not be resident. The RTX 5090 path is unchanged; the RTX 5090 numbers above are the
 published reference measurements.
 
-**Qwen3.5-9B (`groupwise-int`) on RTX 5060 Ti**
+**Qwen3.5-9B (`groupwise-int`) Single-Request Serving on RTX 5060 Ti**
 
 Single-run verification through the OpenAI-compatible serving route with INT8 KV, a 4,096-token
 prefill chunk, a 262,144-token max context, MTP with 3 draft tokens, and greedy sampling:
@@ -93,7 +132,7 @@ A 25,604-token needle-in-haystack request retrieved the planted code correctly w
 disabled, confirming long-context correctness on this GPU. These are single-run measurements taken
 on a 40-SM consumer card, not the five-seed methodology used for the RTX 5090 tables above.
 
-**Concurrent MTP3 serving on RTX 5060 Ti**
+**Qwen3.5-9B (`groupwise-int`) Concurrent MTP3 Serving on RTX 5060 Ti**
 
 Committed decode throughput across concurrent request waves with MTP3 (draft window 3) on NVIDIA GeForce RTX 5060 Ti (16 GB):
 
@@ -102,42 +141,6 @@ Committed decode throughput across concurrent request waves with MTP3 (draft win
 | **C=1** | 256 tok | 2.155 s | **118.8 tok/s** | 118.9 tok/s | 1.00× |
 | **C=4** | 1,024 tok | 5.019 s | **204.0 tok/s** | 197.4 tok/s | **1.72×** |
 | **C=8** | 2,048 tok | 6.443 s | **317.9 tok/s** | **347.8 tok/s** | **2.68× (2.93× decode)** |
-
-**Qwen3.5-9B (`groupwise-int`)**
-
-- Greedy short-prompt serving (no speculation): **~793 prefill tok/s** and **~241 decode tok/s**.
-- MTP3 short-prompt decode: **~450 decode tok/s** with **~84% acceptance** (3.5 tokens/round).
-
-**Qwen3.6-35B-A3B**
-
-- MTP0 at a 7,680-token prompt: **15,544.3 prefill tok/s** and **271.1 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **5,157.1 prefill tok/s** and **188.2 decode tok/s**.
-- MTP3 long reasoning: **620.3–726.2 decode tok/s** with **72.7–82.8% acceptance**.
-- MTP3 structured output: **770.9 decode tok/s**, **89.1% acceptance**, and **3.67 tokens/round**.
-
-**Qwen3.6-27B (`groupwise-int`)**
-
-- MTP0 at a 7,680-token prompt: **3,218.1 prefill tok/s** and **77.6 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **1,614.8 prefill tok/s** and **54.8 decode tok/s**.
-- MTP3 long reasoning: **161.9–175.4 decode tok/s** with **73.4–78.8% acceptance**.
-- MTP3 structured output: **193.0 decode tok/s**, **88.7% acceptance**, and **3.66 tokens/round**.
-
-**Qwen3.6-27B (`nvfp4`)**
-
-- MTP0 at a 7,680-token prompt: **11,191.5 prefill tok/s** and **86.4 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **2,510.6 prefill tok/s** and **59.9 decode tok/s**.
-- MTP3 long reasoning: **213.1–231.0 decode tok/s** with **76.3–81.1% acceptance**.
-- MTP3 structured output: **252.2 decode tok/s**, **89.8% acceptance**, and **3.69 tokens/round**.
-- Against groupwise-int on the same corpus and runtime options: **3.48× the 7,680-token prefill
-  throughput**, **1.55× the 260,096-token prefill throughput**, and **30–32% higher MTP3 decode
-  throughput**.
-
-**Qwen3.8-27B (`nvfp4`)**
-
-- MTP0 at a 7,680-token prompt: **8,340.4 prefill tok/s** and **71.2 decode tok/s**.
-- MTP0 at a 260,096-token prompt: **2,203.1 prefill tok/s** and **52.9 decode tok/s**.
-- MTP3 long reasoning: **151.4–195.2 decode tok/s** with **56.2–76.0% acceptance**.
-- MTP3 structured output: **219.8 decode tok/s**, **90.8% acceptance**, and **3.72 tokens/round**.
 
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
 and per-fixture results.
