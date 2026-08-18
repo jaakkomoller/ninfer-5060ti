@@ -149,8 +149,8 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
         if (p < kTiles) {
-            q4_issue_pair_tile<kN, kK>(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
-                                       gate_scale_row, up_code_row, up_scale_row, p, lane);
+            q4_issue_pair_tile(code_tile[warp][p], scale_tile[warp][p], gate_code_row,
+                               gate_scale_row, up_code_row, up_scale_row, p, lane);
         } else {
             pipe_commit();
         }
@@ -161,8 +161,8 @@ __global__ void q4_linear_swiglu_gemv_pair_kernel(const __nv_bfloat16* __restric
         const int fetch = tile + kPrefetch;
         if (fetch < kTiles) {
             const int buf = fetch % kStages;
-            q4_issue_pair_tile<kN, kK>(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
-                                       gate_scale_row, up_code_row, up_scale_row, fetch, lane);
+            q4_issue_pair_tile(code_tile[warp][buf], scale_tile[warp][buf], gate_code_row,
+                               gate_scale_row, up_code_row, up_scale_row, fetch, lane);
         } else {
             pipe_commit();
         }
@@ -250,7 +250,6 @@ void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Ten
         return;
     }
     throw std::invalid_argument("q4 linear_swiglu small_t: unsupported weight shape");
-}
 }
 
 } // namespace ninfer::ops::detail

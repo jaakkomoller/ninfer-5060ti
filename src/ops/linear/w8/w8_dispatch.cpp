@@ -52,6 +52,7 @@ W8Launch select_w8_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t) {
             return launch_w8_mma_r64_c128;
         }
         break;
+    case 4096:
         switch (n) {
         case 2048:
             if (t <= 48) { return launch_w8_small_t; }

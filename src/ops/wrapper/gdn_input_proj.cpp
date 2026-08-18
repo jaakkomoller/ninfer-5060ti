@@ -812,19 +812,17 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
-    const bool q4_q5 =
-        (query_rows == 2048 && key_rows == 2048 && (value_rows == 6144 || value_rows == 4096));
-    const bool w8 = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
+    const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
+    const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !w8) {
         throw std::invalid_argument("gdn_input_proj_conv_snapshot workspace: unregistered shape");
     }
     require_snapshot_capacity_domain(batch_size, min_width, max_width);
     const std::int32_t channels = query_rows + key_rows + value_rows;
-    const std::int32_t hidden   = value_rows == 4096 ? 4096 : 5120;
     if (batch_size > 1) {
         if (q4_q5) {
-            (void)resolve_q4_q5_conv_plan(hidden, min_width, batch_size);
-            (void)resolve_q4_q5_conv_plan(hidden, max_width, batch_size);
+            (void)resolve_q4_q5_conv_plan(5120, min_width, batch_size);
+            (void)resolve_q4_q5_conv_plan(5120, max_width, batch_size);
         } else {
             (void)resolve_w8_conv_plan(min_width, batch_size);
             (void)resolve_w8_conv_plan(max_width, batch_size);
@@ -834,8 +832,8 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 
     std::int32_t largest_materialized_width = 0;
     if (q4_q5) {
-        (void)resolve_q4_q5_conv_plan(hidden, min_width, 1);
-        (void)resolve_q4_q5_conv_plan(hidden, max_width, 1);
+        (void)resolve_q4_q5_conv_plan(5120, min_width, 1);
+        (void)resolve_q4_q5_conv_plan(5120, max_width, 1);
         if (max_width >= 7) {
             largest_materialized_width = max_width;
         } else if (min_width <= 4 && max_width >= 4) {
@@ -886,17 +884,15 @@ std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
 std::size_t gdn_input_proj_conv_record_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
     std::int32_t batch_size, std::int32_t min_width, std::int32_t max_width) {
-    const bool q4_q5 =
-        (query_rows == 2048 && key_rows == 2048 && (value_rows == 6144 || value_rows == 4096));
-    const bool w8 = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
+    const bool q4_q5 = query_rows == 2048 && key_rows == 2048 && value_rows == 6144;
+    const bool w8    = query_rows == 2048 && key_rows == 2048 && value_rows == 4096;
     if (!q4_q5 && !w8) {
         throw std::invalid_argument("gdn_input_proj_conv_record workspace: unregistered shape");
     }
     require_record_capacity_domain(batch_size, min_width, max_width);
-    const std::int32_t hidden = value_rows == 4096 ? 4096 : 5120;
     if (q4_q5) {
-        (void)resolve_q4_q5_conv_plan(hidden, min_width, batch_size);
-        (void)resolve_q4_q5_conv_plan(hidden, max_width, batch_size);
+        (void)resolve_q4_q5_conv_plan(5120, min_width, batch_size);
+        (void)resolve_q4_q5_conv_plan(5120, max_width, batch_size);
     } else {
         (void)resolve_w8_conv_plan(min_width, batch_size);
         (void)resolve_w8_conv_plan(max_width, batch_size);
@@ -1040,13 +1036,6 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                                    conv_record, query, key, value, z, stream);
         return;
     }
-    compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
-                   query, key, value, z, geometry, workspace, stream,
-                   [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {
-                       gdn_input_proj(x_flat, qk_weight, value_z_weight, record_flat, z_flat,
-                                      stream);
-                   });
-}
     compose_record(x, conv_weight, conv_states, valid_columns, initial_state_slots, conv_record,
                    query, key, value, z, geometry, workspace, stream,
                    [&](const Tensor& x_flat, Tensor& record_flat, Tensor& z_flat) {

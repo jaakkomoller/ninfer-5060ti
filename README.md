@@ -93,6 +93,16 @@ A 25,604-token needle-in-haystack request retrieved the planted code correctly w
 disabled, confirming long-context correctness on this GPU. These are single-run measurements taken
 on a 40-SM consumer card, not the five-seed methodology used for the RTX 5090 tables above.
 
+**Concurrent MTP3 serving on RTX 5060 Ti**
+
+Committed decode throughput across concurrent request waves with MTP3 (draft window 3) on NVIDIA GeForce RTX 5060 Ti (16 GB):
+
+| Concurrency | Total Generated | Total Time | Aggregate Throughput | Steady-State Decode Speed | Scaling vs C=1 |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| **C=1** | 256 tok | 2.155 s | **118.8 tok/s** | 118.9 tok/s | 1.00× |
+| **C=4** | 1,024 tok | 5.019 s | **204.0 tok/s** | 197.4 tok/s | **1.72×** |
+| **C=8** | 2,048 tok | 6.443 s | **317.9 tok/s** | **347.8 tok/s** | **2.68× (2.93× decode)** |
+
 **Qwen3.5-9B (`groupwise-int`)**
 
 - Greedy short-prompt serving (no speculation): **~793 prefill tok/s** and **~241 decode tok/s**.
