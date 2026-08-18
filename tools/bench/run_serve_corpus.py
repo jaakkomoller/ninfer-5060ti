@@ -24,6 +24,7 @@ MANIFEST_PATH = REPO_ROOT / "examples/cli/manifest.json"
 TARGET_MODEL_IDS = {
     "qwen3_6_35b_a3b": "qwen3.6-35b-a3b",
     "qwen3_6_27b": "qwen3.6-27b",
+    "qwen3_8_27b": "qwen3.8-27b",
 }
 TARGET_ORDER = tuple(TARGET_MODEL_IDS)
 SPECULATIVE_MODES = {
@@ -82,7 +83,7 @@ WARMUP_FIXTURE = "text_smoke_zh"
 RUN_ARTIFACT_TYPE = "ninfer_serve_corpus_result"
 RUN_SCHEMA_VERSION = 5
 SERVER_LOG_ARTIFACT_TYPE = "ninfer_serve_request_log"
-SERVER_LOG_SCHEMA_VERSION = 4
+SERVER_LOG_SCHEMA_VERSION = 9
 STARTUP_TIMEOUT_SECONDS = 1800.0
 REQUEST_TIMEOUT_SECONDS = 24.0 * 60.0 * 60.0
 LOG_EVENT_TIMEOUT_SECONDS = 10.0
@@ -411,7 +412,7 @@ def request_payload(model_id: str, fixture: Fixture, seed: int) -> dict[str, Any
     }
 
 
-def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> dict[str, Any]:
+def send_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> None:
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     try:
         connection.request(
@@ -425,6 +426,12 @@ def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -
                 "Connection": "keep-alive",
             },
         )
+    except (OSError, http.client.HTTPException) as exc:
+        raise CampaignError(f"HTTP request failed: {exc}") from exc
+
+
+def receive_json(connection: http.client.HTTPConnection) -> dict[str, Any]:
+    try:
         response = connection.getresponse()
         response_body = response.read()
     except (OSError, http.client.HTTPException) as exc:
@@ -439,6 +446,11 @@ def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -
     if not isinstance(parsed, dict):
         raise CampaignError("serving response is not a JSON object")
     return parsed
+
+
+def post_json(connection: http.client.HTTPConnection, payload: dict[str, Any]) -> dict[str, Any]:
+    send_json(connection, payload)
+    return receive_json(connection)
 
 
 def require_server_log_identity(event: dict[str, Any], event_name: str) -> None:
@@ -458,6 +470,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     actual = {
         "device": engine.get("device"),
         "max_context": engine.get("max_context"),
+        "kv_capacity": engine.get("kv_capacity"),
         "prefill_chunk": engine.get("prefill_chunk"),
         "kv_cache": engine.get("kv_cache"),
         "cuda_graph": engine.get("cuda_graph"),
@@ -469,6 +482,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     expected = {
         "device": device,
         "max_context": 262144,
+        "kv_capacity": 262144,
         "prefill_chunk": 1024,
         "kv_cache": "int8-group64",
         "cuda_graph": True,
@@ -683,6 +697,8 @@ def server_command(
         "262144",
         "--prefill-chunk",
         "1024",
+        "--log-stats-interval-ms",
+        "0",
         "--device",
         str(device),
         "--request-log-jsonl",
@@ -703,6 +719,25 @@ def server_command(
         )
     if spec.sampling_mode == "greedy":
         command.append("--greedy")
+    else:
+        # Published stochastic measurements use this explicit profile; they must not drift when
+        # product defaults follow a newly registered model recommendation.
+        command.extend(
+            [
+                "--temperature",
+                "0.6",
+                "--top-p",
+                "0.95",
+                "--top-k",
+                "20",
+                "--min-p",
+                "0",
+                "--presence-penalty",
+                "1.0",
+                "--frequency-penalty",
+                "0",
+            ]
+        )
     return command
 
 

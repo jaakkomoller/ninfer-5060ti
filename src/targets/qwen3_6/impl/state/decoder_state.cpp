@@ -1,158 +1,134 @@
 #include <ninfer/targets/qwen3_6/decoder_state.h>
 
-#include "core/device.h"
-
 #include <limits>
 #include <stdexcept>
-#include <string>
 
 namespace ninfer::targets::qwen3_6 {
 namespace {
 
-constexpr std::size_t kArenaAlign = 256;
-
-void validate_positive(std::int32_t value, const char* name) {
-    if (value <= 0) { throw std::invalid_argument(name); }
+std::uint32_t page_count(std::uint32_t capacity) {
+    if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
+    return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
-void validate_layer_slot(const GdnStateStore& state, std::uint32_t layer, std::int32_t slot,
-                         const char* label) {
-    if (layer >= state.layer_count()) {
-        throw std::out_of_range(std::string(label) + " layer out of range");
+PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
+                              std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
+                              std::int32_t quant_group, std::int32_t table_rows,
+                              std::uint32_t physical_page_groups) {
+    if (layers == 0 ||
+        layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
+        kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
+        throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
-    if (slot < 0 || slot >= state.spec.snapshot_slots) {
-        throw std::out_of_range(std::string(label) + " slot out of range");
+    const bool quantized = dtype == DType::I8;
+    if ((!quantized && (dtype != DType::BF16 || quant_group != 0)) ||
+        (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
+        throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
+
+    const std::uint32_t logical_pages = page_count(capacity);
+    if (physical_page_groups < logical_pages) {
+        throw std::invalid_argument("Paged KV physical pages are below logical capacity");
+    }
+
+    PagedKVPoolSpec pool_spec;
+    pool_spec.page_group_count      = physical_page_groups;
+    pool_spec.logical_page_capacity = logical_pages;
+    pool_spec.table_rows            = table_rows;
+    pool_spec.planes.reserve(static_cast<std::size_t>(layers) * (quantized ? 4ULL : 2ULL));
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
+        pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
+        if (quantized) {
+            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+        }
+    }
+    return PagedKVCacheLayout{
+        .pool        = plan_paged_kv_pool(builder, pool_spec),
+        .layers      = layers,
+        .max_context = capacity,
+        .kv_heads    = kv_heads,
+        .head_dim    = head_dim,
+        .dtype       = dtype,
+        .quant_group = quant_group,
+    };
 }
 
 } // namespace
 
-GdnStateLayout plan_gdn_state(LayoutBuilder& builder, const GdnStateSpec& spec) {
-    if (spec.layers == 0) { throw std::invalid_argument("GdnState layers must be nonzero"); }
-    if (spec.layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
-        throw std::overflow_error("GdnState layer count exceeds int32");
-    }
-    validate_positive(spec.conv_dim, "GdnState conv_dim must be positive");
-    validate_positive(spec.conv_width, "GdnState conv_width must be positive");
-    validate_positive(spec.value_heads, "GdnState value_heads must be positive");
-    validate_positive(spec.value_head_dim, "GdnState value_head_dim must be positive");
-    validate_positive(spec.key_head_dim, "GdnState key_head_dim must be positive");
-    validate_positive(spec.snapshot_slots, "GdnState snapshot_slots must be positive");
-    if (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32) {
-        throw std::invalid_argument("GdnState conv_dtype must be BF16 or FP32");
-    }
-
-    const Tensor conv_shape(nullptr, spec.conv_dtype,
-                            {spec.conv_dim, spec.conv_width, spec.snapshot_slots});
-    const Tensor ssm_shape(
-        nullptr, DType::FP32,
-        {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.snapshot_slots});
-
-    GdnStateLayout layout;
-    layout.spec = spec;
-    layout.conv.reserve(spec.layers);
-    layout.ssm.reserve(spec.layers);
-    for (std::uint32_t layer = 0; layer < spec.layers; ++layer) {
-        const std::string prefix = "GDN layer " + std::to_string(layer);
-        layout.conv.push_back(builder.add(conv_shape.bytes(), kArenaAlign, prefix + " conv"));
-        layout.ssm.push_back(builder.add(ssm_shape.bytes(), kArenaAlign, prefix + " SSM"));
-    }
-    return layout;
-}
-
-GdnStateStore::GdnStateStore(DeviceSpan backing, const GdnStateLayout& layout) : spec(layout.spec) {
-    if (layout.conv.empty() || layout.ssm.size() != layout.conv.size() ||
-        layout.conv.size() != spec.layers) {
-        throw std::invalid_argument("GdnState layout layer counts are inconsistent");
-    }
-    const Tensor conv_shape(nullptr, spec.conv_dtype,
-                            {spec.conv_dim, spec.conv_width, spec.snapshot_slots});
-    const Tensor ssm_shape(
-        nullptr, DType::FP32,
-        {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.snapshot_slots});
-    conv.reserve(layout.conv.size());
-    ssm.reserve(layout.ssm.size());
-    for (std::size_t layer = 0; layer < layout.conv.size(); ++layer) {
-        if (layout.conv[layer].bytes != conv_shape.bytes() ||
-            layout.ssm[layer].bytes != ssm_shape.bytes()) {
-            throw std::logic_error("GdnState layout tensor byte size is inconsistent");
-        }
-        conv.emplace_back(layout.conv[layer].bind(backing).data, spec.conv_dtype,
-                          std::initializer_list<std::int32_t>{spec.conv_dim, spec.conv_width,
-                                                              spec.snapshot_slots});
-        ssm.emplace_back(layout.ssm[layer].bind(backing).data, DType::FP32,
-                         std::initializer_list<std::int32_t>{spec.key_head_dim, spec.value_head_dim,
-                                                             spec.value_heads,
-                                                             spec.snapshot_slots});
-    }
-    reset_running();
-}
-
-std::uint32_t GdnStateStore::layer_count() const noexcept {
-    return static_cast<std::uint32_t>(conv.size());
-}
-
-std::int64_t GdnStateStore::conv_slot_stride_elements() const noexcept {
-    return static_cast<std::int64_t>(spec.conv_dim) * static_cast<std::int64_t>(spec.conv_width);
-}
-
-std::int64_t GdnStateStore::ssm_slot_stride_elements() const noexcept {
-    return static_cast<std::int64_t>(spec.key_head_dim) *
-           static_cast<std::int64_t>(spec.value_head_dim) *
-           static_cast<std::int64_t>(spec.value_heads);
-}
-
-Tensor GdnStateStore::conv_slot(std::uint32_t layer, std::int32_t slot) const {
-    validate_layer_slot(*this, layer, slot, "GdnState conv_slot");
-    return conv.at(layer).slice(2, slot, 1).view({spec.conv_dim, spec.conv_width});
-}
-
-Tensor GdnStateStore::ssm_slot(std::uint32_t layer, std::int32_t slot) const {
-    validate_layer_slot(*this, layer, slot, "GdnState ssm_slot");
-    return ssm.at(layer)
-        .slice(3, slot, 1)
-        .view({spec.key_head_dim, spec.value_head_dim, spec.value_heads});
-}
-
-void GdnStateStore::copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {
-    if (src == dst) { return; }
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor source      = conv_slot(layer, src);
-        const Tensor destination = conv_slot(layer, dst);
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
-    }
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor source      = ssm_slot(layer, src);
-        const Tensor destination = ssm_slot(layer, dst);
-        CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                   cudaMemcpyDeviceToDevice, stream));
-    }
-}
-
-void GdnStateStore::reset_running(cudaStream_t stream) {
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor slot = conv_slot(layer, 0);
-        CUDA_CHECK(cudaMemsetAsync(slot.data, 0, slot.bytes(), stream));
-    }
-    for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
-        const Tensor slot = ssm_slot(layer, 0);
-        CUDA_CHECK(cudaMemsetAsync(slot.data, 0, slot.bytes(), stream));
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-}
-
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
-    layout.text_kv =
-        plan_kv_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
-                      spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group);
+    layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
+                                spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
+                                spec.kv_table_rows, spec.text_physical_page_groups);
     if (spec.enable_mtp) {
-        layout.mtp_kv = plan_kv_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
-                                      spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group);
+        layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
+                                   spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
+                                   spec.kv_table_rows, spec.mtp_physical_page_groups);
     }
-    layout.gdn = plan_gdn_state(builder, spec.gdn);
+    layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;
+}
+
+PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
+    : pool_(backing, layout.pool), layers_(layout.layers), max_context_(layout.max_context),
+      kv_heads_(layout.kv_heads), head_dim_(layout.head_dim), dtype_(layout.dtype),
+      quant_group_(layout.quant_group) {}
+
+PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
+    : cache_(&cache), block_table_(block_table) {}
+
+std::uint32_t PagedKVCacheView::max_context() const noexcept {
+    return cache_ == nullptr ? 0 : cache_->max_context();
+}
+
+PagedKVLayerView PagedKVCacheView::layer_view(std::uint32_t layer) const {
+    if (cache_ == nullptr) { throw std::logic_error("Paged KV execution view is empty"); }
+    return cache_->layer_view(layer, block_table_);
+}
+
+PagedKVCacheView PagedKVCache::execution_view(const PagedKVAllocation& allocation) const {
+    if (!allocation.belongs_to(pool_)) {
+        throw std::invalid_argument("Paged KV allocation belongs to another cache pool");
+    }
+    return PagedKVCacheView(*this, allocation.block_table());
+}
+
+PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer, Tensor block_table) const {
+    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    const bool quantized     = dtype_ == DType::I8;
+    const std::size_t stride = quantized ? 4ULL : 2ULL;
+    const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    return PagedKVLayerView{
+        .k_pages       = pool_.plane(base),
+        .v_pages       = pool_.plane(base + 1),
+        .k_scale_pages = quantized ? pool_.plane(base + 2) : Tensor(),
+        .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
+        .block_table   = block_table,
+        .head_dim      = head_dim_,
+        .num_kv_heads  = kv_heads_,
+        .dtype         = dtype_,
+        .quant_group   = quant_group_,
+    };
+}
+
+PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const {
+    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    const bool quantized     = dtype_ == DType::I8;
+    const std::size_t stride = quantized ? 4ULL : 2ULL;
+    const std::size_t base   = static_cast<std::size_t>(layer) * stride;
+    return PagedKVBatchLayerView{
+        .k_pages       = pool_.plane(base),
+        .v_pages       = pool_.plane(base + 1),
+        .k_scale_pages = quantized ? pool_.plane(base + 2) : Tensor(),
+        .v_scale_pages = quantized ? pool_.plane(base + 3) : Tensor(),
+        .block_tables  = pool_.block_tables(),
+        .head_dim      = head_dim_,
+        .num_kv_heads  = kv_heads_,
+        .dtype         = dtype_,
+        .quant_group   = quant_group_,
+    };
 }
 
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
@@ -160,12 +136,12 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
 }
 
 DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
-    : text_kv(backing, layout.text_kv), gdn(backing, layout.gdn) {
+    : text_kv(backing, layout.text_kv), linear_attention(backing, layout.linear_attention) {
     if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
 }
 
-KVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }
+PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }
 
-const KVCache* DecoderState::mtp_cache() const noexcept { return mtp_kv ? &*mtp_kv : nullptr; }
+const PagedKVCache* DecoderState::mtp_cache() const noexcept { return mtp_kv ? &*mtp_kv : nullptr; }
 
 } // namespace ninfer::targets::qwen3_6

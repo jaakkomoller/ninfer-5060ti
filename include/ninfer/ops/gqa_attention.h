@@ -1,6 +1,6 @@
 #pragma once
 
-#include "core/kv_cache.h"
+#include "core/paged_kv_cache.h"
 #include "core/tensor.h"
 
 #include <cuda_runtime.h> // cudaStream_t
@@ -9,6 +9,8 @@
 #include <cstdint>
 
 namespace ninfer::ops {
+
+inline constexpr std::uint32_t kGqaAttentionMaximumVisibleKeys = 262144;
 
 struct GqaExecutionEnvelope {
     std::uint32_t min_visible_keys = 0;
@@ -45,38 +47,49 @@ struct GqaExecutionEnvelope {
  */
 
 /**
- * Returns the transient arena capacity required for every T in the inclusive interval. Head
- * geometry, cache dtype, and execution envelope are the fixed implementation profile. Invalid
- * profiles or intervals throw; a legal prompt route may return zero.
+ * Returns the transient arena capacity required for every W in the inclusive interval at one
+ * exact logical batch size. Head geometry, cache dtype, and execution envelope are the fixed
+ * implementation profile. Invalid profiles or intervals throw; a legal B=1 prompt route may
+ * return zero.
  */
-[[nodiscard]] std::size_t gqa_attention_workspace_capacity_bytes(std::int32_t q_heads,
-                                                                 std::int32_t kv_heads,
-                                                                 DType cache_dtype,
-                                                                 GqaExecutionEnvelope envelope,
-                                                                 std::int32_t min_tokens,
-                                                                 std::int32_t max_tokens);
+[[nodiscard]] std::size_t
+gqa_attention_workspace_capacity_bytes(std::int32_t q_heads, DType cache_dtype,
+                                       GqaExecutionEnvelope envelope, std::int32_t batch_size,
+                                       std::int32_t min_width, std::int32_t max_width);
 
 /**
- * A1: append K/V at the supplied absolute positions and compute causal grouped-query attention.
- * For query head h, kvh=floor(h/group), p=positions[t], and populated cache history [0,p]:
+ * A1: append K/V for B independent sequences and compute causal grouped-query attention. Let
+ * Vb=W when valid_columns is empty and Vb=valid_columns[b] otherwise. For row b, query head h,
+ * kvh=floor(h/group), 0<=j<Vb, p=positions[j,b], and that row's populated cache history [0,p]:
  *
- *   score[j]    = scale * dot(q[:,h,t], K_cache[:,j,kvh]), 0 <= j <= p
- *   probability = softmax_j(score)
- *   ideal[:,h,t] = sum_j probability[j] * V_cache[:,j,kvh].
+ *   score[x]      = scale * dot(q[:,h,j,b], K_cache[b][:,x,kvh]), 0 <= x <= p
+ *   probability   = softmax_x(score)
+ *   ideal[:,h,j,b] = sum_x probability[x] * V_cache[b][:,x,kvh].
  *
- * The registered geometries are `[256,24|4,T]` group 6 and `[256,16|2,T]` group 8. q/k/v/out
- * are contiguous BF16, positions is contiguous sequential I32 [T], and scale is 1/sqrt(256).
- * T may be any positive value that fits the declared cache and execution envelope.
- * Cache storage is BF16 or INT8-G64 under the shared numerical contract above. The caller
- * guarantees that every row in the causal domain is populated and that `positions[T-1]+1` lies in
- * the declared execution envelope. The envelope is a host launch-resource promise; it does not
- * alter the causal mask.
+ * The registered geometries are `[256,24|4,W,B]` group 6 and `[256,16|2,W,B]` group 8.
+ * q/k/v/out are contiguous BF16 in request-major order, positions is contiguous I32 [W,B], and
+ * kv_table_rows is contiguous I32 [B]. valid_columns is either contiguous I32 [B], or an empty
+ * Tensor meaning every row has exactly W valid columns. This dense/masked choice is part of the
+ * call topology; it is not inferred by copying device metadata to the host. B=1 accepts every
+ * positive W in the current prefill/decode domain; B=2..8 accepts W=1..16. Cache storage is BF16
+ * or INT8-G64 under the shared numerical contract above. PagedKVBatchLayerView supplies shared
+ * planes and the complete block-table matrix; kv_table_rows[b] selects one row for sequence b.
  *
- * q/k/v/positions/out, every cache plane, and live workspace suballocations are pairwise
- * non-overlapping. The Op overwrites every addressed cache row but owns no persistent frontier.
+ * In masked form, every row's valid columns are the prefix [0,valid_columns[b]); positions in that
+ * prefix are sequential and address populated causal histories. Each nonempty row repeats its
+ * final valid position through the invalid tail; an empty row uses zero positions. Other
+ * invalid-tail inputs contain safe dummy values. A1 does not modify cache for invalid columns and
+ * writes exact BF16 zero to their output. The caller guarantees that the maximum final valid
+ * position plus one over nonempty rows lies in the declared execution envelope. The envelope is a
+ * host launch-resource promise over that batch maximum; it does not alter any row's causal mask.
+ *
+ * q/k/v/positions/valid_columns/kv_table_rows/out, every cache plane/table, and live workspace
+ * suballocations are pairwise non-overlapping. The Op overwrites every addressed cache row but
+ * owns no persistent frontier, allocation, request identity, or commit authority.
  */
 void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& positions,
-                   float scale, KVCacheLayerView cache, GqaExecutionEnvelope envelope,
+                   const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
+                   PagedKVBatchLayerView cache, GqaExecutionEnvelope envelope,
                    WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 /**
@@ -85,7 +98,7 @@ void gqa_attention(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
  * no unrelated cache row, receives no execution envelope, and owns no persistent frontier.
  */
 void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
-                   KVCacheLayerView cache, cudaStream_t stream);
+                   PagedKVLayerView cache, cudaStream_t stream);
 
 /**
  * A3: compute causal attention from an already populated cache without accepting new K/V or
@@ -94,7 +107,7 @@ void gqa_kv_append(const Tensor& k, const Tensor& v, const Tensor& positions,
  * to A1. Caller workspace is reported by gqa_attention_workspace_capacity_bytes().
  */
 void gqa_attention_cached(const Tensor& q, const Tensor& positions, float scale,
-                          const KVCacheLayerView& cache, GqaExecutionEnvelope envelope,
+                          const PagedKVLayerView& cache, GqaExecutionEnvelope envelope,
                           WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops

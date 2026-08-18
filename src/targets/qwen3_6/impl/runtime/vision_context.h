@@ -6,7 +6,6 @@
 #include "core/device.h"
 #include "core/tensor.h"
 #include "core/weight.h"
-#include <ninfer/targets/qwen3_6/diagnostics.h>
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "runtime/contract/transient_region.h"
 #include "targets/qwen3_6/impl/runtime/vision_prefill.h"
@@ -20,11 +19,8 @@
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS::schedule {
 
-using VisionTapId       = qwen3_6::VisionTapId;
-using VisionTapCallback = qwen3_6::VisionTapCallback;
-
 struct VisionItemView {
-    std::span<const float> patches;
+    std::span<const std::uint16_t> patches;
     const qwen3_6::VisionItemControl* control = nullptr;
 };
 
@@ -48,12 +44,11 @@ class VisionContext {
 public:
     VisionContext(DeviceContext& device, const LoadedModelData& model);
 
+    [[nodiscard]] static std::size_t output_transient_bytes(std::size_t merged_tokens);
     [[nodiscard]] static std::size_t workspace_bytes(const qwen3_6::VisionItemControl& item);
     [[nodiscard]] static std::size_t workspace_capacity_bytes(std::uint32_t max_merged_tokens,
                                                               std::uint32_t max_segments);
-    void encode(std::uint32_t item_index, const VisionItemView& item, Tensor& output,
-                WorkspaceArena& workspace, void* tap = nullptr,
-                VisionTapCallback callback = nullptr) const;
+    void encode(const VisionItemView& item, Tensor& output, WorkspaceArena& workspace) const;
 
 private:
     struct BlockW {
@@ -97,23 +92,22 @@ struct VisionChunk {
 class VisionPrefillSession {
 public:
     VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
-                         WorkspaceArena& workspace, const qwen3_6::PreparedPromptData& prompt,
-                         const VisionPrefillPlan& plan, runtime::TransientRegion transient,
-                         void* tap = nullptr, VisionTapCallback callback = nullptr);
+                         WorkspaceArena& workspace, qwen3_6::PreparedPromptData& prompt,
+                         const VisionPrefillPlan& plan, runtime::TransientRegion transient);
 
     [[nodiscard]] VisionChunk prepare_chunk(std::uint32_t begin, std::uint32_t nominal_length);
+    void release_encoded_media_payloads() noexcept;
     [[nodiscard]] double elapsed_seconds() const;
 
 private:
     DeviceContext& device_;
     WorkspaceArena& workspace_;
-    const qwen3_6::PreparedPromptData& prompt_;
+    qwen3_6::PreparedPromptData& prompt_;
     const VisionPrefillPlan& plan_;
     runtime::TransientRegion transient_;
     VisionContext context_;
-    void* tap_                  = nullptr;
-    VisionTapCallback callback_ = nullptr;
     std::optional<std::uint32_t> active_item_;
+    std::vector<std::uint32_t> encoded_payloads_pending_release_;
     std::vector<CudaEventTimer> timers_;
 };
 

@@ -30,8 +30,10 @@ namespace detail {
 struct Variant;
 
 enum class WeightsProfile : std::uint8_t {
-    GroupwiseInt,
-    Nvfp4,
+    Qwen36GroupwiseInt,
+    Qwen38GroupwiseInt,
+    Qwen36Nvfp4,
+    Qwen38Nvfp4,
 };
 
 using Frontend       = qwen3_6::Frontend;
@@ -77,28 +79,34 @@ private:
 } // namespace detail
 
 struct Package {
-    static constexpr std::string_view model_id   = "qwen3.6-27b";
-    static constexpr std::string_view target_key = "qwen3_6_27b";
+    static constexpr std::string_view model_id           = "qwen3.6-27b";
+    static constexpr std::string_view target_key         = "qwen3_6_27b";
+    static constexpr std::string_view qwen3_8_model_id   = "qwen3.8-27b";
+    static constexpr std::string_view qwen3_8_target_key = "qwen3_8_27b";
 
-    using WeightsProfile = detail::WeightsProfile;
-    using LoadPlan       = detail::LoadPlan;
-    using LoadedModel    = detail::LoadedModel;
-    using Frontend       = detail::Frontend;
-    using PreparedPrompt = detail::PreparedPrompt;
-    using OutputSession  = detail::OutputSession;
-    using SequencePlan   = qwen3_6::SequencePlan<detail::Variant>;
-    using RequestPlan    = qwen3_6::RequestPlan<detail::Variant>;
-    using Program        = qwen3_6::Program<detail::Variant>;
+    using WeightsProfile  = detail::WeightsProfile;
+    using LoadPlan        = detail::LoadPlan;
+    using LoadedModel     = detail::LoadedModel;
+    using Frontend        = detail::Frontend;
+    using PreparedPrompt  = detail::PreparedPrompt;
+    using OutputSession   = detail::OutputSession;
+    using SequencePlanner = qwen3_6::SequencePlanner<detail::Variant>;
+    using SequencePlan    = qwen3_6::SequencePlan<detail::Variant>;
+    using RequestBasePlan = qwen3_6::RequestBasePlan<detail::Variant>;
+    using RequestPlan     = qwen3_6::RequestPlan<detail::Variant>;
+    using Program         = qwen3_6::Program<detail::Variant>;
 
+    [[nodiscard]] static ModelSamplingDefaults sampling_defaults(std::string_view model);
     [[nodiscard]] static WeightsProfile resolve_weights(const artifact::ArtifactIdentity& identity);
     [[nodiscard]] static LoadPlan plan_load(artifact::Binder& binder, const EngineOptions& options,
                                             WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<LoadedModel>
     construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&& materialized);
-    [[nodiscard]] static Frontend make_frontend(const LoadedModel& model);
-    [[nodiscard]] static SequencePlan plan_sequence(DeviceContext& device,
-                                                    const EngineOptions& options,
-                                                    WeightsProfile weights_profile);
+    [[nodiscard]] static Frontend make_frontend(const LoadedModel& model,
+                                                const EngineOptions& options);
+    [[nodiscard]] static SequencePlanner make_sequence_planner(DeviceContext& device,
+                                                               const EngineOptions& options,
+                                                               WeightsProfile weights_profile);
     [[nodiscard]] static std::unique_ptr<Program>
     create_program(const LoadedModel& model, SequencePlan&& plan, DeviceContext& device);
 };

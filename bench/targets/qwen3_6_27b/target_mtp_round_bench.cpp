@@ -4,16 +4,19 @@
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
 #include "core/device.h"
+#include "runtime/engine/kv_capacity.h"
 #include "runtime/engine/request_memory.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -96,13 +99,19 @@ struct RoundMeasurement {
 
 RoundMeasurement measure_round(target::Package::Program& program, ninfer::DeviceContext& device,
                                std::uint32_t draft_tokens) {
+    constexpr std::array<std::uint32_t, 1> lanes{0};
+    const std::array<ninfer::runtime::RoundBudget, 1> budgets{
+        ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1}};
     ninfer::CudaEventTimer timer(device);
     timer.start();
-    auto round = program.decode_round(
-        ninfer::runtime::RoundBudget{.generated_tokens_remaining = draft_tokens + 1});
-    const float milliseconds     = timer.stop_ms();
-    const std::uint32_t licensed = static_cast<std::uint32_t>(round.tokens.size());
-    program.resolve_pending(licensed, false);
+    const auto round = program.decode_batch(lanes, budgets);
+    const std::uint32_t licensed =
+        round.row_counts.empty() ? 1U : static_cast<std::uint32_t>(round.row_counts.front());
+    const std::array<std::uint32_t, 1> accepted{licensed};
+    constexpr std::array<std::uint8_t, 1> terminal{0};
+    constexpr std::array<std::uint8_t, 1> cancelled{0};
+    program.resolve_pending_batch(lanes, accepted, terminal, cancelled);
+    const float milliseconds = timer.stop_ms();
     return RoundMeasurement{.milliseconds = milliseconds, .licensed_tokens = licensed};
 }
 
@@ -116,15 +125,16 @@ int run(const Options& options) {
     const std::uint32_t measured_rounds =
         static_cast<std::uint32_t>(options.warmup + options.repetitions);
     ninfer::EngineOptions engine;
-    engine.artifact_path             = options.artifact;
-    engine.device                    = options.device;
-    engine.max_context               = static_cast<std::uint32_t>(seed.size() + 64ULL +
-                                                                  static_cast<std::uint64_t>(measured_rounds) *
-                                                                      (options.draft_tokens + 1ULL) +
-                                                                  2ULL * options.draft_tokens);
-    engine.prefill_chunk             = 128;
-    engine.kv_cache                  = ninfer::KvCacheStorage::BFloat16;
-    engine.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    engine.artifact_path       = options.artifact;
+    engine.device              = options.device;
+    engine.max_context         = static_cast<std::uint32_t>(seed.size() + 64ULL +
+                                                            static_cast<std::uint64_t>(measured_rounds) *
+                                                                (options.draft_tokens + 1ULL) +
+                                                            2ULL * options.draft_tokens);
+    engine.kv_capacity         = ninfer::KvCapacityPolicy::explicit_capacity(engine.max_context);
+    engine.prefill_chunk       = 128;
+    engine.kv_cache            = ninfer::KvCacheStorage::BFloat16;
+    engine.speculative.backend = ninfer::SpeculativeBackend::Mtp;
     engine.speculative.draft_tokens  = options.draft_tokens;
     engine.speculative.proposal_head = options.proposal;
     engine.use_cuda_graph            = options.use_cuda_graph;
@@ -138,25 +148,32 @@ int run(const Options& options) {
         ninfer::artifact::materialize(reader, load_plan.materialization(), device, nullptr);
     auto model =
         target::Package::construct_loaded_model(std::move(load_plan), std::move(materialized));
-    auto frontend = target::Package::make_frontend(*model);
+    auto frontend = target::Package::make_frontend(*model, engine);
     auto prompt   = frontend.prepare_tokens(seed, false);
 
-    auto sequence = target::Package::plan_sequence(device, engine, weights_profile);
+    auto planner          = target::Package::make_sequence_planner(device, engine, weights_profile);
+    const auto resolution = ninfer::runtime::resolve_kv_capacity(
+        engine.kv_capacity, planner.capacity_curve(), std::numeric_limits<std::size_t>::max());
+    auto sequence                      = std::move(planner).finalize(resolution.main_page_groups);
     const std::size_t request_capacity = sequence.request_transient_capacity_bytes();
     auto program = target::Package::create_program(*model, std::move(sequence), device);
     ninfer::runtime::RequestMemory request_memory(device, request_capacity);
-    ninfer::ExecutionOptions execution;
+    ninfer::runtime::ResolvedExecutionOptions execution;
     execution.requested_output_tokens = 1 + measured_rounds * (options.draft_tokens + 1);
     execution.allow_prefix_reuse      = false;
-    auto request_plan                 = program->plan_request(prompt, execution);
+    auto request_base                 = program->plan_request_base(prompt, execution);
+    auto request_plan                 = program->plan_request_for_lane(0, prompt, request_base);
     request_memory.activate(request_plan.summary().transient_bytes,
                             request_plan.summary().transient_alignment);
-    auto first =
-        program->begin(std::move(prompt), std::move(request_plan), request_memory.region());
+    const auto first = program->start_prefill_lane(0, std::move(prompt), std::move(request_plan),
+                                                   request_memory.region());
     request_memory.deactivate();
-    program->resolve_pending(static_cast<std::uint32_t>(first.round.tokens.size()), false);
+    if (!first.complete || first.round.tokens.size() != 1) {
+        throw std::runtime_error("benchmark seed prefill did not complete in one scheduling unit");
+    }
+    program->resolve_prefill_lane(0, false);
 
-    const std::uint64_t rounds_before = program->speculative_stats().rounds;
+    const std::uint64_t rounds_before = program->speculative_stats_lane(0).rounds;
     for (int iteration = 0; iteration < options.warmup; ++iteration) {
         (void)measure_round(*program, device, options.draft_tokens);
     }
@@ -166,7 +183,7 @@ int run(const Options& options) {
     for (int iteration = 0; iteration < options.repetitions; ++iteration) {
         measurements.push_back(measure_round(*program, device, options.draft_tokens));
     }
-    const ninfer::SpeculativeStats stats = program->speculative_stats();
+    const ninfer::SpeculativeStats stats = program->speculative_stats_lane(0);
     if (stats.rounds - rounds_before != measured_rounds || stats.fallback_steps != 0) {
         throw std::runtime_error("benchmark did not stay on the native MTP proposal/verify path");
     }

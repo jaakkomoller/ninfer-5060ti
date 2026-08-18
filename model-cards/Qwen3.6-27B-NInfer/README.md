@@ -128,16 +128,32 @@ The artifact supports:
 - MTP speculative decoding with draft windows from one to five;
 - BF16 and INT8 group-64 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
+- startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;
 - OpenAI Chat Completions and Anthropic Messages serving.
 
 ## Performance
 
-The following single-GPU serving measurements were collected on an NVIDIA GeForce RTX 5090 with
+The single-request serving measurements below were collected on an NVIDIA GeForce RTX 5090 with
 CUDA 13.1. Requests were submitted serially to a persistent `ninfer-serve` process with CUDA Graph
-enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each value
-is the arithmetic mean ± sample standard deviation over five fixed seeds; warm-up requests are
-excluded. These results use `weights_id = groupwise-int`.
+enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache, and prefix reuse disabled. Each
+single-request value is the arithmetic mean ± sample standard deviation over five fixed seeds;
+warm-up requests are excluded. These results use `weights_id = groupwise-int`.
+
+### Concurrent MTP=3 decode saturation
+
+The concurrent campaign uses CUDA driver API 13.3 and one 293-token prompt followed by an
+8,192-token generation per active request. Each concurrency point starts a fresh server with MTP3,
+INT8 group-64 KV, CUDA Graphs, a 16,384-token per-request context limit, and prefix reuse disabled.
+Aggregate throughput includes only complete one-second intervals whose actual decode batch remains
+equal to C. Each row is one sustained wave.
+
+| C | Steady aggregate decode tok/s | Speedup vs. C1 | Wave makespan |
+|---:|---:|---:|---:|
+| 1 | 185.8 | 1.00× | 44.23 s |
+| 2 | 247.0 | 1.33× | 66.67 s |
+| 4 | 309.5 | 1.67× | 107.49 s |
+| 8 | 535.0 | 2.88× | 125.20 s |
 
 ### Long-context baseline (MTP disabled)
 
@@ -193,9 +209,10 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - The artifact is accepted only by NInfer revision `bd265a3` or later and the matching registered
   target.
-- NInfer currently executes on one RTX 5090, one CUDA device, and one active request per Engine.
-- It does not provide continuous batching, multi-GPU execution, CPU/GPU offload, or distributed
-  serving.
+- NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
+  requests per Engine.
+- It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
+  multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.
 - NInfer does not execute generated tool calls.
 

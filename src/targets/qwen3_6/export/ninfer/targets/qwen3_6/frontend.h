@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -12,6 +13,14 @@
 namespace ninfer::targets::qwen3_6 {
 
 inline constexpr std::size_t kTokenDomain = 248077;
+
+struct FrontendOptions {
+    bool vision_enabled                    = true;
+    std::uint32_t max_context              = 2'048;
+    std::size_t media_cache_bytes          = kDefaultMediaCacheBytes;
+    std::size_t media_live_bytes           = kDefaultMediaLiveBytes;
+    std::uint32_t media_preprocess_threads = 0;
+};
 
 struct FrontendResources;
 struct PreparedPromptData;
@@ -30,7 +39,7 @@ public:
     PreparedPrompt& operator=(const PreparedPrompt&) = delete;
 
     [[nodiscard]] PromptSummary summary() const;
-    [[nodiscard]] double prepare_seconds() const noexcept;
+    [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept;
     [[nodiscard]] explicit operator bool() const noexcept;
 
 private:
@@ -42,7 +51,40 @@ private:
     friend class PreparedPromptAccess;
 };
 
-using PublishedOutput = std::vector<OutputDelta>;
+class PublishedOutput {
+public:
+    using iterator       = std::array<OutputDelta, 2>::iterator;
+    using const_iterator = std::array<OutputDelta, 2>::const_iterator;
+
+    PublishedOutput()                                  = default;
+    PublishedOutput(const PublishedOutput&)            = default;
+    PublishedOutput& operator=(const PublishedOutput&) = default;
+    PublishedOutput(PublishedOutput&& other) noexcept;
+    PublishedOutput& operator=(PublishedOutput&& other) noexcept;
+
+    [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+    [[nodiscard]] iterator begin() noexcept { return values_.begin(); }
+
+    [[nodiscard]] const_iterator begin() const noexcept { return values_.begin(); }
+
+    [[nodiscard]] iterator end() noexcept { return values_.begin() + size_; }
+
+    [[nodiscard]] const_iterator end() const noexcept { return values_.begin() + size_; }
+
+    [[nodiscard]] OutputDelta& back() noexcept { return values_[size_ - 1]; }
+
+    [[nodiscard]] const OutputDelta& back() const noexcept { return values_[size_ - 1]; }
+
+    void clear() noexcept;
+    void push_back(OutputDelta value);
+
+private:
+    std::array<OutputDelta, 2> values_{};
+    std::size_t size_ = 0;
+};
 
 class OutputSession {
 public:
@@ -59,6 +101,7 @@ public:
                                                   FinishReason limit_reason);
     [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
     [[nodiscard]] PublishedOutput commit_preview() noexcept;
+    [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
 
 private:
     class Impl;
@@ -76,10 +119,14 @@ public:
     Frontend& operator=(Frontend&&) noexcept;
     ~Frontend();
 
-    [[nodiscard]] PreparedPrompt prepare(PromptInput input) const;
-    [[nodiscard]] std::uint32_t count_tokens(PromptInput input) const;
+    [[nodiscard]] PreparedPrompt prepare(PromptInput input,
+                                         const PreparationControl& control = {}) const;
+    [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
+                                             const PreparationControl& control = {}) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
+    [[nodiscard]] PromptCapabilities prompt_capabilities() const noexcept;
+    [[nodiscard]] MediaCacheSummary media_cache_summary() const;
     [[nodiscard]] OutputSession make_output_session(const PreparedPrompt& prompt,
                                                     const StopPolicy& caller_stop,
                                                     const OutputOptions& output = {}) const;
@@ -91,9 +138,9 @@ private:
     std::shared_ptr<const Impl> impl_;
 
     friend class FrontendTestAccess;
-    friend Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
+    friend Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
 };
 
-[[nodiscard]] Frontend make_frontend(const FrontendResources& resources, bool vision_enabled);
+[[nodiscard]] Frontend make_frontend(const FrontendResources& resources, FrontendOptions options);
 
 } // namespace ninfer::targets::qwen3_6

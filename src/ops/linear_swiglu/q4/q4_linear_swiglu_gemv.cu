@@ -4,12 +4,15 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "core/device.h" // CUDA_CHECK
+#include "ops/linear/q4/q4_small_t_mma.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <cstdint>
 #include <stdexcept>
+#include <array>
+#include <utility>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -25,7 +28,63 @@ constexpr int kPairsPerBlock     = kWarpsPerBlock;
 static_assert(kBytesPerGroup == 2 * kVecBytes);
 static_assert(kVecsPerWarpTile == 32);
 
-template <int kN, int kK>
+template <int kIntermediate, int kK>
+struct Q4SwiGluSmallTGeometry {
+    static constexpr int kInputRows    = kK;
+    static constexpr int kGroupsPerRow = kK / kGroupK;
+};
+
+template <int kIntermediate>
+struct Q4SwiGluSmallTRows {
+    static constexpr int kOutputRowsPerCta = 8;
+
+    __device__ __forceinline__ int weight_row(int output_row0, int local_row) const {
+        return output_row0 + (local_row & 7) + (local_row >= 8 ? kIntermediate : 0);
+    }
+};
+
+template <int kIntermediate>
+struct Q4SwiGluSmallTEpilogue {
+    __nv_bfloat16* out;
+
+    template <int ActiveCols>
+    __device__ __forceinline__ void store(int row, int col0, float4 projected) const {
+        if (col0 < ActiveCols) {
+            out[static_cast<std::int64_t>(col0) * kIntermediate + row] =
+                __float2bfloat16_rn(silu(projected.x) * projected.z);
+        }
+        if (col0 + 1 < ActiveCols) {
+            out[static_cast<std::int64_t>(col0 + 1) * kIntermediate + row] =
+                __float2bfloat16_rn(silu(projected.y) * projected.w);
+        }
+    }
+};
+
+using SmallTLauncher = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+
+template <int kIntermediate, int kK, int ActiveCols>
+void launch_small_t_active(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
+    constexpr int TileCols =
+        ActiveCols <= 8 ? 8 : (ActiveCols <= 16 ? 16 : (ActiveCols <= 24 ? 24 : 32));
+    constexpr int kBlocks = kIntermediate / Q4SwiGluSmallTRows<kIntermediate>::kOutputRowsPerCta;
+    const Q4SwiGluSmallTEpilogue<kIntermediate> epilogue{static_cast<__nv_bfloat16*>(out.data)};
+    q4_small_t_mma_kernel<Q4SwiGluSmallTGeometry<kIntermediate, kK>, TileCols, ActiveCols,
+                          Q4SwiGluSmallTEpilogue<kIntermediate>, Q4SwiGluSmallTRows<kIntermediate>>
+        <<<kBlocks, Q4DraftSmallTSchedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
+            static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data),
+            epilogue, Q4SwiGluSmallTRows<kIntermediate>{});
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int kIntermediate, int kK, std::size_t... Offsets>
+constexpr auto make_small_t_launchers(std::index_sequence<Offsets...>) {
+    return std::array<SmallTLauncher, sizeof...(Offsets)>{
+        &launch_small_t_active<kIntermediate, kK, 2 + static_cast<int>(Offsets)>...};
+}
+
+constexpr auto kSmallTLaunchers27 = make_small_t_launchers<17408, 5120>(std::make_index_sequence<31>{});
+constexpr auto kSmallTLaunchers9  = make_small_t_launchers<12288, 4096>(std::make_index_sequence<31>{});
 __device__ __forceinline__ void q4_issue_pair_tile(uint4 (*__restrict__ s_code)[kVecsPerWarpTile],
                                                    uint4 (*__restrict__ s_scale)[2],
                                                    const std::uint8_t* __restrict__ gate_code_row,
@@ -174,6 +233,24 @@ void q4_linear_swiglu_gemv_pair_launch(const Tensor& x, const Weight& w, Tensor&
     default:
         throw std::invalid_argument("q4 linear_swiglu GEMV: unsupported weight shape");
     }
+}
+
+void q4_linear_swiglu_small_t_exact_launch(const Tensor& x, const Weight& w, Tensor& out,
+                                           cudaStream_t stream) {
+    if (x.ne[1] < 2 || x.ne[1] > 32) {
+        throw std::invalid_argument("Q4 LinearSwiGLU exact small-T requires T=2..32");
+    }
+    const std::size_t idx = static_cast<std::size_t>(x.ne[1] - 2);
+    if (w.n == 34816) {
+        kSmallTLaunchers27[idx](x, w, out, stream);
+        return;
+    }
+    if (w.n == 24576) {
+        kSmallTLaunchers9[idx](x, w, out, stream);
+        return;
+    }
+    throw std::invalid_argument("q4 linear_swiglu small_t: unsupported weight shape");
+}
 }
 
 } // namespace ninfer::ops::detail

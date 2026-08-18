@@ -26,12 +26,13 @@ benchmark-report, and external protocol behavior. Repository verification princi
   and the opt-in real public-Engine route;
 - `test_ninfer_artifact_reader.cpp` — C++ framing, directory, encoded-size, payload-span, and
   geometry behavior against a self-contained C++ fixture;
-- `test_generation_controller.cpp` — accepted-prefix, cancellation, publication ordering, and
-  request-abort behavior in the common generated-token loop;
 - `test_request_memory.cpp` — startup-frozen request-transient capacity, stable address,
   activation alignment, rejection, and peak semantics;
-- `test_openai_schema.cpp`, `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current
-  protocol translation and tool-call behavior;
+- `test_openai_schema.cpp`, `test_responses_schema.cpp`, `test_response_store.cpp`,
+  `test_anthropic_schema.cpp`, and `test_tool_call_parser.cpp` — current protocol translation,
+  Responses Item/state/SSE behavior, and incremental tool-call behavior;
+- `test_request_log.cpp` and `test_http_error_handler.cpp` — generation lifecycle records,
+  preparation rejections, protocol-shaped payload-limit errors, and application-error preservation;
 - `test_ninfer_bench_support.cpp` — product benchmark CLI, timing boundary, and schema-v9 reports;
 - `test_bench_matrix.py` — schema-v9 report consumption by the Python matrix summarizer;
 - `test_serve_corpus.py` — serving request-log schema compatibility at the measurement consumer;
@@ -136,7 +137,7 @@ Run the serving contract manually after starting a resident server in another te
 
 ```bash
 ./build/apps/ninfer-serve out/qwen3_6_27b.ninfer \
-  --host 127.0.0.1 --port 18080 --model-id qwen3.6-27b
+  --host 127.0.0.1 --port 18080
 ```
 
 ```bash
@@ -145,8 +146,24 @@ python3 -m tools.smoke.serve_contract \
 ```
 
 This smoke check is intentionally not a CTest: it needs the real artifact, a supported GPU, and a
-server process that remains alive while the client exercises OpenAI, Anthropic, streaming, and
-multimodal requests.
+server process that remains alive while the client exercises OpenAI Responses/Chat, Anthropic,
+state, streaming, and multimodal requests.
+
+The thinking-preservation fixture starts and stops its own server, submits a fixed two-step tool
+history, compares restored and cold greedy output, compares stripped and preserved closed-turn
+prompt lengths, and verifies turn/response rewrite-checkpoint reuse paths plus Responses
+inheritance:
+
+```bash
+python3 tools/smoke/serve_thinking_preservation.py \
+  --artifact out/qwen3_6_27b.ninfer --backend mtp
+
+python3 tools/smoke/serve_thinking_preservation.py \
+  --artifact out/qwen3_6_35b_a3b.ninfer --backend dflash
+```
+
+The shared messages are in
+[`fixtures/serve/qwen3_6_thinking_preservation.json`](fixtures/serve/qwen3_6_thinking_preservation.json).
 
 ## What belongs here
 

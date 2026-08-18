@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,10 +17,11 @@ struct Options {
     std::string prompt;
     std::filesystem::path messages_path;
 
-    std::uint32_t max_new       = 128;
-    std::uint32_t max_context   = 2048;
-    std::uint32_t prefill_chunk = 1024;
-    int device                  = 0;
+    std::uint32_t max_new        = 128;
+    std::uint32_t max_context    = 2048;
+    KvCapacityPolicy kv_capacity = KvCapacityPolicy::explicit_capacity(2048);
+    std::uint32_t prefill_chunk  = 1024;
+    int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
@@ -29,13 +31,13 @@ struct Options {
     bool raw_output      = false;
     bool print_token_ids = false;
     bool enable_thinking = true;
+    std::optional<ReasoningEffort> reasoning_effort;
 
     std::vector<TokenId> stop_token_ids;
     std::vector<StopString> stop_strings;
 
-    // Qwen3 thinking defaults. --greedy replaces these with exact argmax.
-    SamplingParameters sampling{
-        .temperature = 0.6F, .top_k = 20, .top_p = 0.95F, .min_p = 0.0F, .presence_penalty = 1.0F};
+    // Omitted fields are resolved from the loaded model and rendered prompt mode by Engine.
+    SamplingOverrides sampling;
     bool greedy = false;
 };
 

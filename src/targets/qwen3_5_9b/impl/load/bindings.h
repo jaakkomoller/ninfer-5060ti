@@ -149,11 +149,22 @@ struct FusedGdnInputProjectionPayload {
 using GdnInputProjectionPayload =
     std::variant<SplitGdnInputProjectionPayload, FusedGdnInputProjectionPayload>;
 
+struct SplitGdnControlProjectionPayload {
+    Weight a_projection;
+    Weight b_projection;
+};
+
+struct FusedGdnControlProjectionPayload {
+    Weight a_b_projection;
+};
+
+using GdnControlProjectionPayload =
+    std::variant<SplitGdnControlProjectionPayload, FusedGdnControlProjectionPayload>;
+
 struct GdnProjectionPayload {
     Tensor a_log;
     Tensor dt_bias;
-    Weight a_projection;
-    Weight b_projection;
+    GdnControlProjectionPayload control_projection;
     GdnInputProjectionPayload input_projection;
 };
 

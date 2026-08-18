@@ -58,25 +58,43 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
+KvCapacityPolicy parse_kv_capacity(const char* text) {
+    if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
+    return KvCapacityPolicy::explicit_capacity(parse_u32(text, "kv-capacity"));
+}
+
+ReasoningEffort parse_reasoning_effort(std::string_view text) {
+    if (text == "low") { return ReasoningEffort::Low; }
+    if (text == "medium") { return ReasoningEffort::Medium; }
+    if (text == "xhigh") { return ReasoningEffort::XHigh; }
+    throw std::invalid_argument("invalid reasoning-effort: " + std::string(text));
+}
+
 } // namespace
 
 std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
-           "       [--max-context N] [--prefill-chunk N] [--max-new N] [--device N]\n"
+           "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
+           "       [--device N]\n"
            "       [--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--raw-output] [--print-token-ids] [--no-thinking] [--vision]\n"
+           "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
+           "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
            "       [--no-cuda-graph]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "Sampling defaults: temperature 0.6, top-p 0.95, top-k 20, presence penalty 1.0.\n";
+           "--kv-capacity auto leaves " +
+           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
+           " MiB of sizing headroom.\n"
+           "Sampling defaults come from the loaded model and thinking mode; flags override "
+           "individual fields.\n";
 }
 
 Options parse_options(int argc, char** argv) {
@@ -86,7 +104,8 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (argc < 2) { throw std::invalid_argument(".ninfer model path is required"); }
-    options.artifact_path = argv[1];
+    options.artifact_path     = argv[1];
+    bool kv_capacity_explicit = false;
 
     for (int i = 2; i < argc; ++i) {
         const std::string_view arg(argv[i]);
@@ -103,6 +122,9 @@ Options parse_options(int argc, char** argv) {
             options.max_new = parse_u32(value(arg), "max-new");
         } else if (arg == "--max-context") {
             options.max_context = parse_u32(value(arg), "max-context");
+        } else if (arg == "--kv-capacity") {
+            options.kv_capacity  = parse_kv_capacity(value(arg));
+            kv_capacity_explicit = true;
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = parse_u32(value(arg), "prefill-chunk");
         } else if (arg == "--device") {
@@ -121,6 +143,8 @@ Options parse_options(int argc, char** argv) {
             options.print_token_ids = true;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--reasoning-effort") {
+            options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
@@ -167,6 +191,10 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
+    if (!kv_capacity_explicit) {
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
+
     const bool has_prompt   = !options.prompt.empty();
     const bool has_messages = !options.messages_path.empty();
     if (has_prompt == has_messages) {
@@ -175,11 +203,18 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_chunk % 128 != 0) {
         throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
     }
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+        options.kv_capacity.explicit_tokens < options.max_context) {
+        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+    }
     product::validate_speculative_cli_options(options.speculative);
     if (options.speculative.backend == SpeculativeBackend::DFlash && options.enable_vision) {
         throw std::invalid_argument("--spec dflash cannot be combined with --vision");
     }
-    if (options.greedy) { options.sampling = SamplingParameters{}; }
+    if (!options.enable_thinking && options.reasoning_effort) {
+        throw std::invalid_argument("--reasoning-effort cannot be combined with --no-thinking");
+    }
+    if (options.greedy) { options.sampling.temperature = 0.0F; }
     return options;
 }
 

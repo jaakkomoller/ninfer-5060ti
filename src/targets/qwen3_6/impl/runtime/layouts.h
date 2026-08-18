@@ -2,7 +2,9 @@
 #include "targets/qwen3_6/impl/runtime/instance.h"
 // Qwen3.6 family runtime implementation; instantiated only by exact variants.
 
+#include "core/cyclic_kv_cache.h"
 #include "core/dtype.h"
+#include "core/gdn_replay_records.h"
 #include "core/layout.h"
 #include "core/tensor.h"
 #include <ninfer/targets/qwen3_6/decoder_state.h>
@@ -19,41 +21,57 @@ namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 using TensorLayout = TensorRegion;
 
 struct DFlashPersistentLayout {
-    KVCacheLayout local;
-    KVCacheLayout boundary_local;
-    KVCacheLayout full;
-    TensorLayout commit_count;
-    TensorLayout target_features;
-    TensorLayout feature_positions;
+    CyclicKVCacheLayout local;
+    CyclicKVCacheLayout rewrite_checkpoint_local;
+    qwen3_6::PagedKVCacheLayout full;
+    TensorLayout prefill_features;
+    TensorLayout prefill_positions;
+    TensorLayout pending_features;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
-        return local.payload_bytes() + boundary_local.payload_bytes() + full.payload_bytes();
+        return local.payload_bytes() + rewrite_checkpoint_local.payload_bytes() +
+               full.payload_bytes();
     }
 };
 
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
+    std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
     TensorLayout token_counts;
     TensorLayout sampling_config;
     TensorLayout tail_hidden;
-    TensorLayout boundary_hidden;
+    TensorLayout rewrite_checkpoint_hidden;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
 };
 
 struct WorkspacePlan {
-    std::size_t text_prefill    = 0;
-    std::size_t ordinary_round  = 0;
-    std::size_t mtp_prefill     = 0;
-    std::size_t mtp_round       = 0;
-    std::size_t dflash_context  = 0;
-    std::size_t dflash_proposal = 0;
-    std::size_t dflash_round    = 0;
-    std::size_t vision_encode   = 0;
-    std::size_t capacity        = 0;
+    std::size_t text_prefill   = 0;
+    std::size_t ordinary_round = 0;
+    std::size_t mtp_prefill    = 0;
+    std::size_t mtp_round      = 0;
+    std::size_t dflash_context = 0;
+    std::size_t dflash_round   = 0;
+    std::size_t vision_encode  = 0;
+    std::size_t capacity       = 0;
+};
+
+struct SequencePlanningInputs {
+    WeightsProfile weights_profile;
+    std::uint32_t capacity                 = 0;
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t draft_window             = 0;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    DType kv_dtype                         = DType::BF16;
+    std::int32_t kv_quant_group            = 0;
+    ProposalHead proposal_head             = ProposalHead::Full;
+    StartupFeatures features;
+    bool use_cuda_graph = true;
+    int device          = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -64,6 +82,9 @@ template <>
 struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     typename NINFER_QWEN36_VARIANT::WeightsProfile weights_profile;
     std::uint32_t capacity                 = 0;
+    std::uint32_t kv_capacity              = 0;
+    std::uint32_t main_page_groups         = 0;
+    std::uint32_t max_concurrency          = 1;
     std::uint32_t prefill_chunk            = 0;
     std::uint32_t draft_window             = 0;
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
@@ -80,15 +101,24 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::size_t device_reservation_bytes         = 0;
 };
 
+template <>
+struct SequencePlannerImpl<NINFER_QWEN36_VARIANT> {
+    NINFER_QWEN36_RUNTIME_NS::SequencePlanningInputs inputs;
+    runtime::SequenceCapacityCurve curve;
+    std::unique_ptr<SequencePlanImpl<NINFER_QWEN36_VARIANT>> minimum;
+};
+
 } // namespace ninfer::targets::qwen3_6::detail
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 using SequencePlanImpl = qwen3_6::detail::SequencePlanImpl<Variant>;
 
-void validate_target_options(DeviceContext& device, const EngineOptions& options);
-[[nodiscard]] std::unique_ptr<SequencePlanImpl> plan_sequence_impl(DeviceContext& device,
-                                                                   const EngineOptions& options,
-                                                                   WeightsProfile weights_profile);
+[[nodiscard]] std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
+make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
+                           WeightsProfile weights_profile);
+[[nodiscard]] std::unique_ptr<SequencePlanImpl>
+finalize_sequence_plan_impl(std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>> planner,
+                            std::uint32_t main_page_groups);
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

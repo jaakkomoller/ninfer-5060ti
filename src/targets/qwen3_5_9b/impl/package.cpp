@@ -38,6 +38,31 @@ LoadedModel::~LoadedModel() = default;
 } // namespace ninfer::targets::qwen3_5_9b::detail
 
 namespace ninfer::targets::qwen3_5_9b {
+namespace {
+
+constexpr ModelSamplingDefaults kQwen3_5Defaults{
+    .thinking     = {.temperature       = 1.0F,
+                     .top_k             = 20,
+                     .top_p             = 0.95F,
+                     .min_p             = 0.0F,
+                     .presence_penalty  = 0.0F,
+                     .frequency_penalty = 0.0F},
+    .non_thinking = {.temperature       = 0.7F,
+                     .top_k             = 20,
+                     .top_p             = 0.80F,
+                     .min_p             = 0.0F,
+                     .presence_penalty  = 1.5F,
+                     .frequency_penalty = 0.0F},
+};
+
+} // namespace
+
+ModelSamplingDefaults Package::sampling_defaults(std::string_view model) {
+    if (model == model_id) { return kQwen3_5Defaults; }
+    throw std::runtime_error("model '" + std::string(model) +
+                             "' has no sampling defaults in target package '" +
+                             std::string(target_key) + "'");
+}
 
 Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentity& identity) {
     if (identity.model_id == model_id && identity.weights_id == "groupwise-int") {
@@ -48,7 +73,7 @@ Package::WeightsProfile Package::resolve_weights(const artifact::ArtifactIdentit
 }
 
 Package::LoadPlan Package::plan_load(artifact::Binder& binder, const EngineOptions& options,
-                                      WeightsProfile weights_profile) {
+                                     WeightsProfile weights_profile) {
     return LoadPlan(std::make_unique<LoadPlan::Impl>(
         weights_profile,
         detail::bind_artifact(binder, weights_profile, qwen3_6::startup_features(options))));
@@ -63,15 +88,22 @@ Package::construct_loaded_model(LoadPlan&& plan, artifact::MaterializedArtifact&
     return std::unique_ptr<LoadedModel>(new LoadedModel(std::move(impl)));
 }
 
-Package::Frontend Package::make_frontend(const LoadedModel& model) {
+Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineOptions& options) {
     if (model.impl_ == nullptr) { throw std::invalid_argument("loaded model is empty"); }
     return qwen3_6::make_frontend(model.impl_->data.frontend,
-                                   model.impl_->data.runtime.features.vision);
+                                  qwen3_6::FrontendOptions{
+                                      .vision_enabled = model.impl_->data.runtime.features.vision,
+                                      .max_context    = options.max_context,
+                                      .media_cache_bytes        = options.media_cache_bytes,
+                                      .media_live_bytes         = options.media_live_bytes,
+                                      .media_preprocess_threads = options.media_preprocess_threads,
+                                  });
 }
 
-Package::SequencePlan Package::plan_sequence(DeviceContext& device, const EngineOptions& options,
-                                              WeightsProfile weights_profile) {
-    return qwen3_6::plan_sequence<detail::Variant>(device, options, weights_profile);
+Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
+                                                        const EngineOptions& options,
+                                                        WeightsProfile weights_profile) {
+    return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 
 std::unique_ptr<Package::Program>

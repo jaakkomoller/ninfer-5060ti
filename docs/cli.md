@@ -24,8 +24,11 @@ written to stderr, so stdout can be redirected independently:
   > answer.txt 2> run.log
 ```
 
-Thinking is enabled by default. Add `--no-thinking` for direct-response prompt rendering or
-`--greedy` for exact argmax decoding.
+Thinking is enabled by default. If the chat template embedded in the loaded artifact exposes
+reasoning effort, `--reasoning-effort low|medium|xhigh` selects it; omitting the option uses the
+template's default. An artifact whose template does not expose effort rejects the option. Add
+`--no-thinking` for direct-response prompt rendering; it cannot be combined with
+`--reasoning-effort`. `--greedy` selects exact argmax decoding independently.
 
 ## Startup memory profile
 
@@ -80,8 +83,11 @@ Run message files from the repository root when they contain repository-relative
   --vision
 ```
 
-Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`. Message content
-may be a string or an ordered array containing:
+Supported roles are `system`, `developer`, `user`, `assistant`, and `tool`.
+System and developer messages retain their array positions; the Qwen family frontend renders both
+as system-class ChatML turns rather than moving later instructions to the beginning.
+
+Message content may be a string or an ordered array containing:
 
 | Content type | Source field | Accepted source |
 |---|---|---|
@@ -129,7 +135,8 @@ measured recommendation rather than a semantic limit.
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--max-context N` | allocated context capacity | `2048` |
+| `--max-context N` | per-sequence logical context ceiling | `2048` |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |
@@ -140,14 +147,30 @@ measured recommendation rather than a semantic limit.
 | `--vision` | enable image/video input and load Vision GPU allocations | off |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-thinking` | disable thinking in prompt rendering | thinking on |
+| `--reasoning-effort low\|medium\|xhigh` | select an effort exposed by the loaded chat template | template default |
 | `--greedy` | exact argmax decoding | off |
-| `--temperature F` | sampling temperature | `0.6` |
-| `--top-p F` | nucleus threshold | `0.95` |
-| `--top-k N` | top-k threshold | `20` |
-| `--min-p F` | min-p threshold | `0` |
-| `--presence-penalty F` | presence penalty | `1.0` |
-| `--frequency-penalty F` | frequency penalty | `0` |
+| `--temperature F` | sampling temperature override | registered model/mode default |
+| `--top-p F` | nucleus-threshold override | registered model/mode default |
+| `--top-k N` | top-k-threshold override | registered model/mode default |
+| `--min-p F` | min-p-threshold override | registered model/mode default |
+| `--presence-penalty F` | presence-penalty override | registered model/mode default |
+| `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
+
+When a sampling flag is omitted, Engine selects the official general-task preset registered for
+the loaded model and the rendered prompt mode. The current presets are:
+
+| Model | Prompt mode | Temperature | Top-p | Top-k | Min-p | Presence penalty |
+|---|---|---:|---:|---:|---:|---:|
+| Qwen3.6-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.6-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.8-27B | thinking | `1.0` | `0.95` | `20` | `0` | `0` |
+| Qwen3.8-27B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+| Qwen3.6-35B-A3B | thinking | `1.0` | `0.95` | `20` | `0` | `1.5` |
+| Qwen3.6-35B-A3B | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+
+Frequency penalty is `0` in every registered preset. Qwen's separate precise-coding recommendation
+is task-specific and is therefore an explicit override rather than an inferred Engine default.
 
 Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
 `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
@@ -157,10 +180,19 @@ Run `./build/apps/ninfer --help` for the exact option contract.
 
 ## Context and memory
 
-Both registered models have a native context limit of 262,144 tokens. The practical allocation on
-one RTX 5090 depends on the selected artifact, media workload, output budget, and KV-cache type.
+The registered model IDs have a native context limit of 262,144 tokens. The practical
+allocation on one RTX 5090 depends on the selected artifact, media workload, output budget, and
+KV-cache type.
 Use `--kv-dtype int8` for large context allocations. The prepared prompt must fit
 `--max-context`; generation stops at the remaining context capacity when necessary.
+`--kv-capacity N` controls the shared physical Main Text KV pool independently and is rounded up to
+the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
+memory, and directly chooses the largest legal page capacity for the complete enabled runtime
+layout. This includes the selected speculative backend, fixed sequence state, workspace, Vision
+request transient, and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
+unallocated. It does not probe allocations or resize the pool at request time. The single-request
+CLI normally leaves the option omitted so it follows
+`--max-context`; the distinction matters primarily to a concurrent Engine or server.
 
 At Engine startup NInfer reserves model weights, persistent sequence state, one phase-reused
 Program scratch arena, the maximum Vision request-transient buffer when Vision is enabled, and a

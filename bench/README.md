@@ -1,9 +1,9 @@
 # Benchmarks
 
 `ninfer_bench` measures the complete public `ninfer::Engine` route against a `.ninfer` artifact.
-The `bench/ops/` `ninfer_<op>_bench` executables measure central Op contracts and their specialized
-CUDA implementations for ncu/nsys work. Target benchmarks measure Program/model composition.
-Correctness and model parity live outside this directory; development rules are in
+The `bench/ops/` `ninfer_<op>_bench` executables measure central public Op contracts while leaving
+implementation selection behind those contracts. Target benchmarks measure Program/model
+composition. Correctness and model parity live outside this directory; development rules are in
 [`../docs/maintainer/op-development.md`](../docs/maintainer/op-development.md).
 
 ## Build
@@ -72,16 +72,20 @@ load, graph construction, and warmup do not enter topology counts.
 ## Linear Op benchmark
 
 `ninfer_linear_bench` measures only the public pure `linear()` contract. It supports Q4, Q5, Q6,
-W8, registered BF16 weights, and the registered NVFP4 problems. Existing formats use
-`--policy a16`; NVFP4 additionally supports `--policy a4`, which keeps `T<=16` on A16 and measures
-the complete activation-quantization plus W4A4 GEMM call for `T>16`. LinearAdd, LinearSwiGLU,
+W8, registered BF16 weights, the registered NVFP4 problems, and the registered FP8 problems.
+Existing formats use `--policy a16`; NVFP4 additionally supports `--policy a4`, and
+FP8 supports `--policy a8`. Each permission lets the production resolver select the qualified
+route for the exact geometry and T. LinearAdd, LinearSwiGLU,
 LinearPair, Attention/GDN projections, and sparse MoE remain separate semantic Ops and are not
 benchmark modes here.
 
 This is a long-lived public benchmark: every timed and profiled point calls `ninfer::ops::linear`
 and lets production dispatch choose the implementation. Candidate crossover work uses a
-task-local temporary sweep, records the winner or boundary in production dispatch, and deletes the
-temporary candidate controls afterward; private launchers and route forcing do not belong here.
+task-local temporary sweep, puts the winner or boundary in production dispatch, and deletes losing
+candidates and temporary controls afterward; private launchers and route forcing do not belong in
+this retained benchmark. An Op-scoped Linear qualification uses this benchmark directly and does
+not load an artifact or invoke the target, Program, Engine, or round benchmarks documented
+elsewhere in this file.
 
 Build the benchmark and measure one exact production point:
 
@@ -91,6 +95,10 @@ cmake --build build --parallel --target ninfer_linear_bench
   --qtype q4 --policy a16 --n 4096 --k 5120 --t 8
 ./build/bench/ninfer_linear_bench \
   --qtype nvfp4 --policy a4 --n 14336 --k 5120 --t 1024
+./build/bench/ninfer_linear_bench \
+  --qtype fp8 --policy a8 --n 14336 --k 5120 --t 1
+./build/bench/ninfer_linear_bench \
+  --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
 ```
 
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
@@ -115,6 +123,11 @@ matrix:
 ./build/bench/ninfer_linear_bench --suite all
 ```
 
+When a point group includes `T=1`, `T1_lin_x` reports the calculated ratio
+`T * median(T=1) / median(T)`. It is a scaling reference from one public `T=1` benchmark point,
+measured with the configured warmup and repetitions; the benchmark never issues T sequential
+`T=1` launches as a substitute workload.
+
 For NCU, `--profile` performs setup, warmup, and the L2 flush before enabling the profiler, then
 captures exactly one public Linear call. That call may emit one or more production-selected kernel
 launches:
@@ -129,24 +142,50 @@ Every ordinary sample is cold-cache: a 256 MiB L2 eviction write completes befor
 interval. Reported effective bandwidth uses the encoded weight planes once, one BF16 activation
 read, and one BF16 output write. Reported FLOPs are the mathematical `2*N*K*T`; neither metric
 copies route-private tile, replay, padding, split, schedule, host-launcher, or kernel-instance
-behavior. The fixed RTX 5090 references are `1792 GB/s` DRAM bandwidth, `209.5 TFLOP/s` dense
-BF16 Tensor Core throughput, and `1676.0 TFLOP/s` dense FP4 Tensor Core throughput. `TC_%` selects
-the reference for the production activation-compute profile; `pol` and `act` separately report
-caller permission and the resolved profile. `READ_%` additionally compares the same one-read model
+behavior. The fixed RTX 5090 memory reference is `1792 GB/s` DRAM bandwidth. Because `AllowA4` is
+a permission rather than an execution-profile label, the long-lived benchmark does not infer or
+report private activation compute or Tensor Core utilization. `READ_%` additionally compares the same one-read model
 bytes with the measured `1674.5 GB/s` pure-read ceiling from `tools/hbm_bandwidth_probe.cu`; it is
 the practical utilization measure for read-dominated points. Physical traffic and instruction
 utilization still require NCU.
 
+## Embedding Op benchmark
+
+`ninfer_embedding_bench` measures the four registered quantized public `embedding()` profiles:
+Q6 `[248320,5120]`, W8 `[248320,5120]`, W8 `[248320,2048]`, and row-scaled FP8
+`[248320,5120]`. With no token override, each profile enumerates its exact aggregate Decode domain
+for `B=1..8`: the three D=5120 profiles cover ordinary Decode and MTP through `T=48`, while
+W8/D=2048 additionally covers DFlash through `T=128`.
+
+Each interval contains one public Op call and receives one 256 MiB L2 eviction before timing; the
+eviction itself is excluded. Effective bandwidth counts the selected encoded rows, their scales,
+the I32 ids, and BF16 output once, and `READ_%` uses the measured RTX 5090 sustained-read reference.
+There are no repeated-T=1 comparisons, private launchers, forced routes, candidate kernels, or
+copied controls in this benchmark.
+
+```bash
+cmake --build build --parallel --target ninfer_embedding_bench
+./build/bench/ninfer_embedding_bench --profile q6-d5120 --warmup 10 --repeat 61
+./build/bench/ninfer_embedding_bench --profile w8-d5120 --warmup 10 --repeat 61
+./build/bench/ninfer_embedding_bench --profile w8-d2048 --warmup 10 --repeat 61
+./build/bench/ninfer_embedding_bench --profile fp8-d5120 --warmup 10 --repeat 61
+./build/bench/ninfer_embedding_bench \
+  --profile w8-d2048 --tokens 1,6,7,16,128 --warmup 10 --repeat 61 --csv
+```
+
 ## GDN control-projection Op benchmark
 
-`ninfer_gdn_gating_proj_bench` measures the registered BF16 control projection. With `--35b
---norm-control`, it measures the complete 35B RMSNorm, normalized hidden output, A/B projection,
-gate transform, and beta transform contract. `--candidate auto` uses production dispatch;
+`ninfer_gdn_gating_proj_bench` measures the registered BF16 control projection. With
+`--norm-control`, it measures the complete 27B two-weight RMSNorm/control contract; adding `--35b`
+selects the 35B contiguous-parent form. `--candidate auto` uses production dispatch;
 `--candidate composed` is the explicit RMSNorm-plus-control comparison. Every row reports the
 selected route and transient workspace after a 256 MiB L2 flush.
 
 ```bash
 cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
+./build/bench/ninfer_gdn_gating_proj_bench \
+  --norm-control --candidate auto \
+  -p 1,2,3,4,5,6,8,16,32,48 --warmup 10 --repeat 200
 ./build/bench/ninfer_gdn_gating_proj_bench \
   --35b --norm-control --candidate auto \
   -p 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --warmup 10 --repeat 200
@@ -158,15 +197,18 @@ cmake --build build --parallel --target ninfer_gdn_gating_proj_bench
 ## Gated DeltaNet Op benchmark
 
 `ninfer_gated_delta_net_bench` measures the BF16 Gated DeltaNet contract with state/head dimension
-128, batch 1, production Q/K normalization, and any positive, divisible
-`value_heads >= qk_heads` mapping. Every measurement is a CUDA Graph replay preceded by a 256 MiB
-L2 flush outside the timed interval.
+128, production Q/K normalization, and any positive, divisible `value_heads >= qk_heads` mapping.
+Running/chunked modes use batch 1; snapshot mode accepts exact `B=1..8` and optional mixed valid
+prefixes. Every measurement is a CUDA Graph replay preceded by a 256 MiB L2 flush outside the timed
+interval.
 
 `--running` measures the public running-state entry across recurrent-only, complete 64-token
-chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the 17-slot snapshot entry over
-the production `T=1..16` range; `--qk-norm composed` retains the two-L2Norm comparison.
-`--chunked-only` measures the private pre-normalized BF16 pipeline. Adding `--breakdown` reports the
-end-to-end pipeline and isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings.
+chunks, and chunked-plus-recurrent-tail routes. `--snapshot` measures the snapshot entry over the
+production `W=1..16` batch range; `--qk-norm composed` retains the B=1 two-L2Norm comparison.
+`--chunked-only` measures the complete pre-normalized BF16 pipeline through the public Op. Adding
+`--breakdown` reports isolated `prepare_wy_wu`, `state_passing`, and `output` stage timings. These
+three intrinsic algorithm stages are the benchmark's sole private-launcher exception; the complete
+pipeline and every other mode remain public-contract calls.
 `stage_share_pct` partitions the sum of isolated-stage medians. Each isolated stage receives its own
 cold-L2 flush, so `relative_to_e2e_pct` is informative but is not an additive partition of the
 pipeline latency.
@@ -193,165 +235,184 @@ cmake --build build --parallel --target ninfer_gated_delta_net_bench ninfer_gdn_
   --route fused --norm-control fused --qk-norm fused --warmup 20 --repeat 500
 ```
 
-## Input-projection Op benchmark
+## GDN input-projection Op benchmark
 
-`ninfer_input_proj_bench` measures the exact Qwen3.6-27B Attention and GDN input-projection shapes,
-including the stateful GDN convolution/snapshot form.
-The default Q4/Q5 Attention production path uses two parent projections and its benchmark-only
-control uses the former four logical projections. BF16 and NVFP4 modes measure the single-parent
-Attention route; NVFP4 accepts `--policy a16|a4`. GDN production writes directly into the pitched
-final output; its controls isolate projection time and the former materialize-plus-two-copy
-composition. All timed operands, including the queried A4 workspace, are allocated before
-measurement, and each sample is preceded by a 256 MiB L2 flush. Activation quantization remains
-inside the timed public call. Existing Q4/Q5 production accepts the Text token extent through the
-benchmark allocation limit; controls remain limited to their Small-T domain.
+`ninfer_gdn_input_proj_bench` measures all registered public `gdn_input_proj` forms: the 27B
+Q4/Q5 two-parent projection, the 35B W8 single-parent projection, and the 27B NVFP4 or row-scaled
+FP8 single-parent projection under its admitted policies. Every timed and profiled point is exactly
+one public Op call. Single-parent workspace is queried and allocated through the public capacity
+entry before timing; the benchmark has no private launchers, route controls, or candidate mode.
+
+Cold cache is the primary model-layer condition. Reported logical traffic counts encoded weights
+once, BF16 input once, and QKV/Z outputs once. FLOPs describe the complete registered projection.
+The benchmark reports caller policy rather than inferring a private activation-compute route.
 
 ```bash
-cmake --build build --parallel --target ninfer_input_proj_bench
-./build/bench/ninfer_input_proj_bench \
-  --op all --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,128,129,1024 \
-  --warmup 5 --repeat 50 --csv-out profiles/bench/input_proj.csv
+cmake --build build --parallel --target ninfer_gdn_input_proj_bench
+./build/bench/ninfer_gdn_input_proj_bench \
+  --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
+  --cache cold --warmup 5 --repeat 30 \
+  --csv-out profiles/bench/gdn_input_proj.csv
+./build/bench/ninfer_gdn_input_proj_bench \
+  --format nvfp4 --nvfp4-policy a4 --tokens 1024 --cache cold --profile
+./build/bench/ninfer_gdn_input_proj_bench \
+  --format fp8 --fp8-policy a8 --tokens 1,2,3,4,5,6,7,8 --cache cold
 ```
 
-The four-projection and materialize/copy controls exist only in this benchmark and are not
-production-callable routes.
+## GDN input projection/convolution Snapshot/Record Op benchmark
 
-BF16 Attention defaults to the complete decode/small-T sweep plus the first MMA point, a full/tail
-tile pair, the primary prefill point, and representative larger chunks. A focused decode run is:
+`ninfer_gdn_input_proj_conv_snapshot_bench` measures the public Qwen3.6/Qwen3.8 Q4/Q5, NVFP4,
+row-scaled FP8, and W8 `gdn_input_proj_conv_snapshot` / `gdn_input_proj_conv_record` forms for exact
+`B=1..8`. The timed body is exactly one complete public Op call; the benchmark does not include
+private launchers, candidate selection, duplicated compositions, or route labels. Its default
+`T=1..6` sweep is the production MTP verification interval; Record begins at `T=2`.
+`--form snapshot|record|both` selects the semantic form. NVFP4 accepts public `a16`/`a4`, while FP8
+accepts `a16`/`a8`; the reported profile names caller policy, not a private resolved route.
+
+CUDA Graph replay is the default execution mode. The graph contains external timing event nodes
+around the complete Op body, while L2 eviction stays outside the timed interval. Cold-cache results
+model successive model layers with distinct weights and are the authoritative comparison; warm
+results make launch and cache effects visible. The initial state occupies a slot disjoint from all
+published snapshot slots, so repeated replay does not introduce a benchmark-only state reset.
 
 ```bash
-./build/bench/ninfer_input_proj_bench \
-  --op attention --weight-type bf16 --t-sweep 1 \
-  --warmup 20 --repeat 500
+cmake --build build --parallel --target ninfer_gdn_input_proj_conv_snapshot_bench
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format q4q5 --sweep 1:6 --execution graph --cache both \
+  --warmup 10 --repeat 100 \
+  --csv-out profiles/bench/gdn_input_proj_conv_snapshot.csv
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format nvfp4 --nvfp4-policy a4 --sweep 1:17 \
+  --execution graph --cache cold --warmup 10 --repeat 100
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format w8 --tokens 16 --batch 8 \
+  --execution graph --cache cold --warmup 10 --repeat 100
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format nvfp4 --tokens 6 --batch 3 --valid-columns 6,3,1 \
+  --execution graph --cache cold --warmup 10 --repeat 100
+./build/bench/ninfer_gdn_input_proj_conv_snapshot_bench \
+  --format fp8 --fp8-policy a8 --form both --batch 1 --sweep 1:16 \
+  --execution both --cache both --warmup 5 --repeat 30
 ```
 
-`--bf16-route production|small-t|mma|all` provides the corresponding benchmark-local crossover
-controls. The candidate small-T implementation remains measurable through `T=32`; this range is
-not the production crossover.
+`--execution eager|both` is available only to attribute launch behavior; it calls the same public
+Op with the same operands and workspace.
 
-The NVFP4 A16 decode point is:
+## Softmax Attention Op benchmarks
+
+The four Softmax Attention executables share one harness rule: fixture setup, public workspace
+capacity queries, L2 conditioning, graph capture, and synchronization stay outside the timed
+interval. An eager interval contains one public Op call; a captured graph contains that same one
+public call. `--profile` likewise brackets one complete public call and requires one exact semantic
+point. There are no private headers, launchers, route labels, candidate controls, tile sizes, split
+counts, or kernel-name filters in these benchmarks.
+
+`ninfer_causal_softmax_attention_bench` measures the two public causal-cache entries:
+append-and-attend and cached-only. It covers the registered D256 H24/KV4 and H16/KV2 geometries
+with BF16 and INT8-G64 KV storage. Production dispatch receives the caller-visible execution
+envelope and owns all decode, prompt, Small-T, and split-KV choices.
+
+Append-and-attend accepts `--batch 1,2,4,8`; each ordinary `--context L` point gives every row the
+same context and all `W` columns are valid. One exact mixed profile uses `--row-contexts`,
+`--valid-columns`, and `--table-rows`, each with exactly `B` entries. Cached-only remains B=1.
+The timed call consumes the whole batch once; metadata copies and graph capture remain outside the
+interval. Uniform full-width profiles use the dense public contract; exact partial profiles use
+device-resident valid extents. Reported useful bytes/FLOPs sum only valid row work.
 
 ```bash
-./build/bench/ninfer_input_proj_bench \
-  --op attention --weight-type nvfp4 --t-sweep 1 \
-  --warmup 10 --repeat 200
+cmake --build build --parallel --target ninfer_causal_softmax_attention_bench
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry both --geometry all --kv-dtype all --batch 1 \
+  --tokens 1,2,4,6,8,12,16 --context 0,128,2048,8192 \
+  --execution graph --cache cold --warmup 10 --repeat 61
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry d256-h16-kv2 --kv-dtype int8 \
+  --batch 3 --tokens 6 --row-contexts 127,2047,63 \
+  --valid-columns 6,3,0 --table-rows 2,0,1 \
+  --execution graph --cache cold --warmup 10 --repeat 61
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
+  --tokens 16 --context 8192 --execution graph --cache cold --profile
 ```
 
-The primary NVFP4 W4A4 point is:
+`ninfer_context_softmax_attention_bench` measures the public read-only context-plus-query contract
+at Q32/KV8/D128 with BF16 context storage. `T` is a complete non-causal query block and `L` is its
+external context length.
 
 ```bash
-./build/bench/ninfer_input_proj_bench \
-  --op attention --weight-type nvfp4 --policy a4 --t-sweep 1024 \
-  --warmup 5 --repeat 30
-```
-
-The NVFP4 GDN snapshot mode calls only the complete public Op. `a16` is registered through `T=16`;
-`a4` keeps those extents on the same fused A16 kernels and uses W4A4 Linear plus one post kernel
-for `T>16`:
-
-```bash
-./build/bench/ninfer_input_proj_bench \
-  --op gdn-snapshot --weight-type nvfp4 --policy a4 \
-  --t-sweep 1,4,8,16,17,1024 --warmup 10 --repeat 100
-```
-
-Its table and CSV separate logical Op bytes from route-private single-pass bytes. Logical bytes
-include the encoded parent, BF16 activation, convolution weights, selected initial history, four
-final outputs, and published snapshots. Private bytes report the packed BF16 projection
-write/read and, on W4A4 routes, activation-code/scale write/read. These are an explicit useful-byte
-model, not a claim about cache-line or physical DRAM traffic.
-
-The direct Attention and stateless GDN modes count the complete parent exactly once, one activation
-read, and the final output writes. Their result reports the same fixed-spec `DRAM_%` and measured
-pure-read `READ_%` columns as the Linear control, plus profile-appropriate BF16 or FP4 `TC_%`.
-`--profile` performs setup, warmup, and L2 eviction before capturing exactly one selected launch;
-production routes enter through the corresponding public BF16 or NVFP4 Op call.
-
-## Bidirectional GQA Op benchmark
-
-`ninfer_bidirectional_gqa_attention_bench` measures the read-only, non-causal Q32/KV8/D128
-attention contract for `T=1..16`. Every timed invocation is a CUDA Graph replay. `--cold-cache`
-flushes 256 MiB before each sample outside the timed interval; `--route direct|split` and the tile
-and split overrides expose candidate controls, while `--route production` uses measured dispatch.
-
-```bash
-cmake --build build --parallel --target ninfer_bidirectional_gqa_attention_bench
-./build/bench/ninfer_bidirectional_gqa_attention_bench \
+cmake --build build --parallel --target ninfer_context_softmax_attention_bench
+./build/bench/ninfer_context_softmax_attention_bench \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 0,2048,8192,32768,131072,196608,262144 \
-  --route production --cold-cache --warmup 10 --repeat 61
-./build/bench/ninfer_bidirectional_gqa_attention_bench \
-  --tokens 16 --context 262144 --route production --cold-cache --profile-once
+  --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-The reported useful roofline counts one read of context K/V, query Q/K/V, and one output write,
-plus the full QK and PV FLOPs. It intentionally excludes implementation scratch traffic.
-
-## Symmetric sliding-window GQA Op benchmark
-
-`ninfer_swa_bench` measures the read-only, non-causal Q32/KV8/D128 attention contract over a
-4096-slot cyclic BF16 context and a complete temporary query block for `T=1..16`. Every timed
-invocation is a CUDA Graph replay. `--cold-cache` flushes 256 MiB before each sample outside the
-timed interval. `--route direct|split`, `--key-block`, and `--split-capacity` expose candidate
-controls; `--route production` uses the measured dispatch.
+`ninfer_sliding_window_attention_bench` measures the public Q32/KV8/D128 symmetric sliding-window
+contract over the 4096-slot cyclic BF16 cache and a complete non-causal query block.
 
 ```bash
-cmake --build build --parallel --target ninfer_swa_bench
-./build/bench/ninfer_swa_bench \
+cmake --build build --parallel --target ninfer_sliding_window_attention_bench
+./build/bench/ninfer_sliding_window_attention_bench \
   --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
   --context 0,32,64,96,128,4095,4096,8192,262144 \
-  --route production --cold-cache --warmup 10 --repeat 61
-./build/bench/ninfer_swa_bench \
-  --tokens 16 --context 4096 --route production --cold-cache --profile-once
+  --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-The useful roofline counts the admitted cyclic context once, query Q/K/V, one output write, and
-the complete QK/PV FLOPs. It intentionally excludes split/reduce scratch traffic; the
-implementation-traffic comparison is reported separately in the Op qualification.
-
-## Device-count K/V prefix-append benchmark
-
-`ninfer_kv_cache_append_prefix_bench` measures exact BF16 D128/KV8 prefix publication into linear
-and 4096-slot cyclic cache layouts. `T` fixes the captured launch envelope, while `C` is the device
-commit count and determines the exact bytes written. Every timed invocation is one CUDA Graph
-replay. `--cold-cache` flushes 256 MiB before each sample outside the timed interval, and
-`--route flat16|flat32|persistent32|token` exposes private candidate controls.
+`ninfer_packed_softmax_attention_bench` measures both public dense Attention overloads: a uniform
+plain-segment entry and a packed entry driven by cumulative segment lengths. Equal-length inputs
+can compare both public entries; nonuniform inputs select only `packed`.
 
 ```bash
-cmake --build build --parallel --target ninfer_kv_cache_append_prefix_bench
-./build/bench/ninfer_kv_cache_append_prefix_bench \
-  --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --counts 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --layout all --route production --cold-cache --warmup 10 --repeat 61
-./build/bench/ninfer_kv_cache_append_prefix_bench \
-  --tokens 16 --counts 16 --layout cyclic --route production --profile-once
+cmake --build build --parallel --target ninfer_packed_softmax_attention_bench
+./build/bench/ninfer_packed_softmax_attention_bench \
+  --entry both --segments 16 --length 256 \
+  --execution graph --cache cold --warmup 10 --repeat 61
+./build/bench/ninfer_packed_softmax_attention_bench \
+  --entry packed --segment-lengths 128,256,384,512 \
+  --execution graph --cache cold --warmup 10 --repeat 61
 ```
 
-Useful traffic is the exact committed K/V input read plus cache write, 8192 bytes per committed
-token. `C=0` still exercises the captured device-count launch but has zero useful bytes.
+The bandwidth and FLOP fields are semantic useful-work models. They do not infer private scratch
+traffic, launch decomposition, or selected implementation from kernel names; physical traffic and
+instruction utilization require a profiler capture of the complete public call.
 
-## Masked-block preparation benchmark
+## KV cache append Op benchmark
 
-`ninfer_prepare_masked_block_bench` measures the exact I32 anchor/mask block transform for every
-registered `B=2..16`. Every timed invocation is one CUDA Graph replay. An untimed 256 MiB write
-conditions GPU clocks; hot mode primes the Op once after that write, while `--cold-cache` measures
-immediately after it. `--route warp32|block64|block128|block256` exposes private candidate
-controls, and `--route production` uses measured dispatch.
+`ninfer_kv_cache_append_bench` unifies the two public append contracts without combining them in
+one timed body. `--mode full` calls full D256 KV publication for KV4/KV2 and BF16/INT8-G64 caches.
+`--mode prefix` calls device-count prefix publication for BF16 D128/KV8 linear or 4096-slot cyclic
+caches; `T` is the public envelope and `C` is the device commit count. Every measured interval or
+captured graph contains exactly one selected public append call.
+
+```bash
+cmake --build build --parallel --target ninfer_kv_cache_append_bench
+./build/bench/ninfer_kv_cache_append_bench \
+  --mode full --full-geometry all --kv-dtype all --tokens 1,2,4,8,16 \
+  --context 128 --execution graph --cache cold --warmup 10 --repeat 61
+./build/bench/ninfer_kv_cache_append_bench \
+  --mode prefix --tokens 1,2,4,8,16 --counts 0,1,2,4,8,16 \
+  --layout all --execution graph --cache cold --warmup 10 --repeat 61
+```
+
+Prefix useful traffic is 8192 bytes per committed token; `C=0` still exercises the public
+device-count contract and reports zero useful bytes.
+
+## Masked-block preparation Op benchmark
+
+`ninfer_prepare_masked_block_bench` measures the public exact I32 anchor/mask transform for every
+registered `B=2..16`. Eager and graph modes call the same public contract; cold mode performs the
+256 MiB L2 eviction before the timed interval.
 
 ```bash
 cmake --build build --parallel --target ninfer_prepare_masked_block_bench
 ./build/bench/ninfer_prepare_masked_block_bench \
-  --block-sizes 2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 --route all
-./build/bench/ninfer_prepare_masked_block_bench \
   --block-sizes 2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --route production --cold-cache --warmup 20 --repeat 101
+  --execution graph --cache both --warmup 20 --repeat 101
 ./build/bench/ninfer_prepare_masked_block_bench \
-  --block-sizes 16 --route production --profile-once
+  --block-sizes 16 --execution graph --cache cold --profile
 ```
 
 Useful traffic is `(2+2B)*4` bytes: two device scalar reads and two complete I32 output writes.
-This benchmark qualifies block preparation and route selection only; it neither includes nor
-claims the deferred embedding fusion or complete-round performance.
 
 ## W8 LinearSwiGLU Op benchmark
 
@@ -370,20 +431,61 @@ cmake --build build --parallel --target ninfer_w8_linear_swiglu_bench
   --profile --t-sweep 1024
 ```
 
+## Q4 LinearSwiGLU Op benchmark
+
+`ninfer_q4_linear_swiglu_bench` measures the public Q4 `[34816,5120] -> [17408,T]` profile and
+queries workspace capacity for the requested aggregate interval.
+
+```bash
+cmake --build build --parallel --target ninfer_q4_linear_swiglu_bench
+./build/bench/ninfer_q4_linear_swiglu_bench \
+  --t-sweep 1,2,4,8,16,24,32,40,48 --warmup 10 --repeat 50
+```
+
+## FP8 LinearSwiGLU Op benchmark
+
+`ninfer_fp8_linear_swiglu_bench` measures the public row-scaled FP8 `[34816,5120] ->
+[17408,T]` profile. `--policy a8` measures the production resolver, including caller-owned
+activation workspace and the fused SwiGLU output; `--policy a16` measures the public A16 form.
+The Tensor Core percentage uses the RTX 5090 dense FP8/FP32-accumulate reference of 419 TFLOP/s
+only for extents that the production resolver sends to A8.
+
+```bash
+cmake --build build --parallel --target ninfer_fp8_linear_swiglu_bench
+./build/bench/ninfer_fp8_linear_swiglu_bench \
+  --policy a8 \
+  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,24,32,40,48,1024 \
+  --warmup 5 --repeat 30
+```
+
+## Q5 LinearAdd Op benchmark
+
+`ninfer_q5_linear_add_bench` measures the public Q5 `[5120,6144]` and `[5120,17408]`
+LinearAdd profiles. Every cold-cache sample is one production-dispatched public call, with the
+workspace capacity queried for the requested interval.
+
+```bash
+cmake --build build --parallel --target ninfer_q5_linear_add_bench
+./build/bench/ninfer_q5_linear_add_bench \
+  --k 6144 --t-sweep 1,2,4,8,16,24,32,48 --warmup 10 --repeat 50
+./build/bench/ninfer_q5_linear_add_bench \
+  --k 17408 --t-sweep 1,2,4,8,16,24,32,48 --warmup 10 --repeat 50
+```
+
 ## BF16 LinearAdd Op benchmark
 
 `ninfer_bf16_linear_add_bench` measures the contiguous BF16 `[5120,6144]` projection with its
-in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..26`, and
-MMA from `T=27`; `--route all` retains the legal overlap needed to reproduce that crossover.
+in-place BF16 residual epilogue. Production uses decode at `T=1`, exact-small-T at `T=2..4`,
+aggregate MMA through `T=48`, and the large-T MMA afterward.
 Every sample is cold-cache. Effective bandwidth counts the weight once, the activation once, and
-the residual read plus write; `READ_%` and `TC_%` use the same RTX 5090 references as the Linear
-benchmark.
+the residual read plus write; its `READ_%` and `TC_%` use the benchmark's explicit RTX 5090 BF16
+references.
 
 ```bash
 cmake --build build --parallel --target ninfer_bf16_linear_add_bench
 ./build/bench/ninfer_bf16_linear_add_bench \
-  --sweep 1:32:1 --route all --warmup 10 --repeat 50 \
-  --csv-out profiles/bench/bf16_linear_add_t1_32.csv
+  --sweep 1:48:1 --route production --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/bf16_linear_add_t1_48.csv
 ./build/bench/ninfer_bf16_linear_add_bench \
   --t-sweep 1024,1536,2048 --route production --warmup 10 --repeat 50
 ./build/bench/ninfer_bf16_linear_add_bench \
@@ -392,17 +494,17 @@ cmake --build build --parallel --target ninfer_bf16_linear_add_bench
 
 ## W8 LinearAdd Op benchmark
 
-`ninfer_w8_linear_add_bench` measures the W8 `[2048,6144]` projection with its BF16 residual
-epilogue. Production updates the residual in place and uses no workspace. The explicit control
-runs the same-shape parent `linear` into a scratch allocation followed by `residual_add`.
-Candidate mode retains the direct-decode, exact-T split-K Tensor Core, composite exact-T, and tiled
-Tensor Core schedules used to tune every dispatch seam. Every cold-cache sample follows a 256 MiB
-L2 flush.
+`ninfer_w8_linear_add_bench` measures the W8 `[2048,4096]` and `[2048,6144]` projections with their
+BF16 residual epilogue. Production updates the residual in place and uses no workspace. Use
+`--production-only` for public evidence; every cold-cache sample follows a 256 MiB L2 flush.
 
 ```bash
 cmake --build build --parallel --target ninfer_w8_linear_add_bench
 ./build/bench/ninfer_w8_linear_add_bench \
-  --production-only \
+  --k 4096 --production-only \
+  --t-sweep 1,2,4,8,16,32,48,64,96,128 --warmup 10 --repeat 50
+./build/bench/ninfer_w8_linear_add_bench \
+  --k 6144 --production-only \
   --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,32,33,64,65,96,128,256,640,641,896,960,1024,1280,2048 \
   --warmup 10 --repeat 50 --csv-out profiles/bench/w8_linear_add.csv
 ./build/bench/ninfer_w8_linear_add_bench \
@@ -412,67 +514,109 @@ cmake --build build --parallel --target ninfer_w8_linear_add_bench
   --profile --production-only --t-sweep 1024
 ```
 
-## 35B W8 input-projection Op benchmark
+## FP8 LinearAdd Op benchmark
 
-`ninfer_w8_input_proj_bench` measures the registered 35B-A3B target's W8 Attention
-`[9216,2048]`, the companion Q/K/V Attention `[6144,2048]`, and GDN `[12288,2048]`
-multi-output Ops. Production writes independent contiguous consumer allocations directly. The
-non-production sweep exposes only the fused Op's compiled local launchers. Unsupported parent
-Linear and parent-plus-extract controls were removed instead of expanding the pure W8 registry.
-Each timed sample is preceded by a 256 MiB L2 flush.
-
-`--op companion-attention` covers the exact `T=1..16` proposal domain and the tuned prefill
-dispatch. `--production-only` suppresses candidates for a compact boundary sweep; `--profile`
-launches the selected production kernel once for an NCU capture.
-
-`--op gdn-snapshot` measures the complete stateful GDN input projection, causal convolution, SiLU,
-Q/K/V split, z projection, and snapshot publication contract. It reports the selected production
-route and an explicit five-launch composed control at every requested T.
+`ninfer_fp8_linear_add_bench` measures the two public row-scaled FP8 LinearAdd registrations,
+including activation quantization, caller-owned workspace, contraction, residual read, and final
+in-place BF16 write. `--policy a8` follows the independent production resolver of the selected
+semantic Op: `[5120,6144]` uses A16 below `T=22`, while `[5120,17408]` uses A16 below `T=25`; larger
+extents use FP8/FP32-accumulate Tensor Core contraction. `TC_%` is reported only when that A8 route
+actually executes, against the RTX 5090 419 TFLOP/s reference.
 
 ```bash
-cmake --build build --parallel --target ninfer_w8_input_proj_bench
-./build/bench/ninfer_w8_input_proj_bench \
-  --op all --t-sweep 1,2,4,8,12,13,16,17,32,64,128,129,256,512,1024 \
-  --warmup 10 --repeat 50 --csv-out profiles/bench/w8_input_proj_final.csv
-
-./build/bench/ninfer_w8_input_proj_bench \
-  --op gdn-snapshot --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --warmup 5 --repeat 50 --csv-out profiles/bench/gdn_input_snapshot.csv
-
-./build/bench/ninfer_w8_input_proj_bench \
-  --op companion-attention \
-  --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,32,33,64,65,96,97,128,256,512,896,1024 \
-  --production-only --warmup 20 --repeat 100 \
-  --csv-out profiles/bench/w8_companion_attention.csv
+cmake --build build --parallel --target ninfer_fp8_linear_add_bench
+./build/bench/ninfer_fp8_linear_add_bench \
+  --k 6144 --policy a8 --t-sweep 1,2,4,8,16,20,21,22,32,48,1024 \
+  --warmup 5 --repeat 30
+./build/bench/ninfer_fp8_linear_add_bench \
+  --k 17408 --policy a8 --t-sweep 1,2,4,8,16,24,25,32,48,1024 \
+  --warmup 5 --repeat 30
 ```
 
-The executable isolates these Op contracts; end-to-end 35B-A3B measurement uses `ninfer_bench`.
+## Attention input-projection Op benchmark
+
+`ninfer_attn_input_proj_bench` measures every registered public `attn_input_proj()` weight/shape
+contract: the 27B two-parent Q4/Q5 projection; the 35B W8 Q/K/gate/V and companion Q/K/V
+projections; and the 27B BF16, NVFP4, and T=1 FP8 single-parent Q/K/gate/V projections. Fixture
+packing and public workspace capacity queries happen before timing. Every sample and profiler
+range contains exactly one public Op call, so production owns format-specific dispatch and launch
+decomposition.
+
+```bash
+cmake --build build --parallel --target ninfer_attn_input_proj_bench
+./build/bench/ninfer_attn_input_proj_bench \
+  --format all --tokens 1,2,4,8,12,16,32,64,128,256,512,1024 \
+  --cache cold --warmup 10 --repeat 50 \
+  --csv-out profiles/bench/attn_input_proj.csv
+./build/bench/ninfer_attn_input_proj_bench \
+  --format nvfp4 --nvfp4-policy a4 --tokens 1024 \
+  --cache cold --warmup 10 --profile
+./build/bench/ninfer_attn_input_proj_bench \
+  --format fp8 --fp8-policy a8 --tokens 1 \
+  --cache cold --warmup 10 --repeat 50
+```
+
+The stateful GDN projection/convolution/snapshot contract remains in its own public Op benchmark;
+it is not a mode of Attention input projection. End-to-end target measurement uses `ninfer_bench`.
 
 ## 35B sparse-MoE dFlash benchmark
 
 `ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
-Q4+Q5/Q6 profiles and the MTP W8+W8 profile. Small-T rows report the selected number of D3
-paths/CTA (`p`) and D4 output rows/CTA (`r`). `--matrix` includes the former three-path/one-row
-schedule as a same-process control.
+Q4+Q5/Q6 profiles and the MTP W8+W8 profile. It is a long-lived public Op benchmark: fixture setup
+uses `sparse_moe_workspace_capacity_bytes()`, and every eager or captured measurement calls only
+`ninfer::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
+workspace views, launch decomposition, and schedule selection.
+
+CUDA Graph replay is the default and authoritative execution mode. The benchmark eagerly
+materializes the public call, captures it with stable tensor and workspace addresses, instantiates
+the graph, and primes one replay before configured warmup. Timing-enabled external event nodes
+surround the captured public call, so `graph_replay` reports the complete device-side SparseMoe
+body while excluding fixture reset, L2 eviction, graph capture/instantiation/prime, host launch,
+and host synchronization. `eager` uses the same public-call lambda and is only a comparison mode.
 
 ```bash
 cmake --build build --parallel --target ninfer_sparse_moe_bench
-for codec in q4-q5 q4-q6 w8-w8; do
-  for tokens in $(seq 1 16); do
-    ./build/bench/ninfer_sparse_moe_bench \
-      --scope full --candidate production --codec "$codec" --tokens "$tokens" \
-      --distribution trace-like --warmup 5 --repeat 50
-  done
-done
-
 ./build/bench/ninfer_sparse_moe_bench \
-  --matrix --tokens 16 --distribution trace-like --warmup 5 --repeat 80
+  --codec q4-q5 --tokens 1 --execution graph --cache both \
+  --distribution trace-like --warmup 20 --repeat 200
+./build/bench/ninfer_sparse_moe_bench \
+  --codec q4-q5 --sweep 1:128:1 --execution graph --cache cold \
+  --distribution trace-like --warmup 5 --repeat 50 \
+  --csv-out profiles/bench/sparse_moe_public_graph.csv
 ```
 
 Each cold sample flushes 256 MiB before the timed interval. `trace-like` is the primary
 single-sequence verification distribution; `independent` and `same` bound zero and complete expert
-overlap. Candidate names `small-t-p{1,3,9}-r{1,2,4}` expose the compiled schedule matrix without
-changing public dispatch.
+overlap. `--execution eager|graph|both` and `--cache cold|warm|both` change only the harness around
+the same public call. The CSV `timed_scope` is `full_sparse_moe_device_body`; it contains no private
+route, candidate, grid, block, or launch-count fields.
+
+`unique_weight_gbps` counts the router, shared weights, and each selected expert's encoded weights
+once, so it is a distribution-aware useful-traffic lower bound rather than measured DRAM traffic.
+Its peak percentage uses the device's theoretical DDR bandwidth. `logical_tflops` counts the
+router plus eight routed and one shared gate/up and down matrix products.
+
+## DFlash LinearPair benchmark
+
+`ninfer_linear_pair_bench` measures one public `linear_pair()` call over the exact adjacent W8
+`[1024,2048]` K/V row views. It uses cold-cache CUDA Graph replay, accepts an arbitrary token list
+or sweep, and reports route-neutral effective bandwidth, logical FLOP/s, and calculated T=1 linear
+extrapolation.
+
+```bash
+cmake --build build --parallel --target ninfer_linear_pair_bench
+./build/bench/ninfer_linear_pair_bench --sweep 1:128:1 --warmup 5 --repeat 30
+```
+
+## MTP exact-transform benchmark
+
+`ninfer_mtp_pack_bench` calls the public bit-exact pack or attention-split Op once per point:
+
+```bash
+cmake --build build --parallel --target ninfer_mtp_pack_bench
+./build/bench/ninfer_mtp_pack_bench --op pack --d 5120 --tokens 1,2,3,4,5,6,48
+./build/bench/ninfer_mtp_pack_bench --op split --tokens 1,2,3,4,5,6,48
+```
 
 ## Target MTP round benchmark
 
@@ -486,28 +630,6 @@ cmake --build build --parallel --target ninfer_qwen3_6_27b_mtp_round_bench
 ./build/bench/ninfer_qwen3_6_27b_mtp_round_bench \
   --artifact out/qwen3_6_27b.ninfer
 ```
-
-## 35B target-side speculative round benchmark
-
-`ninfer_qwen3_6_35b_a3b_target_speculative_round_bench` measures the shared target verification,
-greedy acceptance, accepted-hidden selection, and target-state publication transaction without
-including MTP or dFlash proposal work. It uses the real 35B Text weights, target KV cache, and 17
-GDN snapshot slots when `K=15`. The default sweep covers `K=1..15` in eager and CUDA Graph modes;
-`--accepted-drafts A` forces one acceptance frontier for every selected K:
-
-```bash
-cmake --build build --parallel \
-  --target ninfer_qwen3_6_35b_a3b_target_speculative_round_bench
-./build/bench/ninfer_qwen3_6_35b_a3b_target_speculative_round_bench \
-  --artifact out/qwen3_6_35b_a3b.ninfer \
-  --context 128 --draft-tokens 7,15 --mode both
-```
-
-The reported `target_side_effective_tok_s` is `(A+1)/target-side latency`. It deliberately excludes
-proposal generation and dFlash-specific context maintenance and is not an end-to-end speed claim.
-`program_workspace_capacity_bytes` is the frozen capacity of the complete DFlash Program plan used
-to supply the benchmark's shared arena; it is not a target-round scratch measurement and does not
-change the timed scope.
 
 ## 35B complete DFlash round benchmark
 
@@ -530,51 +652,48 @@ this complete-round benchmark intentionally preserves the DFlash model's real gr
 
 ## Token-decision Op benchmarks
 
-The G1 benchmark covers the Qwen3.6-35B full physical vocabulary with 248077 valid rows at
-`C=1..16`, plus the 131072-row shortlist. Its `--control` route reads the same rotating payload and
-uses the same launch grid without computing argmax, which provides the fixed-work comparison used
-by the benchmark comparison. `--candidate-block` forces a tiled-atomic CTA geometry:
+The G1 benchmark calls public `argmax` for the Qwen3.6-35B full physical vocabulary with 248077
+valid rows through `C=128`, and for the 131072-row shortlist through `C=120`. With no arguments it
+covers every B=1 full-vocabulary width, both T1 routes, and both aggregate maxima:
 
 ```bash
 cmake --build build --parallel --target ninfer_argmax_bench ninfer_sampling_select_bench
 ./build/bench/ninfer_argmax_bench
-./build/bench/ninfer_argmax_bench --control
-./build/bench/ninfer_argmax_bench --candidate-block 128
+./build/bench/ninfer_argmax_bench --shape full --cols 128
+./build/bench/ninfer_argmax_bench --shape shortlist --cols 120
 ```
 
 The G2/G3 benchmark uses physical rows 248320, valid token domain 248077, optional occurrence
-counts, and every MTP window `K=1..5`. With no arguments it runs the full greedy/stochastic matrix;
-individual routes are suitable for Nsight Compute capture:
+counts, batched sampling at `B=1,2,4,8`, and every MTP window `K=1..5`. With no arguments it runs
+the full greedy/stochastic matrix; individual routes are suitable for Nsight Compute capture:
 
 ```bash
 ./build/bench/ninfer_sampling_select_bench --matrix
-./build/bench/ninfer_sampling_select_bench --sample --mode stochastic --top-k 20
+./build/bench/ninfer_sampling_select_bench --sample --batch 8 --mode stochastic --top-k 20
 ./build/bench/ninfer_sampling_select_bench --mtp --mode stochastic --mtp-k 5 --top-k 20
 ```
 
-## 35B dFlash attention qualification
+## 35B dFlash causal Attention qualification
 
-The GQA benchmark covers exact verify widths `T=1..16`, both KV codecs, append-and-attend and
-already-cached attention, and prints the selected context-dependent route:
-
-```bash
-./build/bench/ninfer_gqa_attention_bench --append-small-t --geometry 35b \
-  --kv-dtype bf16 --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --context 128,1024,8192
-./build/bench/ninfer_gqa_attention_bench --cached-small-t --geometry 35b \
-  --kv-dtype int8 --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
-  --context 128,1024,8192
-```
-
-The complete 35B attention mixer benchmark uses cold-cache CUDA Graph replay. Its
-`prompt-control` route preserves the former prompt implementation for a same-build layer A/B:
+The public causal benchmark covers exact verify widths `W=1..16`, both KV codecs, and the
+append-and-attend and already-cached entries for the D256 H16/KV2 geometry. Batched target
+qualification uses the append entry:
 
 ```bash
-./build/bench/ninfer_attention_layer_bench --geometry 35b --kv-dtype bf16 \
-  --context 128,1024,8192 --t-sweep 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
-./build/bench/ninfer_attention_layer_bench --geometry 35b --kv-dtype bf16 \
-  --attention-route prompt-control --context 1024,8192 --t-sweep 7,8,9,10,11,12,13,14,15,16
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry append --geometry d256-h16-kv2 --kv-dtype bf16 \
+  --batch 1,2,4,8 \
+  --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --context 128,1024,8192 --execution graph --cache cold
+./build/bench/ninfer_causal_softmax_attention_bench \
+  --entry cached --geometry d256-h16-kv2 --kv-dtype int8 \
+  --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+  --context 128,1024,8192 --execution graph --cache cold
 ```
+
+The former `attention_layer` executable composed multiple implementation-level stages and exposed
+private route controls, so it is not retained as a public Op benchmark. Complete mixer and target
+effects are measured through the public Engine benchmark or the target round benchmarks.
 
 ## Pointwise Op benchmarks
 

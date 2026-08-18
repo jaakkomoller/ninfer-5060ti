@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/load_progress/load_progress.h"
 #include "product/prompt_input/prompt_input.h"
 
 #include "ninfer/engine.h"
@@ -8,8 +9,6 @@
 #include <exception>
 #include <iomanip>
 #include <iostream>
-#include <limits>
-#include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -65,7 +64,7 @@ std::string format_arena_peak(const ninfer::ArenaMemorySummary& arena) {
     return format_bytes(arena.peak_used_bytes) + " / " + format_bytes(arena.capacity_bytes);
 }
 
-std::string format_sampling(const ninfer::SamplingParameters& sampling) {
+std::string format_sampling(const ninfer::ResolvedSamplingParameters& sampling) {
     if (sampling.temperature <= 0.0F) { return "greedy (temperature 0)"; }
     std::ostringstream output;
     output << std::fixed << std::setprecision(2) << "temp=" << sampling.temperature
@@ -97,6 +96,10 @@ std::string format_kv_cache(ninfer::KvCacheStorage storage) {
     return storage == ninfer::KvCacheStorage::BFloat16 ? "bf16" : "int8-group64";
 }
 
+std::string format_kv_capacity_mode(ninfer::KvCapacityMode mode) {
+    return mode == ninfer::KvCapacityMode::Automatic ? "auto" : "explicit";
+}
+
 void print_stage(std::string_view group, std::string_view detail, double seconds) {
     std::cerr << std::left << std::setw(12) << group << std::setw(26) << detail << std::right
               << std::setw(12) << format_seconds(seconds) << '\n';
@@ -105,12 +108,6 @@ void print_stage(std::string_view group, std::string_view detail, double seconds
 void print_metric(std::string_view label, std::string_view value) {
     std::cerr << std::left << std::setw(12) << "summary" << std::setw(26) << label << value << '\n';
 }
-
-struct ProgressState {
-    Clock::time_point started;
-    std::uint64_t done  = std::numeric_limits<std::uint64_t>::max();
-    std::uint64_t total = std::numeric_limits<std::uint64_t>::max();
-};
 
 class StreamingSink final : public ninfer::OutputSink {
 public:
@@ -155,7 +152,7 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
 }
 
 void print_generation_summary(const ninfer::GenerationResult& result,
-                              const ninfer::RequestOptions& request,
+                              const ninfer::ResolvedSamplingParameters& sampling,
                               const ninfer::MemorySummary& memory) {
     print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
@@ -167,7 +164,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     const std::size_t decoded   = generated == 0 ? 0 : generated - 1;
     const double model_seconds  = result.timings.vision_seconds + result.timings.prefill_seconds +
                                  result.timings.decode_seconds;
-    print_metric("sampling", format_sampling(request.execution.sampling));
+    print_metric("sampling", format_sampling(sampling));
     print_metric("finish reason", format_finish(result.finish_reason));
     print_metric("prompt tokens", std::to_string(result.prompt.prompt_tokens));
     print_metric("reused prompt tokens", std::to_string(result.reused_prompt_tokens));
@@ -181,16 +178,26 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                  format_rate(static_cast<double>(generated), model_seconds));
 
     const std::uint64_t reserved = static_cast<std::uint64_t>(memory.weights.capacity_bytes) +
-                                   static_cast<std::uint64_t>(memory.sequence.capacity_bytes) +
-                                   static_cast<std::uint64_t>(memory.workspace.capacity_bytes);
+                                   memory.runtime_reservation_bytes;
     print_metric("device", std::to_string(memory.device));
     print_metric("max context", std::to_string(memory.max_context));
+    print_metric("KV capacity policy", format_kv_capacity_mode(memory.kv_capacity_mode));
+    print_metric("KV capacity", std::to_string(memory.kv_capacity));
+    print_metric("KV page groups", std::to_string(memory.kv_capacity_page_groups) + " / " +
+                                       std::to_string(memory.kv_capacity_max_page_groups));
     print_metric("gpu weights used", format_arena_used(memory.weights));
     print_metric("gpu sequence used", format_arena_used(memory.sequence));
     print_metric("kv cache dtype", format_kv_cache(memory.kv_cache));
     print_metric("kv cache payload", format_bytes(memory.kv_payload_bytes));
     print_metric("gpu workspace peak", format_arena_peak(memory.workspace));
-    print_metric("gpu reserved total", format_bytes(reserved));
+    print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
+    print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
+    print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
+    print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
+    print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
+    print_metric("CUDA Graph memory", format_bytes(memory.cuda_graph_observed_bytes) + " / " +
+                                          format_bytes(memory.cuda_graph_allowance_bytes));
+    print_metric("planned device total", format_bytes(reserved));
 
     const ninfer::SpeculativeStats& speculative = result.speculative;
     if (speculative.enabled) {
@@ -237,6 +244,7 @@ int main(int argc, char** argv) {
                 ? ninfer::product::prompt_from_text(cli.prompt, cli.enable_thinking)
                 : ninfer::product::prompt_from_messages(cli.messages_path, cli.enable_thinking,
                                                         cli.enable_vision);
+        input.options.reasoning_effort = cli.reasoning_effort;
 
         ninfer::RequestOptions request;
         request.execution.sampling                = cli.sampling;
@@ -246,31 +254,19 @@ int main(int argc, char** argv) {
         request.output.raw                        = cli.raw_output;
 
         std::cerr << "phase       detail                      elapsed/progress\n";
-        std::map<std::string, ProgressState> progress;
+        ninfer::product::LoadProgressRenderer load_progress(
+            std::cerr, ninfer::product::stderr_load_progress_options());
         ninfer::EngineOptions engine_options;
-        engine_options.artifact_path                    = cli.artifact_path;
-        engine_options.device                           = cli.device;
-        engine_options.max_context                      = cli.max_context;
-        engine_options.prefill_chunk                    = cli.prefill_chunk;
-        engine_options.kv_cache                         = cli.kv_cache;
-        engine_options.speculative                      = cli.speculative;
-        engine_options.enable_vision                    = cli.enable_vision;
-        engine_options.use_cuda_graph                   = cli.use_cuda_graph;
-        engine_options.load_progress.min_interval_bytes = 1ULL << 30;
-        engine_options.load_progress.callback = [&](std::string_view phase, std::uint64_t done,
-                                                    std::uint64_t total) {
-            const auto now = Clock::now();
-            auto [it, inserted] =
-                progress.emplace(std::string(phase), ProgressState{.started = now});
-            if (!inserted && it->second.done == done && it->second.total == total) { return; }
-            it->second.done      = done;
-            it->second.total     = total;
-            const double seconds = std::chrono::duration<double>(now - it->second.started).count();
-            std::cerr << std::left << std::setw(12) << "load" << std::setw(26) << phase
-                      << std::right << std::setw(8) << format_percent(done, total) << std::setw(14)
-                      << format_bytes(done) << " / " << std::setw(14) << format_bytes(total)
-                      << std::setw(12) << format_seconds(seconds) << '\n';
-        };
+        engine_options.artifact_path  = cli.artifact_path;
+        engine_options.device         = cli.device;
+        engine_options.max_context    = cli.max_context;
+        engine_options.kv_capacity    = cli.kv_capacity;
+        engine_options.prefill_chunk  = cli.prefill_chunk;
+        engine_options.kv_cache       = cli.kv_cache;
+        engine_options.speculative    = cli.speculative;
+        engine_options.enable_vision  = cli.enable_vision;
+        engine_options.use_cuda_graph = cli.use_cuda_graph;
+        engine_options.load_progress  = load_progress.callback();
 
         const auto load_started = Clock::now();
         ninfer::Engine engine(std::move(engine_options));
@@ -281,7 +277,9 @@ int main(int argc, char** argv) {
         ninfer::PreparedPrompt prompt = engine.prepare(std::move(input));
 
         StreamingSink sink;
-        const ninfer::GenerationResult result = engine.generate(std::move(prompt), request, &sink);
+        ninfer::GenerationHandle generation = engine.submit(std::move(prompt), std::move(request));
+        const ninfer::ResolvedSamplingParameters sampling = generation.resolved_sampling();
+        const ninfer::GenerationResult result             = generation.wait(&sink);
         sink.finish_streams();
 
         if (cli.print_token_ids) {
@@ -292,7 +290,7 @@ int main(int argc, char** argv) {
             }
             std::cerr << '\n';
         }
-        print_generation_summary(result, request, engine.memory_summary());
+        print_generation_summary(result, sampling, engine.memory_summary());
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';

@@ -2,7 +2,6 @@
 
 #include "targets/qwen3_5_9b/impl/config.h"
 #include "targets/qwen3_5_9b/impl/load/bindings.h"
-#include <ninfer/targets/qwen3_6/diagnostics.h>
 #include <ninfer/targets/qwen3_6/runtime.h>
 
 #include <cstddef>
@@ -11,7 +10,7 @@
 
 namespace ninfer::targets::qwen3_5_9b::detail {
 
-using GraphFrontierRange = qwen3_6::GraphFrontierRange;
+using GraphExecutionProfile = qwen3_6::GraphExecutionProfile;
 
 struct Variant {
     using WeightsProfile                 = detail::WeightsProfile;
@@ -25,7 +24,7 @@ struct Variant {
     using MtpAttentionProjectionWeights  = detail::MtpAttentionPayload;
     using MtpPostMixerWeights            = detail::DensePostMixerPayload;
     using VisionWeights                  = qwen3_6::VisionWeights;
-    using GraphFrontierRange             = detail::GraphFrontierRange;
+    using GraphExecutionProfile          = detail::GraphExecutionProfile;
 
     static constexpr float attention_scale                     = kAttentionScale;
     static constexpr float gdn_scale                           = kGdnScale;
@@ -36,91 +35,94 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
-    static void attach_diagnostics(qwen3_6::Program<Variant>& program, void* context,
-                                    qwen3_6::TextTapCallback text,
-                                    qwen3_6::VisionTapCallback vision);
-    static void detach_diagnostics(qwen3_6::Program<Variant>& program) noexcept;
-
     static void attention_projection(const Tensor& hidden,
-                                      const FullAttentionProjectionWeights& weights, Tensor& query,
-                                      Tensor& gate, Tensor& key, Tensor& value,
+                                     const FullAttentionProjectionWeights& weights, Tensor& query,
+                                     Tensor& gate, Tensor& key, Tensor& value,
+                                     qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                     cudaStream_t stream);
+    static void attention_output_projection(const Tensor& attention, const Weight& weight,
+                                            Tensor& residual, qwen3_6::TextPhase phase,
+                                            WorkspaceArena& workspace, cudaStream_t stream);
+    static void mtp_attention_projection(const Tensor& hidden,
+                                         const MtpAttentionProjectionWeights& weights,
+                                         Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
+                                         WorkspaceArena& workspace, cudaStream_t stream);
+    static void mtp_kv_projection(const Tensor& hidden,
+                                  const MtpAttentionProjectionWeights& weights, Tensor& key,
+                                  Tensor& value, WorkspaceArena& workspace, cudaStream_t stream);
+    static void mtp_q_gate_projection(const Tensor& hidden,
+                                      const MtpAttentionProjectionWeights& weights, Tensor& query,
+                                      Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
+    static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
+                                     Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
+                                     WorkspaceArena& workspace, cudaStream_t stream);
+    static void
+    gdn_input_projection_snapshot(const Tensor& hidden, const GdnProjectionWeights& weights,
+                                  const Tensor& conv_weight, Tensor& conv_states,
+                                  const Tensor& valid_columns, const Tensor& initial_slot,
+                                  const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+                                  Tensor& value, Tensor& output_gate, qwen3_6::TextPhase phase,
+                                  WorkspaceArena& workspace, cudaStream_t stream);
+    static void gdn_input_projection_record(
+        const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
+        const Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slots,
+        Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
+        qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream);
+    static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);
-    static void attention_output_projection(const Tensor& attention, const Weight& weight,
-                                             Tensor& residual, qwen3_6::TextPhase phase,
-                                             WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_attention_projection(const Tensor& hidden,
-                                          const MtpAttentionProjectionWeights& weights,
-                                          Tensor& query, Tensor& gate, Tensor& key, Tensor& value,
-                                          WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_kv_projection(const Tensor& hidden,
-                                   const MtpAttentionProjectionWeights& weights, Tensor& key,
-                                   Tensor& value, WorkspaceArena& workspace, cudaStream_t stream);
-    static void mtp_q_gate_projection(const Tensor& hidden,
-                                       const MtpAttentionProjectionWeights& weights, Tensor& query,
-                                       Tensor& gate, WorkspaceArena& workspace, cudaStream_t stream);
-    static void gdn_input_projection(const Tensor& hidden, const GdnProjectionWeights& weights,
-                                      Tensor& qkv, Tensor& output_gate, qwen3_6::TextPhase phase,
-                                      WorkspaceArena& workspace, cudaStream_t stream);
-    static void gdn_input_projection_snapshot(const Tensor& hidden,
-                                               const GdnProjectionWeights& weights,
-                                               const Tensor& conv_weight, Tensor& conv_states,
-                                               const Tensor& initial_slot, Tensor& query,
-                                               Tensor& key, Tensor& value, Tensor& output_gate,
-                                               qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                                               cudaStream_t stream);
-    static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
-                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
-                                       cudaStream_t stream);
     static void gdn_norm_control_projection(const Tensor& residual, const Tensor& norm_weight,
-                                             float eps, const GdnProjectionWeights& weights,
-                                             Tensor& hidden, Tensor& g, Tensor& beta,
-                                             WorkspaceArena& workspace, cudaStream_t stream);
+                                            float eps, const GdnProjectionWeights& weights,
+                                            Tensor& hidden, Tensor& g, Tensor& beta,
+                                            WorkspaceArena& workspace, cudaStream_t stream);
     static void post_mixer(const Tensor& hidden, const PostMixerWeights& weights, Tensor& residual,
                            qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                            cudaStream_t stream);
     static void mtp_post_mixer(const Tensor& hidden, const MtpPostMixerWeights& weights,
-                                Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
+                               Tensor& residual, WorkspaceArena& workspace, cudaStream_t stream);
     [[nodiscard]] static std::size_t
     mtp_attention_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_kv_projection_workspace_capacity_bytes(std::int32_t first,
-                                                                                 std::int32_t last);
+                                                                                std::int32_t last);
     [[nodiscard]] static std::size_t
     mtp_q_gate_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     attention_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                   qwen3_6::TextPhase phase, std::int32_t first,
-                                                   std::int32_t last);
+                                                  qwen3_6::TextPhase phase, std::int32_t first,
+                                                  std::int32_t last);
     [[nodiscard]] static std::size_t
     attention_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                          qwen3_6::TextPhase phase,
-                                                          std::int32_t first, std::int32_t last);
+                                                         qwen3_6::TextPhase phase,
+                                                         std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     gdn_input_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                   qwen3_6::TextPhase phase, std::int32_t first,
-                                                   std::int32_t last);
-    [[nodiscard]] static std::size_t
-    gdn_input_projection_snapshot_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                            qwen3_6::TextPhase phase,
-                                                            std::int32_t first, std::int32_t last);
+                                                  qwen3_6::TextPhase phase, std::int32_t first,
+                                                  std::int32_t last);
+    [[nodiscard]] static std::size_t gdn_input_projection_snapshot_workspace_capacity_bytes(
+        WeightsProfile weights_profile, qwen3_6::TextPhase phase, std::int32_t batch_size,
+        std::int32_t first, std::int32_t last);
+    [[nodiscard]] static std::size_t gdn_input_projection_record_workspace_capacity_bytes(
+        WeightsProfile weights_profile, qwen3_6::TextPhase phase, std::int32_t batch_size,
+        std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     gdn_output_projection_workspace_capacity_bytes(WeightsProfile weights_profile,
-                                                    qwen3_6::TextPhase phase, std::int32_t first,
-                                                    std::int32_t last);
+                                                   qwen3_6::TextPhase phase, std::int32_t first,
+                                                   std::int32_t last);
     [[nodiscard]] static std::size_t
     gdn_norm_control_projection_workspace_capacity_bytes(std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t
     post_mixer_workspace_capacity_bytes(WeightsProfile weights_profile, qwen3_6::TextPhase phase,
-                                         std::int32_t first, std::int32_t last);
+                                        std::int32_t first, std::int32_t last);
     [[nodiscard]] static std::size_t mtp_post_mixer_workspace_capacity_bytes(std::int32_t first,
-                                                                              std::int32_t last);
+                                                                             std::int32_t last);
 
-    [[nodiscard]] static std::vector<GraphFrontierRange>
-    ordinary_graph_ranges(std::uint32_t capacity);
-    [[nodiscard]] static std::vector<GraphFrontierRange>
-    mtp_graph_ranges(std::uint32_t capacity, std::uint32_t draft_window);
-    [[nodiscard]] static std::vector<GraphFrontierRange>
-    dflash_graph_ranges(std::uint32_t capacity, std::uint32_t draft_window);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    ordinary_graph_profiles(std::uint32_t capacity);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    mtp_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window);
+    [[nodiscard]] static std::vector<GraphExecutionProfile>
+    dflash_graph_profiles(std::uint32_t capacity, std::uint32_t draft_window,
+                          std::uint32_t batch_size);
 };
 
 } // namespace ninfer::targets::qwen3_5_9b::detail

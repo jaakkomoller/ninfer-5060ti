@@ -24,6 +24,18 @@ using Json = nlohmann::json;
     throw ApiException(std::move(error));
 }
 
+ChatRole parse_message_role(const std::string& role) {
+    if (role == "system") { return ChatRole::System; }
+    if (role == "developer") { return ChatRole::Developer; }
+    if (role == "user") { return ChatRole::User; }
+    if (role == "assistant") { return ChatRole::Assistant; }
+    if (role == "tool") { return ChatRole::Tool; }
+    if (role == "function") {
+        bad_request("role 'function' is not supported yet", "messages", "unsupported_role");
+    }
+    bad_request("unsupported role: " + role, "messages", "unsupported_role");
+}
+
 const Json& require_object(const Json& body) {
     if (!body.is_object()) { bad_request("request body must be a JSON object"); }
     return body;
@@ -222,21 +234,15 @@ void parse_messages(const Json& body, GenerationRequest& out) {
         if (!item.contains("role") || !item.at("role").is_string()) {
             bad_request("message " + std::to_string(i) + " must have a string role", "messages");
         }
-        const std::string role = item.at("role").get<std::string>();
+        const std::string role     = item.at("role").get<std::string>();
+        const ChatRole parsed_role = parse_message_role(role);
         if (item.contains("function_call") && !item.at("function_call").is_null()) {
             bad_request("message function_call is not supported", "messages",
                         "tools_not_supported");
         }
-        if (role == "function") {
-            ApiError error;
-            error.message = "role '" + role + "' is not supported yet";
-            error.param   = "messages";
-            error.code    = "unsupported_role";
-            throw ApiException(std::move(error));
-        }
         ChatTurn turn;
-        turn.role = role;
-        if (role == "tool") {
+        turn.role = parsed_role;
+        if (parsed_role == ChatRole::Tool) {
             if (item.contains("tool_calls") && !item.at("tool_calls").is_null()) {
                 bad_request("tool messages must not contain tool_calls", "messages");
             }
@@ -256,7 +262,7 @@ void parse_messages(const Json& body, GenerationRequest& out) {
         if (item.contains("tool_call_id") && !item.at("tool_call_id").is_null()) {
             bad_request("tool_call_id is only valid on tool messages", "messages");
         }
-        if (role == "assistant") {
+        if (parsed_role == ChatRole::Assistant) {
             turn.tool_calls = parse_assistant_tool_calls(item, i);
             if (item.contains("content") && !item.at("content").is_null()) {
                 parse_content_parts(item.at("content"), turn, i);
@@ -473,6 +479,59 @@ std::string sse_event(const Json& payload) { return "data: " + payload.dump() + 
 
 } // namespace
 
+std::optional<bool> parse_openai_preserve_thinking(const Json& body) {
+    std::optional<bool> top_level;
+    if (body.contains("preserve_thinking") && !body.at("preserve_thinking").is_null()) {
+        if (!body.at("preserve_thinking").is_boolean()) {
+            bad_request("preserve_thinking must be a boolean or null", "preserve_thinking");
+        }
+        top_level = body.at("preserve_thinking").get<bool>();
+    }
+
+    std::optional<bool> template_value;
+    if (body.contains("chat_template_kwargs")) {
+        const Json& kwargs = body.at("chat_template_kwargs");
+        if (!kwargs.is_object()) {
+            bad_request("chat_template_kwargs must be an object", "chat_template_kwargs");
+        }
+        for (auto it = kwargs.begin(); it != kwargs.end(); ++it) {
+            if (it.key() != "preserve_thinking" && !it.value().is_null()) {
+                bad_request("chat_template_kwargs." + it.key() + " is not supported",
+                            "chat_template_kwargs", "chat_template_option_not_supported");
+            }
+        }
+        if (kwargs.contains("preserve_thinking") && !kwargs.at("preserve_thinking").is_null()) {
+            if (!kwargs.at("preserve_thinking").is_boolean()) {
+                bad_request("chat_template_kwargs.preserve_thinking must be a boolean or null",
+                            "chat_template_kwargs");
+            }
+            template_value = kwargs.at("preserve_thinking").get<bool>();
+        }
+    }
+
+    if (top_level && template_value && *top_level != *template_value) {
+        bad_request("conflicting preserve_thinking values", "preserve_thinking",
+                    "conflicting_template_option");
+    }
+    return template_value ? template_value : top_level;
+}
+
+void parse_openai_reasoning_effort(const Json& body, GenerationRequest& out) {
+    if (!body.contains("reasoning_effort") || body.at("reasoning_effort").is_null()) { return; }
+    if (!body.at("reasoning_effort").is_string()) {
+        bad_request("reasoning_effort must be a string or null", "reasoning_effort");
+    }
+    const std::string value = body.at("reasoning_effort").get<std::string>();
+    const std::optional<RequestedReasoningEffort> effort = parse_requested_reasoning_effort(value);
+    if (!effort) {
+        bad_request("reasoning_effort must be one of none, minimal, low, medium, high, xhigh, or "
+                    "max",
+                    "reasoning_effort");
+    }
+    out.reasoning_effort       = *effort;
+    out.reasoning_effort_param = "reasoning_effort";
+}
+
 GenerationRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body);
     reject_unsupported_features(body);
@@ -497,6 +556,8 @@ GenerationRequest parse_chat_completion_request(const Json& body, const RequestL
     if (body.contains("enable_thinking") && !body.at("enable_thinking").is_null()) {
         out.enable_thinking = get_bool(body, "enable_thinking", false);
     }
+    parse_openai_reasoning_effort(body, out);
+    out.preserve_thinking = parse_openai_preserve_thinking(body);
 
     std::optional<int> max_tokens = get_int(body, "max_completion_tokens");
     if (!max_tokens) { max_tokens = get_int(body, "max_tokens"); }

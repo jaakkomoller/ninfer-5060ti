@@ -7,6 +7,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace ninfer::serve {
 namespace {
@@ -51,29 +52,52 @@ KvCacheStorage parse_kv_dtype(const char* text) {
     throw std::invalid_argument("invalid kv-dtype: " + value);
 }
 
+KvCapacityPolicy parse_kv_capacity(const char* text) {
+    if (std::string_view(text) == "auto") { return KvCapacityPolicy::automatic(); }
+    const int value = parse_nonnegative_int(text, "kv-capacity");
+    if (value == 0) { throw std::invalid_argument("--kv-capacity must be positive"); }
+    return KvCapacityPolicy::explicit_capacity(static_cast<std::uint32_t>(value));
+}
+
 } // namespace
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
-           "[--model-id ID] [--max-context N] [--prefill-chunk N] [--device N] "
-           "[--max-request-mib N] [--request-log-jsonl FILE] "
+           "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
+           "[--max-pending-requests N] [--pending-timeout-ms N] "
+           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
+           "[--media-preprocess-threads N] "
+           "[--request-log-jsonl FILE] "
+           "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
-           "[--lm-head-draft] [--no-thinking] [--cors] "
-           "[--temperature F] [--top-p F] [--top-k N] [--presence-penalty F] "
+           "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
+           "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
-           "       serves an OpenAI-compatible Chat Completions endpoint\n"
+           "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
            "       --max-request-mib defaults to 384 and is enforced before JSON parsing\n"
+           "       --media-cache-mib defaults to 1024; 0 disables retained media reuse\n"
+           "       --media-live-mib defaults to 2048 and bounds all live BF16 patch payloads\n"
+           "       --media-preprocess-threads defaults to 0 (auto, at most 16 workers)\n"
            "       --request-log-jsonl appends full-precision server/request records\n"
+           "       --model-id overrides the artifact identity.model_id reported by the server\n"
+           "       Responses state is process-local and bounded to 1024 records / 256 MiB by "
+           "default\n"
+           "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
+           "       --kv-capacity auto leaves " +
+           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
+           " MiB of sizing headroom\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
-           "       sampler defaults to Qwen3 thinking (temperature 0.6, top-p 0.95, "
-           "top-k 20, presence-penalty 1.0); a request may override any field.\n"
+           "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       sampler defaults come from the loaded model and resolved thinking mode; "
+           "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
 }
 
@@ -91,6 +115,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
+    bool kv_capacity_explicit        = false;
     if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -110,13 +135,31 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--api-key") {
             options.api_key = require_value("--api-key");
         } else if (arg == "--model-id") {
-            options.model_id = require_value("--model-id");
+            options.model_id_override = require_value("--model-id");
+            if (options.model_id_override->empty()) {
+                throw std::invalid_argument("--model-id must not be empty");
+            }
         } else if (arg == "--max-context") {
             options.max_context = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-context"), "max-context"));
+        } else if (arg == "--kv-capacity") {
+            options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
+            kv_capacity_explicit = true;
+        } else if (arg == "--max-concurrency") {
+            options.max_concurrency = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+        } else if (arg == "--max-pending-requests") {
+            options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--max-pending-requests"), "max-pending-requests"));
+        } else if (arg == "--pending-timeout-ms") {
+            options.pending_timeout_ms = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
+        } else if (arg == "--log-stats-interval-ms") {
+            options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));
         } else if (arg == "--max-request-mib") {
             const std::uint64_t mib =
                 parse_u64(require_value("--max-request-mib"), "max-request-mib");
@@ -124,11 +167,46 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument("--max-request-mib is out of range");
             }
             options.max_request_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--media-cache-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--media-cache-mib"), "media-cache-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--media-cache-mib is out of range");
+            }
+            options.media_cache_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--media-live-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--media-live-mib"), "media-live-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--media-live-mib is out of range");
+            }
+            options.media_live_bytes = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--media-preprocess-threads") {
+            const int threads = parse_nonnegative_int(require_value("--media-preprocess-threads"),
+                                                      "media-preprocess-threads");
+            if (threads > 64) {
+                throw std::invalid_argument("--media-preprocess-threads must be in [0,64]");
+            }
+            options.media_preprocess_threads = static_cast<std::uint32_t>(threads);
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
             }
+        } else if (arg == "--response-store-max-records") {
+            const int records = parse_nonnegative_int(require_value("--response-store-max-records"),
+                                                      "response-store-max-records");
+            if (records == 0) {
+                throw std::invalid_argument("--response-store-max-records must be positive");
+            }
+            options.response_store_max_records = static_cast<std::size_t>(records);
+        } else if (arg == "--response-store-max-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--response-store-max-mib"), "response-store-max-mib");
+            if (mib == 0 || mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--response-store-max-mib is out of range");
+            }
+            options.response_store_max_bytes = static_cast<std::size_t>(mib << 20);
         } else if (arg == "--device") {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
@@ -153,33 +231,56 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--no-thinking") {
             options.enable_thinking = false;
+        } else if (arg == "--preserve-thinking") {
+            options.preserve_thinking = true;
         } else if (arg == "--cors") {
             options.enable_cors = true;
         } else if (arg == "--temperature") {
-            options.sampling_temperature =
+            options.sampling_overrides.temperature =
                 parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
         } else if (arg == "--top-p") {
-            options.sampling_top_p = parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
+            options.sampling_overrides.top_p =
+                parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
         } else if (arg == "--top-k") {
-            options.sampling_top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
+            options.sampling_overrides.top_k =
+                parse_nonnegative_int(require_value("--top-k"), "top-k");
+        } else if (arg == "--min-p") {
+            options.sampling_overrides.min_p =
+                parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
         } else if (arg == "--presence-penalty") {
-            options.sampling_presence_penalty = parse_float_in(require_value("--presence-penalty"),
-                                                               "presence-penalty", -2.0f, 2.0f);
+            options.sampling_overrides.presence_penalty = parse_float_in(
+                require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
         } else if (arg == "--frequency-penalty") {
-            options.sampling_frequency_penalty = parse_float_in(
+            options.sampling_overrides.frequency_penalty = parse_float_in(
                 require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
         } else if (arg == "--seed") {
-            options.sampling_seed = parse_u64(require_value("--seed"), "seed");
+            options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
         } else if (arg == "--greedy") {
             options.greedy = true;
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
     }
+    if (!kv_capacity_explicit) {
+        options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);
+    }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+        options.kv_capacity.explicit_tokens < options.max_context) {
+        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+    }
+    if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
+        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+    }
+    if (options.max_pending_requests == 0) {
+        throw std::invalid_argument("--max-pending-requests must be positive");
+    }
+    if (options.pending_timeout_ms == 0) {
+        throw std::invalid_argument("--pending-timeout-ms must be positive");
+    }
     if (options.max_request_bytes == 0) {
         throw std::invalid_argument("--max-request-mib must be positive");
     }
@@ -196,6 +297,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
     }
     return options;
+}
+
+std::string resolve_public_model_id(const ServeOptions& options,
+                                    std::string_view artifact_model_id) {
+    if (options.model_id_override.has_value()) { return *options.model_id_override; }
+    if (artifact_model_id.empty()) {
+        throw std::logic_error("loaded artifact model_id must not be empty");
+    }
+    return std::string(artifact_model_id);
 }
 
 } // namespace ninfer::serve

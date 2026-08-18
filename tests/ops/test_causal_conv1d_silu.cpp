@@ -284,7 +284,7 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
 }
 
 int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32_t initial_slot,
-                  std::uint32_t seed) {
+                  std::int32_t snapshot_base_slot, std::uint32_t seed) {
     const LogicalInput input        = make_input(C, T, seed);
     const std::size_t slot_elements = static_cast<std::size_t>(C) * 3U;
     std::vector<float> states(slot_elements * static_cast<std::size_t>(slots));
@@ -301,36 +301,44 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
         causal_conv_oracle(input.x, input.weight, selected_state, C, T, true);
 
     std::vector<float> expected_states = states;
-    std::copy(oracle.snapshots.begin(), oracle.snapshots.end(), expected_states.begin());
+    std::copy(oracle.snapshots.begin(), oracle.snapshots.end(),
+              expected_states.begin() +
+                  static_cast<std::size_t>(snapshot_base_slot) * slot_elements);
 
     const std::vector<std::uint16_t> x_bits        = bf16_bits(input.x);
     const std::vector<std::uint16_t> weight_bits   = bf16_bits(input.weight);
     const std::vector<std::uint16_t> state_bits    = bf16_bits(states);
     const std::vector<std::uint16_t> expected_bits = bf16_bits(expected_states);
     const std::int32_t initial_slot_host           = initial_slot;
+    const std::int32_t snapshot_base_slot_host     = snapshot_base_slot;
 
     GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer state(state_bits.size() * sizeof(std::uint16_t));
     GuardedDeviceBuffer slot(sizeof(std::int32_t));
+    GuardedDeviceBuffer snapshot_base(sizeof(std::int32_t));
     GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
     x.copy_from_host(x_bits.data(), x.bytes());
     weight.copy_from_host(weight_bits.data(), weight.bytes());
     state.copy_from_host(state_bits.data(), state.bytes());
     slot.copy_from_host(&initial_slot_host, sizeof(initial_slot_host));
+    snapshot_base.copy_from_host(&snapshot_base_slot_host, sizeof(snapshot_base_slot_host));
     output.fill(kOutputPoison);
 
     Tensor tx(x.data(), DType::BF16, {C, T});
     Tensor tw(weight.data(), DType::BF16, {C, 4});
     Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
     Tensor tslot(slot.data(), DType::I32, {1});
+    Tensor tsnapshot_base(snapshot_base.data(), DType::I32, {1});
     Tensor tout(output.data(), DType::BF16, {C, T});
-    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, tslot, tout, nullptr);
+    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, Tensor{}, tslot, tsnapshot_base, tout,
+                                     nullptr);
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu snapshot C=" + std::to_string(C) +
                             " T=" + std::to_string(T) + " slots=" + std::to_string(slots) +
-                            " initial_slot=" + std::to_string(initial_slot);
+                            " initial_slot=" + std::to_string(initial_slot) +
+                            " snapshot_base_slot=" + std::to_string(snapshot_base_slot);
     int failures = 0;
     failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
                               oracle.output);
@@ -340,10 +348,118 @@ int snapshot_case(std::int32_t C, std::int32_t T, std::int32_t slots, std::int32
     failures += verify_exact((tag + " initial slot preserved").c_str(),
                              from_device<std::int32_t>(slot.data(), 1),
                              std::vector<std::int32_t>{initial_slot});
+    failures += verify_exact((tag + " snapshot base slot preserved").c_str(),
+                             from_device<std::int32_t>(snapshot_base.data(), 1),
+                             std::vector<std::int32_t>{snapshot_base_slot});
     failures += verify_buffer_guards(tag + " x", x);
     failures += verify_buffer_guards(tag + " weight", weight);
     failures += verify_buffer_guards(tag + " states", state);
     failures += verify_buffer_guards(tag + " initial slot", slot);
+    failures += verify_buffer_guards(tag + " snapshot base slot", snapshot_base);
+    failures += verify_buffer_guards(tag + " output", output);
+    return failures;
+}
+
+int batched_snapshot_case(std::int32_t C, std::int32_t width,
+                          const std::vector<std::int32_t>& initial_slots,
+                          const std::vector<std::int32_t>& snapshot_bases,
+                          const std::vector<std::int32_t>& valid_columns, std::int32_t slots,
+                          std::uint32_t seed) {
+    const std::int32_t batch        = static_cast<std::int32_t>(initial_slots.size());
+    const bool masked               = !valid_columns.empty();
+    const LogicalInput input        = make_input(C, width * batch, seed);
+    const std::size_t slot_elements = static_cast<std::size_t>(C) * 3U;
+    const std::size_t row_elements  = static_cast<std::size_t>(C) * width;
+
+    std::vector<float> states(slot_elements * static_cast<std::size_t>(slots));
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        std::vector<float> one = make_state(C, seed + 10U + static_cast<std::uint32_t>(slot));
+        std::copy(one.begin(), one.end(),
+                  states.begin() + static_cast<std::size_t>(slot) * slot_elements);
+    }
+
+    std::vector<double> expected_output(row_elements * static_cast<std::size_t>(batch), 0.0);
+    std::vector<float> expected_states = states;
+    for (std::int32_t row = 0; row < batch; ++row) {
+        const std::int32_t valid = masked ? valid_columns[static_cast<std::size_t>(row)] : width;
+        const std::size_t input_begin = static_cast<std::size_t>(row) * row_elements;
+        std::vector<float> row_input(input.x.begin() + input_begin,
+                                     input.x.begin() + input_begin +
+                                         static_cast<std::size_t>(valid) * C);
+        const std::size_t initial_begin =
+            static_cast<std::size_t>(initial_slots[static_cast<std::size_t>(row)]) * slot_elements;
+        std::vector<float> initial_state(states.begin() + initial_begin,
+                                         states.begin() + initial_begin + slot_elements);
+        const OracleResult oracle =
+            causal_conv_oracle(row_input, input.weight, initial_state, C, valid, true);
+        std::copy(oracle.output.begin(), oracle.output.end(),
+                  expected_output.begin() + input_begin);
+        const std::size_t destination_begin =
+            static_cast<std::size_t>(snapshot_bases[static_cast<std::size_t>(row)]) * slot_elements;
+        std::copy(oracle.snapshots.begin(), oracle.snapshots.end(),
+                  expected_states.begin() + destination_begin);
+    }
+
+    const std::vector<std::uint16_t> x_bits        = bf16_bits(input.x);
+    const std::vector<std::uint16_t> weight_bits   = bf16_bits(input.weight);
+    const std::vector<std::uint16_t> state_bits    = bf16_bits(states);
+    const std::vector<std::uint16_t> expected_bits = bf16_bits(expected_states);
+
+    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer state(state_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer initial(initial_slots.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer bases(snapshot_bases.size() * sizeof(std::int32_t));
+    std::unique_ptr<GuardedDeviceBuffer> valid;
+    if (masked) {
+        valid = std::make_unique<GuardedDeviceBuffer>(valid_columns.size() * sizeof(std::int32_t));
+        valid->copy_from_host(valid_columns.data(), valid->bytes());
+    }
+    GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+    x.copy_from_host(x_bits.data(), x.bytes());
+    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    state.copy_from_host(state_bits.data(), state.bytes());
+    initial.copy_from_host(initial_slots.data(), initial.bytes());
+    bases.copy_from_host(snapshot_bases.data(), bases.bytes());
+    output.fill(kOutputPoison);
+
+    Tensor tx(x.data(), DType::BF16, {C, width, batch});
+    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tstate(state.data(), DType::BF16, {C, 3, slots});
+    Tensor tvalid;
+    if (masked) { tvalid = Tensor(valid->data(), DType::I32, {batch}); }
+    Tensor tinitial(initial.data(), DType::I32, {batch});
+    Tensor tbases(bases.data(), DType::I32, {batch});
+    Tensor tout(output.data(), DType::BF16, {C, width, batch});
+    ops::causal_conv1d_silu_snapshot(tx, tw, tstate, tvalid, tinitial, tbases, tout, nullptr);
+    cuda_synchronize();
+
+    const std::string tag = "causal_conv1d_silu batched snapshot C=" + std::to_string(C) +
+                            " W=" + std::to_string(width) + " B=" + std::to_string(batch) +
+                            (masked ? " masked" : " dense");
+    int failures = 0;
+    failures += verify_output(tag + " output", from_device_bf16(output.data(), x_bits.size()),
+                              expected_output);
+    failures += verify_bits(tag + " all state slots", state.data(), expected_bits);
+    failures += verify_bits(tag + " x preserved", x.data(), x_bits);
+    failures += verify_bits(tag + " weight preserved", weight.data(), weight_bits);
+    failures += verify_exact((tag + " initial selectors preserved").c_str(),
+                             from_device<std::int32_t>(initial.data(), initial_slots.size()),
+                             initial_slots);
+    failures += verify_exact((tag + " snapshot bases preserved").c_str(),
+                             from_device<std::int32_t>(bases.data(), snapshot_bases.size()),
+                             snapshot_bases);
+    if (masked) {
+        failures += verify_exact((tag + " valid columns preserved").c_str(),
+                                 from_device<std::int32_t>(valid->data(), valid_columns.size()),
+                                 valid_columns);
+        failures += verify_buffer_guards(tag + " valid columns", *valid);
+    }
+    failures += verify_buffer_guards(tag + " x", x);
+    failures += verify_buffer_guards(tag + " weight", weight);
+    failures += verify_buffer_guards(tag + " states", state);
+    failures += verify_buffer_guards(tag + " initial selectors", initial);
+    failures += verify_buffer_guards(tag + " snapshot bases", bases);
     failures += verify_buffer_guards(tag + " output", output);
     return failures;
 }
@@ -378,14 +494,22 @@ int main() {
     failures += ordinary_case(kQwen35Channels, 257, StateCall::InPlaceEntry, 3257U);
 
     // Snapshot decode, small-T boundary/interior, sequence route, slot 0 initialization, and
-    // continuation from selected slots. Cases deliberately include selected slots that are and are
-    // not overwritten by the resulting [0,T) snapshots.
-    failures += snapshot_case(kQwen27Channels, 1, 4, 0, 4001U);
-    failures += snapshot_case(kQwen27Channels, 2, 5, 4, 4002U);
-    failures += snapshot_case(kQwen27Channels, 7, 9, 3, 4007U);
-    failures += snapshot_case(kQwen27Channels, 15, 18, 14, 4015U);
-    failures += snapshot_case(kQwen27Channels, 16, 18, 17, 4016U);
-    failures += snapshot_case(kQwen35Channels, 17, 20, 16, 4017U);
+    // continuation from selected slots. A nonzero destination base proves that snapshots are not
+    // hard-wired to physical slots [0,T); selected source slots may overlap the destination range.
+    failures += snapshot_case(kQwen27Channels, 1, 4, 0, 1, 4001U);
+    failures += snapshot_case(kQwen27Channels, 2, 5, 4, 1, 4002U);
+    failures += snapshot_case(kQwen27Channels, 7, 9, 3, 1, 4007U);
+    failures += snapshot_case(kQwen27Channels, 15, 18, 14, 1, 4015U);
+    failures += snapshot_case(kQwen27Channels, 16, 18, 17, 1, 4016U);
+    failures += snapshot_case(kQwen35Channels, 17, 20, 16, 1, 4017U);
+
+    failures += batched_snapshot_case(kQwen35Channels, 1, {8, 9, 10, 11, 12, 13, 14, 15},
+                                      {0, 1, 2, 3, 4, 5, 6, 7}, {}, 16, 5001U);
+    failures +=
+        batched_snapshot_case(kQwen27Channels, 6, {18, 19, 20}, {0, 6, 12}, {6, 3, 1}, 21, 5006U);
+    // Row 0 reads slot 15 and overwrites it only after the final valid column. This is the
+    // production same-row alias pattern; row 1 remains fully disjoint.
+    failures += batched_snapshot_case(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";
     return failures == 0 ? 0 : 1;

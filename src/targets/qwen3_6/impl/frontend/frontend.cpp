@@ -4,6 +4,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include "targets/qwen3_6/impl/frontend/chat_template.h"
+#include "targets/qwen3_6/impl/frontend/media_cache.h"
 #include "targets/qwen3_6/impl/frontend/processor.h"
 #include "targets/qwen3_6/impl/frontend/test_access.h"
 #include "targets/qwen3_6/impl/frontend/tokenizer.h"
@@ -192,6 +193,21 @@ void validate_tokenizer_config(const FrontendResources& resources) {
         throw std::invalid_argument(
             "tokenizer_config.json does not use the official <|endoftext|> pad token");
     }
+    if (!tokenizer_config.contains("chat_template") ||
+        !tokenizer_config.at("chat_template").is_string()) {
+        throw std::invalid_argument(
+            "tokenizer_config.json.chat_template must contain the loaded chat template");
+    }
+    if (tokenizer_config.at("chat_template").get_ref<const std::string&>() !=
+        resources.chat_template_jinja) {
+        throw std::invalid_argument(
+            "tokenizer_config.json.chat_template does not match frontend/chat_template.jinja");
+    }
+}
+
+fi::CompiledChatTemplate compile_chat_template(const FrontendResources& resources) {
+    validate_tokenizer_config(resources);
+    return fi::CompiledChatTemplate::resolve(resources.chat_template_jinja);
 }
 
 [[noreturn]] void throw_processor_error(const fi::ProcessorError& error) {
@@ -229,7 +245,7 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
     result.reserve(messages.size());
     for (ChatMessage& source : messages) {
         fi::ChatMessage target;
-        target.role              = std::move(source.role);
+        target.role              = source.role;
         target.reasoning_content = std::move(source.reasoning_content);
         target.tool_call_id      = std::move(source.tool_call_id);
         target.tool_calls.reserve(source.tool_calls.size());
@@ -264,6 +280,7 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
 fi::ChatRenderOptions render_options(const PromptOptions& options) {
     return fi::ChatRenderOptions{.add_generation_prompt = options.add_generation_prompt,
                                  .enable_thinking       = options.enable_thinking,
+                                 .reasoning_effort      = options.reasoning_effort,
                                  .preserve_thinking     = options.preserve_thinking,
                                  .add_vision_id         = options.add_vision_id,
                                  .tool_jsons            = options.tool_jsons};
@@ -292,20 +309,6 @@ void assign_text_positions(PreparedPromptData& prompt) {
         }
     }
     prompt.rope_delta = 0;
-}
-
-std::optional<std::uint32_t> assistant_boundary(const fi::Tokenizer& tokenizer,
-                                                const PromptOptions& options,
-                                                std::size_t prompt_tokens) {
-    if (!options.add_generation_prompt) { return std::nullopt; }
-    const std::string_view opener   = options.enable_thinking
-                                          ? std::string_view("<think>\n")
-                                          : std::string_view("<think>\n\n</think>\n\n");
-    const std::size_t opener_tokens = tokenizer.encode(opener).size();
-    if (opener_tokens > prompt_tokens) {
-        throw std::logic_error("generation-prompt opener exceeds rendered prompt");
-    }
-    return static_cast<std::uint32_t>(prompt_tokens - opener_tokens);
 }
 
 VisionItem convert_vision_item(fi::VisionItem item) {
@@ -426,10 +429,11 @@ struct DecoderState {
     std::string utf8_pending;
     std::string think_marker_pending;
     std::array<std::string, 2> stop_pending;
-    bool in_reasoning           = false;
-    bool strip_content_leading  = false;
-    bool terminal               = false;
-    std::uint64_t decoded_bytes = 0;
+    bool in_reasoning              = false;
+    bool strip_content_leading     = false;
+    bool terminal                  = false;
+    std::uint64_t decoded_bytes    = 0;
+    std::uint32_t reasoning_tokens = 0;
 };
 
 struct StopMatch {
@@ -590,13 +594,31 @@ DecoderState terminal_state(DecoderState state) {
 
 class Frontend::Impl {
 public:
-    Impl(const FrontendResources& resources, bool registered_checkpoint, bool vision_enabled_)
-        : tokenizer(std::make_shared<const fi::Tokenizer>(
+    Impl(const FrontendResources& resources, bool registered_checkpoint, FrontendOptions options)
+        : chat_template(compile_chat_template(resources)),
+          tokenizer(std::make_shared<const fi::Tokenizer>(
               fi::TokenizerResources{.tokenizer_json         = resources.tokenizer_json,
                                      .tokenizer_config_json  = resources.tokenizer_config_json,
                                      .generation_config_json = resources.generation_config_json})),
-          processor(processor_options(resources)), vision_enabled(vision_enabled_) {
-        validate_tokenizer_config(resources);
+          processor(processor_options(resources)), vision_enabled(options.vision_enabled) {
+        if (options.max_context == 0) {
+            throw std::invalid_argument("frontend max_context must be nonzero");
+        }
+        const std::uint64_t vision_tokens =
+            std::min<std::uint64_t>(options.max_context, kMaximumVisionTokens);
+        processor.max_vision_tokens = vision_tokens;
+        processor.max_raw_patches   = vision_tokens * kRawPatchesPerVisionToken;
+        if (vision_enabled) {
+            const std::uint64_t minimum_live =
+                processor.max_raw_patches * kPreparedVisionPatchFeatures * sizeof(std::uint16_t);
+            if (minimum_live > options.media_live_bytes) {
+                throw std::invalid_argument(
+                    "media live-byte capacity cannot hold the maximum supported Vision prompt");
+            }
+            media_cache = std::make_shared<fi::MediaPreprocessCache>(
+                options.media_cache_bytes, options.media_live_bytes,
+                options.media_preprocess_threads, static_cast<std::size_t>(minimum_live));
+        }
         if (registered_checkpoint) { validate_registered_tokenizer(*tokenizer); }
         for (const int token : tokenizer->default_stop_token_ids()) {
             if (!tokenizer->is_valid_token(token)) {
@@ -607,8 +629,10 @@ public:
         }
     }
 
+    fi::CompiledChatTemplate chat_template;
     std::shared_ptr<const fi::Tokenizer> tokenizer;
     fi::ProcessorOptions processor;
+    std::shared_ptr<fi::MediaPreprocessCache> media_cache;
     StopPolicy defaults;
     bool vision_enabled = true;
 };
@@ -654,11 +678,51 @@ PromptSummary PreparedPrompt::summary() const {
                          .has_media     = data_->has_media()};
 }
 
-double PreparedPrompt::prepare_seconds() const noexcept {
-    return data_ != nullptr ? data_->prepare.seconds : 0.0;
+PromptPreparationStats PreparedPrompt::preparation_stats() const noexcept {
+    if (data_ == nullptr) { return {}; }
+    const PrepareStats& stats = data_->prepare;
+    return PromptPreparationStats{
+        .seconds                       = stats.seconds,
+        .media_preprocess_seconds      = stats.media_preprocess_seconds,
+        .media_preprocess_work_seconds = stats.media_preprocess_work_seconds,
+        .tokenize_seconds              = stats.tokenize_seconds,
+        .media_items                   = stats.media_items,
+        .media_bytes                   = stats.media_bytes,
+        .raw_patches                   = stats.raw_patches,
+        .vision_tokens                 = stats.vision_tokens,
+        .patch_bytes                   = stats.patch_bytes,
+        .media_cache_hits              = stats.media_cache_hits,
+        .media_cache_misses            = stats.media_cache_misses,
+        .media_singleflight_waits      = stats.media_singleflight_waits,
+        .built_patch_bytes             = stats.built_patch_bytes,
+        .reused_patch_bytes            = stats.reused_patch_bytes,
+    };
 }
 
 PreparedPrompt::operator bool() const noexcept { return data_ != nullptr; }
+
+PublishedOutput::PublishedOutput(PublishedOutput&& other) noexcept
+    : values_(std::move(other.values_)), size_(std::exchange(other.size_, 0)) {}
+
+PublishedOutput& PublishedOutput::operator=(PublishedOutput&& other) noexcept {
+    if (this != &other) {
+        values_ = std::move(other.values_);
+        size_   = std::exchange(other.size_, 0);
+    }
+    return *this;
+}
+
+void PublishedOutput::clear() noexcept {
+    for (std::size_t index = 0; index < size_; ++index) { values_[index] = {}; }
+    size_ = 0;
+}
+
+void PublishedOutput::push_back(OutputDelta value) {
+    if (size_ == values_.size()) {
+        throw std::logic_error("output decoder produced more than two channel transitions");
+    }
+    values_[size_++] = std::move(value);
+}
 
 OutputSession::OutputSession() noexcept                           = default;
 OutputSession::~OutputSession()                                   = default;
@@ -699,6 +763,8 @@ runtime::OutputDecision OutputSession::preview(std::span<const TokenId> tokens,
             throw std::out_of_range("generated token is outside the checkpoint vocabulary: " +
                                     std::to_string(token));
         }
+
+        if (impl_->preview_state.in_reasoning) { ++impl_->preview_state.reasoning_tokens; }
 
         const bool stop_token =
             std::find(impl_->policy.token_ids.begin(), impl_->policy.token_ids.end(), token) !=
@@ -759,10 +825,14 @@ PublishedOutput OutputSession::commit_preview() noexcept {
     if (impl_ == nullptr || !impl_->preview_ready) { std::terminate(); }
     using std::swap;
     swap(impl_->state, impl_->preview_state);
-    PublishedOutput output;
-    output.swap(impl_->preview_output);
+    PublishedOutput output = std::move(impl_->preview_output);
+    impl_->preview_output.clear();
     impl_->preview_ready = false;
     return output;
+}
+
+std::uint32_t OutputSession::reasoning_tokens() const noexcept {
+    return impl_ != nullptr ? impl_->state.reasoning_tokens : 0;
 }
 
 Frontend::Frontend(std::shared_ptr<const Impl> impl) noexcept : impl_(std::move(impl)) {}
@@ -773,13 +843,16 @@ Frontend::Frontend(Frontend&&) noexcept            = default;
 Frontend& Frontend::operator=(Frontend&&) noexcept = default;
 Frontend::~Frontend()                              = default;
 
-Frontend make_frontend(const FrontendResources& resources, bool vision_enabled) {
-    return Frontend(std::make_shared<const Frontend::Impl>(resources, true, vision_enabled));
+Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
+    return Frontend(std::make_shared<const Frontend::Impl>(resources, true, options));
 }
 
 Frontend FrontendTestAccess::create_component(const FrontendResources& resources,
                                               bool vision_enabled) {
-    return Frontend(std::make_shared<const Frontend::Impl>(resources, false, vision_enabled));
+    FrontendOptions options;
+    options.vision_enabled = vision_enabled;
+    options.max_context    = static_cast<std::uint32_t>(kMaximumVisionTokens);
+    return Frontend(std::make_shared<const Frontend::Impl>(resources, false, options));
 }
 
 const PreparedPromptData& PreparedPromptAccess::view(const PreparedPrompt& prompt) {
@@ -797,7 +870,8 @@ const PreparedPromptData& FrontendTestAccess::inspect(const PreparedPrompt& prom
     return PreparedPromptAccess::view(prompt);
 }
 
-PreparedPrompt Frontend::prepare(PromptInput input) const {
+PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& control) const {
+    fi::check_preparation_control(control);
     const auto start                      = Clock::now();
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
@@ -811,40 +885,58 @@ PreparedPrompt Frontend::prepare(PromptInput input) const {
     auto prepared              = std::make_unique<PreparedPromptData>();
     PreparedPromptData& result = *prepared;
     if (has_media) {
-        fi::Processor processor(*impl_->tokenizer, impl_->processor);
+        fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
+                                impl_->media_cache);
         fi::ProcessedInput processed;
         try {
-            processed = processor.process(messages, render_options(options));
+            processed = processor.process(std::move(messages), render_options(options), control);
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
-        result.token_types = std::move(processed.token_types);
-        result.positions   = std::move(processed.positions);
-        result.rope_delta  = processed.rope_delta;
-        result.patches     = std::move(processed.patches);
+        result.token_types    = std::move(processed.token_types);
+        result.positions      = std::move(processed.positions);
+        result.rope_delta     = processed.rope_delta;
+        result.media_payloads = std::move(processed.media_payloads);
         result.vision_items.reserve(processed.vision_items.size());
         for (fi::VisionItem& item : processed.vision_items) {
             result.vision_items.push_back(convert_vision_item(std::move(item)));
         }
-        result.prepare.media_items     = processed.stats.media_items;
-        result.prepare.raw_patches     = processed.stats.raw_patches;
-        result.prepare.vision_tokens   = processed.stats.vision_tokens;
-        result.prepare.attention_pairs = processed.stats.attention_pairs;
-        result.prepare.patch_bytes     = processed.stats.patch_bytes;
+        result.prepare.media_items              = processed.stats.media_items;
+        result.prepare.media_bytes              = processed.stats.media_bytes;
+        result.prepare.raw_patches              = processed.stats.raw_patches;
+        result.prepare.vision_tokens            = processed.stats.vision_tokens;
+        result.prepare.attention_pairs          = processed.stats.attention_pairs;
+        result.prepare.patch_bytes              = processed.stats.patch_bytes;
+        result.prepare.media_cache_hits         = processed.stats.media_cache_hits;
+        result.prepare.media_cache_misses       = processed.stats.media_cache_misses;
+        result.prepare.media_singleflight_waits = processed.stats.media_singleflight_waits;
+        result.prepare.built_patch_bytes        = processed.stats.built_patch_bytes;
+        result.prepare.reused_patch_bytes       = processed.stats.reused_patch_bytes;
+        result.prepare.media_preprocess_seconds = processed.stats.media_preprocess_seconds;
+        result.prepare.media_preprocess_work_seconds =
+            processed.stats.media_preprocess_work_seconds;
+        result.prepare.tokenize_seconds    = processed.stats.tokenize_seconds;
+        result.identity.rewrite_checkpoint = processed.rewrite_checkpoint;
     } else {
-        const std::string rendered = fi::render_chat(messages, render_options(options));
-        result.token_ids           = impl_->tokenizer->encode(rendered);
+        const fi::RenderedChat rendered =
+            impl_->chat_template.render(messages, render_options(options));
+        const auto tokenize_started = Clock::now();
+        fi::EncodedChat encoded     = fi::encode_rendered_chat(*impl_->tokenizer, rendered);
+        result.prepare.tokenize_seconds =
+            std::chrono::duration<double>(Clock::now() - tokenize_started).count();
+        fi::check_preparation_control(control, "tokenization");
+        result.token_ids                   = std::move(encoded.input_ids);
+        result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         assign_text_positions(result);
     }
     (void)checked_token_count(result.token_ids.size());
-    result.identity.reusable = true;
-    result.identity.assistant_content_boundary =
-        assistant_boundary(*impl_->tokenizer, options, result.token_ids.size());
+    result.identity.reusable   = true;
     result.starts_in_reasoning = options.add_generation_prompt && options.enable_thinking;
     result.prepare.seconds     = std::chrono::duration<double>(Clock::now() - start).count();
     return PreparedPrompt(std::move(prepared));
 }
 
-std::uint32_t Frontend::count_tokens(PromptInput input) const {
+std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {
+    fi::check_preparation_control(control);
     const PromptOptions options           = input.options;
     std::vector<fi::ChatMessage> messages = convert_messages(std::move(input.messages));
     const bool has_media =
@@ -854,17 +946,46 @@ std::uint32_t Frontend::count_tokens(PromptInput input) const {
         throw std::invalid_argument("Vision is disabled for this Engine");
     }
     if (!has_media) {
-        return checked_token_count(
-            impl_->tokenizer->encode(fi::render_chat(messages, render_options(options))).size());
+        const fi::RenderedChat rendered =
+            impl_->chat_template.render(messages, render_options(options));
+        const std::uint32_t count =
+            checked_token_count(impl_->tokenizer->encode(rendered.text).size());
+        fi::check_preparation_control(control, "tokenization");
+        return count;
     }
 
-    fi::ProcessorOptions processor_options = impl_->processor;
-    processor_options.max_prompt_tokens    = std::numeric_limits<std::size_t>::max();
-    fi::Processor processor(*impl_->tokenizer, processor_options);
+    fi::Processor processor(*impl_->tokenizer, impl_->chat_template, impl_->processor,
+                            impl_->media_cache);
     try {
         return checked_token_count(
-            processor.process(messages, render_options(options)).input_ids.size());
+            processor.process(std::move(messages), render_options(options), control)
+                .input_ids.size());
     } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
+}
+
+PromptCapabilities Frontend::prompt_capabilities() const noexcept {
+    return impl_ != nullptr ? impl_->chat_template.capabilities() : PromptCapabilities{};
+}
+
+MediaCacheSummary Frontend::media_cache_summary() const {
+    if (impl_ == nullptr || !impl_->media_cache) { return {}; }
+    const fi::MediaCacheStats stats = impl_->media_cache->stats();
+    return MediaCacheSummary{
+        .capacity_bytes      = stats.capacity_bytes,
+        .live_capacity_bytes = stats.live_capacity_bytes,
+        .retained_bytes      = stats.retained_bytes,
+        .live_bytes          = stats.live_bytes,
+        .entries             = stats.entries,
+        .inflight            = stats.inflight,
+        .queued_tasks        = stats.queued_tasks,
+        .active_tasks        = stats.active_tasks,
+        .preprocess_threads  = stats.preprocess_threads,
+        .hits                = stats.hits,
+        .misses              = stats.misses,
+        .singleflight_waits  = stats.singleflight_waits,
+        .evictions           = stats.evictions,
+        .oversize_bypasses   = stats.oversize_bypasses,
+    };
 }
 
 PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,

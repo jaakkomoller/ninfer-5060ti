@@ -176,10 +176,12 @@ RuntimeModelView build_runtime(BindingPlan const& plan,
                 materialized, source.gdn.a_log, NumericFormat::FP32, {32});
             target.projection.dt_bias = artifact::materialized_tensor(
                 materialized, source.gdn.dt_bias, NumericFormat::FP32, {32});
-            target.projection.a_projection = artifact::materialized_weight(
-                materialized, source.gdn.a_projection, NumericFormat::BF16, 32, 4096);
-            target.projection.b_projection = artifact::materialized_weight(
-                materialized, source.gdn.b_projection, NumericFormat::BF16, 32, 4096);
+            target.projection.control_projection = SplitGdnControlProjectionPayload{
+                .a_projection = artifact::materialized_weight(
+                    materialized, source.gdn.a_projection, NumericFormat::BF16, 32, 4096),
+                .b_projection = artifact::materialized_weight(
+                    materialized, source.gdn.b_projection, NumericFormat::BF16, 32, 4096),
+            };
             target.projection.input_projection =
                 load_gdn_input_projection(source.gdn, materialized);
             target.convolution = artifact::materialized_tensor(

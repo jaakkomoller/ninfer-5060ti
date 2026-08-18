@@ -36,6 +36,7 @@
 // reading global memory directly, masked at the k boundary. Weights in the
 // padded region [k, padded_k) are never used.
 
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -150,7 +151,7 @@ q5_simt_consume_slab(const __nv_bfloat16* __restrict__ x0, std::int64_t xslab, s
 }
 
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
-          int SplitRow = 0>
+          int SplitRow = 0, bool AddResidual = false>
 __launch_bounds__(64, 16) __global__
     void q5_rowsplit_gemm_simt_split2_kernel(const __nv_bfloat16* __restrict__ x,
                                              const std::uint8_t* __restrict__ codes,
@@ -247,8 +248,10 @@ __launch_bounds__(64, 16) __global__
     __syncthreads();
 
     if (part == 0 && lane < kTt) {
-        const float sum                                = s_part[0][lane] + s_part[1][lane];
-        out[static_cast<std::int64_t>(lane) * n + row] = __float2bfloat16(sum);
+        const std::int64_t index = static_cast<std::int64_t>(lane) * n + row;
+        float sum                = s_part[0][lane] + s_part[1][lane];
+        if constexpr (AddResidual) { sum += __bfloat162float(out[index]); }
+        out[index] = __float2bfloat16(sum);
     }
 }
 
@@ -276,7 +279,8 @@ struct Q5Split4StoreEpilogue {
 };
 
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
-          int SplitRow = 0, class Epilogue = Q5Split4StoreEpilogue>
+          int SplitRow = 0, class Epilogue = Q5Split4StoreEpilogue, bool TriggerPdl = false,
+          bool JoinPdl = false>
 __launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
@@ -289,6 +293,9 @@ __launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
     static_assert(kFullSlabs > 0 && kStride > 0, "direct split4 requires exact positive shape");
     static_assert(!SplitOutput || SplitRow > 0,
                   "split-output Q5 split4 requires a positive compile-time seam");
+    if constexpr (TriggerPdl) {
+        if (threadIdx.x == 0) { pdl::trigger_dependents(); }
+    }
     (void)full_slabs;
     (void)k;
     (void)t;
@@ -396,6 +403,7 @@ __launch_bounds__(128, 10) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
                                                                 s_part[0]);
         }
     }
+    if constexpr (JoinPdl) { pdl::wait_for_dependencies(); }
 }
 
 // full_slabs is computed on the host: k/1024 when k % 8 == 0 and x is 16-byte

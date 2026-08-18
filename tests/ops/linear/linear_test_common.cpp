@@ -29,6 +29,7 @@ constexpr std::uint8_t kOutputPoisonByte  = 0xff;
 constexpr std::size_t kOutputScanWords    = 1U << 20;
 constexpr int kOracleTBlock               = 8;
 constexpr double kBf16UnitRoundoff        = 1.0 / 256.0;
+constexpr double kA8QuantizationAllowance = 0.04;
 constexpr double kA4QuantizationAllowance = 0.16;
 
 // The criterion belongs to the activation compute path, not to a private kernel, schedule, or
@@ -38,6 +39,8 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
     switch (activation_compute) {
     case ActivationCompute::A16:
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
+    case ActivationCompute::A8:
+        return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
         return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
@@ -83,8 +86,10 @@ std::vector<std::int32_t> all_indices(std::int32_t extent) {
 
 std::vector<std::int32_t> sampled_indices(std::int32_t extent) {
     std::vector<std::int32_t> result;
-    for (const std::int32_t index :
-         {0, 1, extent / 4, extent / 2, (3 * extent) / 4, extent - 2, extent - 1}) {
+    constexpr std::int32_t kSamples = 32;
+    for (std::int32_t sample = 0; sample < kSamples; ++sample) {
+        const std::int32_t index = static_cast<std::int32_t>(
+            (static_cast<std::int64_t>(extent - 1) * sample) / (kSamples - 1));
         if (index >= 0 && index < extent &&
             std::find(result.begin(), result.end(), index) == result.end()) {
             result.push_back(index);
@@ -232,6 +237,10 @@ quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
     options.weight_scale_divisor = 0.125F;
     options.input_scale_divisor  = 3.5F;
     return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
+}
+
+quantized_weight::PackedWeight make_fp8_weight(std::int32_t n, std::int32_t k, std::uint32_t seed) {
+    return quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16S, n, k, seed);
 }
 
 void cpu_linear_gemm_fp64(const float* weight, const float* activation, double* output,

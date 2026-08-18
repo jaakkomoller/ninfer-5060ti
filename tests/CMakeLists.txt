@@ -58,31 +58,45 @@ ninfer_add_test(ninfer_artifact_reader_test
 ninfer_add_test(ninfer_artifact_materialization_test
   SOURCES test_artifact_materialization.cpp
   LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_media_decode_test
+  SOURCES test_media_decode.cpp
+  LIBRARIES ninfer_media_decode)
 ninfer_add_test(ninfer_device_test       SOURCES test_device.cpp)
+ninfer_add_test(ninfer_decode_graph_test SOURCES test_decode_graph.cpp)
 ninfer_add_test(ninfer_tensor_test       SOURCES test_tensor.cpp)
 ninfer_add_test(ninfer_arena_test        SOURCES test_arena.cpp)
 ninfer_add_test(ninfer_request_memory_test SOURCES test_request_memory.cpp)
+ninfer_add_test(ninfer_admission_policy_test SOURCES test_admission_policy.cpp)
+ninfer_add_test(ninfer_kv_capacity_test SOURCES test_kv_capacity.cpp)
+ninfer_add_test(ninfer_sampling_defaults_test
+  SOURCES test_sampling_defaults.cpp
+  LIBRARIES ninfer_engine)
+target_include_directories(ninfer_sampling_defaults_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
+  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
 ninfer_add_test(ninfer_kv_cache_test
   SOURCES test_kv_cache.cpp
   LIBRARIES ninfer_core)
 ninfer_add_test(ninfer_state_store_test
   SOURCES test_state_store.cpp
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_gdn_replay_records_test
+  SOURCES test_gdn_replay_records.cpp
+  LIBRARIES ninfer_core)
 set_tests_properties(
   ninfer_artifact_materialization_test
   ninfer_device_test
+  ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_request_memory_test
   ninfer_kv_cache_test
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
-target_include_directories(ninfer_state_store_test PRIVATE
-  ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export)
-ninfer_add_test(ninfer_generation_controller_test SOURCES test_generation_controller.cpp)
-
 # Family frontend and one opt-in real-artifact prefix/MTP integration test.
 ninfer_add_test(ninfer_qwen3_6_frontend_test
   SOURCES targets/qwen3_6/test_frontend.cpp
+  NEEDS_SOURCE_DIR
   LIBRARIES ninfer_engine ninfer_core)
 target_include_directories(ninfer_qwen3_6_frontend_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
@@ -128,6 +142,12 @@ set_tests_properties(ninfer_qwen3_6_35b_a3b_dflash_load_plan_test
 ninfer_add_test(ninfer_openai_schema_test
   SOURCES test_openai_schema.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_responses_schema_test
+  SOURCES test_responses_schema.cpp
+  LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_response_store_test
+  SOURCES test_response_store.cpp
+  LIBRARIES ninfer_serve)
 ninfer_add_test(ninfer_anthropic_schema_test
   SOURCES test_anthropic_schema.cpp
   LIBRARIES ninfer_serve)
@@ -140,6 +160,11 @@ ninfer_add_test(ninfer_serve_options_test
 ninfer_add_test(ninfer_request_log_test
   SOURCES test_request_log.cpp
   LIBRARIES ninfer_serve)
+ninfer_add_test(ninfer_http_error_handler_test
+  SOURCES test_http_error_handler.cpp
+  LIBRARIES ninfer_serve)
+target_include_directories(ninfer_http_error_handler_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp
@@ -213,6 +238,8 @@ ninfer_add_linear_test(ninfer_linear_q6_a16_test ops/linear/test_q6_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_w8_a16_test ops/linear/test_w8_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a16_test ops/linear/test_nvfp4_a16.cpp)
 ninfer_add_linear_test(ninfer_linear_nvfp4_a4_test ops/linear/test_nvfp4_a4.cpp)
+ninfer_add_linear_test(ninfer_linear_fp8_a16_test ops/linear/test_fp8_a16.cpp)
+ninfer_add_linear_test(ninfer_linear_fp8_a8_test ops/linear/test_fp8_a8.cpp)
 ninfer_add_op_test(ninfer_linear_bf16_a16_test
   SOURCES ops/linear/test_bf16_a16.cpp
   LIBRARIES ninfer_ops)
@@ -224,6 +251,15 @@ ninfer_add_op_test(ninfer_gdn_input_proj_test
   LIBRARIES ninfer_ops)
 ninfer_add_op_test(ninfer_gdn_input_proj_conv_snapshot_test
   SOURCES ops/test_gdn_input_proj_conv_snapshot.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_input_proj_conv_record_test
+  SOURCES ops/test_gdn_input_proj_conv_record.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gated_delta_net_replay_record_test
+  SOURCES ops/test_gated_delta_net_replay_record.cpp
+  LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_gdn_replay_fold_test
+  SOURCES ops/test_gdn_replay_fold.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_add_q5_a16_test
@@ -240,6 +276,9 @@ ninfer_add_fused_linear_test(
 ninfer_add_op_test(ninfer_linear_add_nvfp4_test
   SOURCES ops/linear_add/test_nvfp4.cpp
   LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_linear_add_fp8_test
+  SOURCES ops/linear_add/test_fp8.cpp
+  LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
   ninfer_linear_pair_w8_a16_test
   ops/linear_pair/test_w8_a16.cpp
@@ -255,6 +294,10 @@ ninfer_add_fused_linear_test(
 ninfer_add_fused_linear_test(
   ninfer_linear_swiglu_nvfp4_test
   ops/linear_swiglu/test_nvfp4.cpp
+  ops/linear_swiglu/linear_swiglu_test_common.cpp)
+ninfer_add_fused_linear_test(
+  ninfer_linear_swiglu_fp8_test
+  ops/linear_swiglu/test_fp8.cpp
   ops/linear_swiglu/linear_swiglu_test_common.cpp)
 
 ninfer_add_test(ninfer_qwen3_6_27b_visual_scatter_test

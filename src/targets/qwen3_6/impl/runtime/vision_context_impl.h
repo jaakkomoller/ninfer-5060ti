@@ -5,7 +5,6 @@
 #include "core/layout.h"
 #include <ninfer/targets/qwen3_6/vision_control.h>
 #include "ninfer/ops/add_bias.h"
-#include "ninfer/ops/cast.h"
 #include "ninfer/ops/gelu.h"
 #include "ninfer/ops/layer_norm.h"
 #include "ninfer/ops/linear.h"
@@ -17,6 +16,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -41,7 +41,6 @@ struct VisionWorkspaceLayout {
     TensorRegion pos_weights;
     TensorRegion x;
     TensorRegion patch_bf16;
-    TensorRegion patch_f32;
     TensorRegion attended;
     TensorRegion qkv;
     TensorRegion attention_norm;
@@ -83,13 +82,8 @@ VisionWorkspaceLayout build_workspace_layout(std::size_t patches64, std::size_t 
     out.pos_indices = add(DType::I32, {4, patches}, "vision position indices");
     out.pos_weights = add(DType::FP32, {4, patches}, "vision position weights");
     out.x           = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision residual");
-    {
-        auto scope = builder.scope();
-        out.patch_bf16 =
-            add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
-        out.patch_f32 =
-            add(DType::FP32, {VisionScheduleConfig::patch_dim, patches}, "vision FP32 patches");
-    }
+    out.patch_bf16 =
+        add(DType::BF16, {VisionScheduleConfig::patch_dim, patches}, "vision BF16 patches");
     {
         auto attention_scope = builder.scope();
         out.attended = add(DType::BF16, {VisionScheduleConfig::hidden, patches}, "vision attended");
@@ -176,6 +170,18 @@ std::size_t VisionContext::workspace_bytes(const qwen3_6::VisionItemControl& ite
         .bytes;
 }
 
+std::size_t VisionContext::output_transient_bytes(std::size_t merged_tokens) {
+    if (merged_tokens == 0 ||
+        merged_tokens > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Vision output transient extent must fit positive int32");
+    }
+    LayoutBuilder layout;
+    (void)layout.add_tensor(
+        DType::BF16, {VisionScheduleConfig::out_hidden, static_cast<std::int32_t>(merged_tokens)},
+        kWorkspaceAlignment, "Vision item output transient");
+    return layout.finish(kWorkspaceAlignment, "Vision item output transient layout");
+}
+
 std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tokens,
                                                     std::uint32_t max_segments) {
     if (max_merged_tokens == 0 || max_segments == 0) {
@@ -188,11 +194,8 @@ std::size_t VisionContext::workspace_capacity_bytes(std::uint32_t max_merged_tok
         .bytes;
 }
 
-void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item, Tensor& output,
-                           WorkspaceArena& workspace, void* tap, VisionTapCallback callback) const {
-    if ((tap == nullptr) != (callback == nullptr)) {
-        throw std::invalid_argument("Vision tap context and callback must be provided together");
-    }
+void VisionContext::encode(const VisionItemView& item, Tensor& output,
+                           WorkspaceArena& workspace) const {
     if (item.control == nullptr) { throw std::invalid_argument("Vision item control is null"); }
     const qwen3_6::VisionItemControl& control = *item.control;
     const auto patches64                      = control.patch_count;
@@ -228,9 +231,7 @@ void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item,
 
     Tensor x          = layout.x.bind(backing);
     Tensor patch_bf16 = layout.patch_bf16.bind(backing);
-    Tensor patch_f32  = layout.patch_f32.bind(backing);
-    copy_host(item.patches.data(), patch_f32, stream);
-    ops::cast_fp32_to_bf16(patch_f32, patch_bf16, stream);
+    copy_host(item.patches.data(), patch_bf16, stream);
     ops::linear(patch_bf16, *patch_embed_, x, stream);
     ops::add_bias(*patch_embed_bias_, x, stream);
     // The artifact records the source table shape [rows,hidden], while Tensor's
@@ -239,8 +240,6 @@ void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item,
     Tensor position_table = position_embed_->reshape(
         {VisionScheduleConfig::hidden, VisionScheduleConfig::position_embeddings});
     ops::vision_pos_embed_add(position_table, pos_indices, pos_weights, x, stream);
-    if (callback != nullptr) { callback(tap, item_index, VisionTapId::PatchEmbed, -1, x, stream); }
-
     for (std::size_t layer = 0; layer < blocks_.size(); ++layer) {
         const BlockW& block = blocks_[layer];
         {
@@ -296,9 +295,6 @@ void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item,
             ops::add_bias(*block.fc2_bias, down, stream);
             ops::residual_add(down, x, stream);
         }
-        if (callback != nullptr) {
-            callback(tap, item_index, VisionTapId::Block, static_cast<int>(layer), x, stream);
-        }
     }
 
     Tensor normalized = layout.normalized.bind(backing);
@@ -311,26 +307,22 @@ void VisionContext::encode(std::uint32_t item_index, const VisionItemView& item,
     ops::gelu(hidden, ops::GeluMode::Exact, stream);
     ops::linear(hidden, *merger_.fc2, output, stream);
     ops::add_bias(*merger_.fc2_bias, output, stream);
-    if (callback != nullptr) { callback(tap, item_index, VisionTapId::Merger, -1, output, stream); }
 }
 
 VisionPrefillSession::VisionPrefillSession(DeviceContext& device, const LoadedModelData& model,
                                            WorkspaceArena& workspace,
-                                           const qwen3_6::PreparedPromptData& prompt,
+                                           qwen3_6::PreparedPromptData& prompt,
                                            const VisionPrefillPlan& plan,
-                                           runtime::TransientRegion transient, void* tap,
-                                           VisionTapCallback callback)
+                                           runtime::TransientRegion transient)
     : device_(device), workspace_(workspace), prompt_(prompt), plan_(plan), transient_(transient),
-      context_(device, model), tap_(tap), callback_(callback) {
-    if ((tap_ == nullptr) != (callback_ == nullptr)) {
-        throw std::invalid_argument("Vision tap context and callback must be provided together");
-    }
-    if (plan_.control.items.empty() || plan_.uses.empty()) {
+      context_(device, model) {
+    if (plan_.control == nullptr || plan_.control->items.empty() || plan_.uses.empty()) {
         throw std::invalid_argument("Vision prefill plan has no suffix item spans");
     }
     if (transient_.data == nullptr || transient_.alignment < kWorkspaceAlignment) {
         throw std::invalid_argument("Vision item output transient is missing or misaligned");
     }
+    encoded_payloads_pending_release_.reserve(plan_.uses.size());
     timers_.reserve(plan_.uses.size());
 }
 
@@ -358,11 +350,12 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
     if (active == nullptr) {
         return VisionChunk{static_cast<std::int32_t>(end - begin), nullptr, {}};
     }
-    if (active->item_index >= plan_.control.items.size() ||
-        active->item_index >= prompt_.vision_items.size()) {
+    if (active->item_index >= plan_.control->items.size() ||
+        active->item_index >= prompt_.vision_items.size() ||
+        active->item_index >= prompt_.media_payloads.size()) {
         throw std::logic_error("Vision prefill item index is out of range");
     }
-    const qwen3_6::VisionItemControl& control = plan_.control.items[active->item_index];
+    const qwen3_6::VisionItemControl& control = plan_.control->items[active->item_index];
     const qwen3_6::VisionItem& source         = prompt_.vision_items[active->item_index];
     if (source.modality != control.modality || source.grid.temporal != control.grid.temporal ||
         source.grid.height != control.grid.height || source.grid.width != control.grid.width ||
@@ -387,29 +380,30 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
         if (active_item_ && active->item_index <= *active_item_) {
             throw std::logic_error("Vision items are not consumed in strictly increasing order");
         }
-        const std::size_t patch_offset = checked_mul(
-            control.patch_begin, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
-            "item patch offset");
         const std::size_t patch_elements = checked_mul(
             control.patch_count, static_cast<std::size_t>(VisionScheduleConfig::patch_dim),
             "item patch elements");
-        if (patch_offset > prompt_.patches.size() ||
-            patch_elements > prompt_.patches.size() - patch_offset) {
-            throw std::invalid_argument("Vision item patch range exceeds prepared payload");
+        const auto& payload = prompt_.media_payloads[active->item_index];
+        if (!payload || payload->patch_elements != patch_elements) {
+            throw std::invalid_argument("Vision item patch payload has an invalid shape");
         }
         timers_.emplace_back(device_);
         timers_.back().start();
-        context_.encode(
-            active->item_index,
-            VisionItemView{
-                std::span<const float>(prompt_.patches).subspan(patch_offset, patch_elements),
-                &control},
-            output, workspace_, tap_, callback_);
+        context_.encode(VisionItemView{payload->span(), &control}, output, workspace_);
         timers_.back().record_stop();
         workspace_.reset();
         active_item_ = active->item_index;
+        encoded_payloads_pending_release_.push_back(active->item_index);
     }
     return VisionChunk{static_cast<std::int32_t>(end - begin), &control, output};
+}
+
+void VisionPrefillSession::release_encoded_media_payloads() noexcept {
+    for (const std::uint32_t item_index : encoded_payloads_pending_release_) {
+        if (item_index >= prompt_.media_payloads.size()) { std::terminate(); }
+        prompt_.media_payloads[item_index].reset();
+    }
+    encoded_payloads_pending_release_.clear();
 }
 
 double VisionPrefillSession::elapsed_seconds() const {

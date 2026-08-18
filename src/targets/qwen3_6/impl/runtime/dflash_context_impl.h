@@ -1,56 +1,49 @@
 #include "targets/qwen3_6/impl/runtime/dflash_context.h"
 
-#include "core/device.h"
-
 #include <stdexcept>
 
 namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS {
 
 DFlashPersistentState::DFlashPersistentState(DeviceSpan backing,
                                              const DFlashPersistentLayout& layout)
-    : local(backing, layout.local), boundary_local(backing, layout.boundary_local),
-      full(backing, layout.full), commit_count(layout.commit_count.bind(backing)),
-      target_features(layout.target_features.bind(backing)),
-      feature_positions(layout.feature_positions.bind(backing)) {
-    if (local.layer_count() != 5 || boundary_local.layer_count() != 5 || full.layer_count() != 1 ||
-        local.dtype != DType::BF16 || boundary_local.dtype != DType::BF16 ||
-        full.dtype != DType::BF16) {
+    : local(backing, layout.local),
+      rewrite_checkpoint_local(backing, layout.rewrite_checkpoint_local),
+      full(backing, layout.full), prefill_features(layout.prefill_features.bind(backing)),
+      prefill_positions(layout.prefill_positions.bind(backing)),
+      pending_features(layout.pending_features.bind(backing)) {
+    if (local.layer_count() != DFlashConfig::local_layers ||
+        rewrite_checkpoint_local.layer_count() != DFlashConfig::local_layers ||
+        local.capacity() != DFlashConfig::local_capacity ||
+        rewrite_checkpoint_local.capacity() != DFlashConfig::local_capacity || full.layers() != 1 ||
+        full.max_context() != layout.full.max_context || full.pool().plane_count() != 2 ||
+        local.num_kv_heads() != DFlashConfig::kv_heads ||
+        rewrite_checkpoint_local.num_kv_heads() != DFlashConfig::kv_heads ||
+        local.head_dim() != DFlashConfig::head_dim ||
+        rewrite_checkpoint_local.head_dim() != DFlashConfig::head_dim ||
+        local.lane_capacity() != rewrite_checkpoint_local.lane_capacity() ||
+        local.lane_capacity() != full.pool().table_row_count() ||
+        full.pool().plane(0).dtype != DType::BF16 ||
+        full.pool().plane(0).ne[0] != DFlashConfig::head_dim ||
+        full.pool().plane(0).ne[1] != kPagedKVPageSize ||
+        full.pool().plane(0).ne[3] != DFlashConfig::kv_heads) {
         throw std::invalid_argument("DFlash persistent cache layout is invalid");
     }
 }
 
 CyclicKVCacheLayerView DFlashPersistentState::local_layer(std::uint32_t layer) const {
-    const KVCacheLayerView view = local.layer_view(layer);
-    return CyclicKVCacheLayerView{
-        .k               = view.k,
-        .v               = view.v,
-        .capacity        = view.max_context,
-        .padded_capacity = view.padded_context,
-        .num_kv_heads    = view.num_kv_heads,
-        .head_dim        = view.head_dim,
-        .dtype           = view.dtype,
-        .quant_group     = view.quant_group,
-    };
+    return local.layer_view(layer);
 }
 
-KVCacheLayerView DFlashPersistentState::full_layer() const { return full.layer_view(0); }
-
-void DFlashPersistentState::save_boundary(cudaStream_t stream) const {
-    for (std::uint32_t layer = 0; layer < local.layer_count(); ++layer) {
-        CUDA_CHECK(cudaMemcpyAsync(boundary_local.k[layer].data, local.k[layer].data,
-                                   local.k[layer].bytes(), cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(boundary_local.v[layer].data, local.v[layer].data,
-                                   local.v[layer].bytes(), cudaMemcpyDeviceToDevice, stream));
-    }
+PagedKVBatchLayerView DFlashPersistentState::full_batch_layer(std::uint32_t layer) const {
+    return full.batch_layer_view(layer);
 }
 
-void DFlashPersistentState::restore_boundary(cudaStream_t stream) const {
-    for (std::uint32_t layer = 0; layer < local.layer_count(); ++layer) {
-        CUDA_CHECK(cudaMemcpyAsync(local.k[layer].data, boundary_local.k[layer].data,
-                                   local.k[layer].bytes(), cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(local.v[layer].data, boundary_local.v[layer].data,
-                                   local.v[layer].bytes(), cudaMemcpyDeviceToDevice, stream));
-    }
+void DFlashPersistentState::save_rewrite_checkpoint(std::int32_t lane, cudaStream_t stream) {
+    rewrite_checkpoint_local.copy_lane_from(local, lane, stream);
+}
+
+void DFlashPersistentState::restore_rewrite_checkpoint(std::int32_t lane, cudaStream_t stream) {
+    local.copy_lane_from(rewrite_checkpoint_local, lane, stream);
 }
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS

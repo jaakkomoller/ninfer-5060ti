@@ -144,16 +144,34 @@ The artifact supports:
 - MTP speculative decoding with draft windows from one to five;
 - BF16 and INT8 group-64 KV cache;
 - CUDA Graph decode and compatible-prefix reuse;
+- startup-bounded small-scale concurrent serving with true batched decode;
 - the NInfer CLI;
 - OpenAI Chat Completions and Anthropic Messages serving.
 
 ## Performance
 
-The following single-GPU serving measurements were collected on an NVIDIA GeForce RTX 5090 with
+The single-request serving measurements below were collected on an NVIDIA GeForce RTX 5090 with
 CUDA 13.1 compile/runtime and CUDA driver API 13.3. Requests were submitted serially to a persistent
 `ninfer-serve` process with CUDA Graph enabled, a 1,024-token prefill chunk, INT8 group-64 KV cache,
-and prefix reuse disabled. Each value is the arithmetic mean ± sample standard deviation over five
-fixed seeds; warm-up requests are excluded.
+and prefix reuse disabled. Each single-request value is the arithmetic mean ± sample standard
+deviation over five fixed seeds; server warm-up completes before the measured requests.
+
+### Concurrent MTP=3 decode saturation
+
+The concurrent campaign uses one 293-token prompt followed by an 8,192-token generation per active
+request. Each concurrency point starts a fresh server with MTP3, INT8 group-64 KV, CUDA Graphs, a
+16,384-token per-request context limit, and prefix reuse disabled. Aggregate throughput includes
+only complete one-second intervals whose actual decode batch remains equal to C. Each row is one
+sustained wave.
+
+| C | Steady aggregate decode tok/s | Speedup vs. C1 | Wave makespan |
+|---:|---:|---:|---:|
+| 1 | 202.4 | 1.00× | 40.46 s |
+| 2 | 399.7 | 1.97× | 41.82 s |
+| 4 | 699.7 | 3.46× | 47.92 s |
+| 8 | 1,146.9 | 5.67× | 58.57 s |
+
+At C=8, the profile sustains **1,146.9 aggregate decode tok/s**, or **5.67×** its C=1 throughput.
 
 ### Long-context baseline (MTP disabled)
 
@@ -173,9 +191,9 @@ Thinking was enabled and the output limit was 65,536 tokens.
 
 | AIME 2026 fixture | Completion tokens | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|---:|
-| Problem 1 | 11,717.0 ± 476.7 | 222.7 ± 3.4 | 80.8% ± 1.8% | 3.43 ± 0.06 |
-| Problem 15 | 65,536.0 ± 0.0 | 201.6 ± 2.9 | 74.7% ± 1.5% | 3.24 ± 0.04 |
-| Problem 30 | 46,439.2 ± 3,719.0 | 216.3 ± 1.5 | 80.8% ± 0.9% | 3.42 ± 0.03 |
+| Problem 1 | 12,053.4 ± 820.9 | 231.0 ± 3.0 | 80.2% ± 1.2% | 3.41 ± 0.04 |
+| Problem 15 | 63,109.0 ± 5,426.9 | 213.1 ± 4.2 | 76.3% ± 2.0% | 3.29 ± 0.06 |
+| Problem 30 | 57,166.4 ± 9,204.9 | 223.3 ± 1.8 | 81.1% ± 1.5% | 3.43 ± 0.04 |
 
 ### MTP=3 cross-scenario decode
 
@@ -184,10 +202,10 @@ disabled and the output limit was 4,096 tokens.
 
 | Category | Decode tok/s | MTP acceptance | MTP tokens/round |
 |---|---:|---:|---:|
-| Code | 211.7 ± 7.0 | 74.2% ± 3.6% | 3.23 ± 0.11 |
-| Story | 144.5 ± 10.5 | 40.0% ± 5.4% | 2.20 ± 0.16 |
-| Translation | 205.2 ± 13.9 | 70.4% ± 7.1% | 3.11 ± 0.21 |
-| Structured output | 243.1 ± 15.3 | 90.2% ± 7.8% | 3.71 ± 0.24 |
+| Code | 220.3 ± 8.2 | 74.2% ± 4.0% | 3.23 ± 0.12 |
+| Story | 148.8 ± 11.6 | 39.2% ± 5.7% | 2.18 ± 0.17 |
+| Translation | 213.6 ± 12.2 | 70.5% ± 6.0% | 3.12 ± 0.18 |
+| Structured output | 252.2 ± 16.3 | 89.8% ± 8.0% | 3.69 ± 0.24 |
 
 See the
 [full methodology and results](https://github.com/Neroued/ninfer/blob/master/docs/performance.md),
@@ -212,9 +230,10 @@ These are single-sample results under the stated NInfer evaluation profile, not 
 
 - The artifact is accepted only by NInfer revision `a85109c` or later and the matching registered
   target.
-- NInfer currently executes on one RTX 5090, one CUDA device, and one active request per Engine.
-- It does not provide continuous batching, multi-GPU execution, CPU/GPU offload, or distributed
-  serving.
+- NInfer executes on one RTX 5090 and one CUDA device, with a startup-fixed capacity of 1–8 active
+  requests per Engine.
+- It does not provide large-scale or preemptive continuous batching, priority/QoS scheduling,
+  multi-GPU execution, CPU/GPU offload, or distributed serving.
 - Context allocation is subject to GPU memory and the selected KV-cache type.
 - NInfer does not execute generated tool calls.
 

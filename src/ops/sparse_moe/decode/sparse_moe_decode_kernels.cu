@@ -1,6 +1,7 @@
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 
 #include "core/device.h"
+#include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -13,7 +14,6 @@
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <math_constants.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -21,13 +21,14 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kHidden       = 2048;
-constexpr int kExperts      = 256;
-constexpr int kRouterRows   = kExperts + 1;
-constexpr int kTopK         = 8;
-constexpr int kIntermediate = 512;
-
-using RankedValue = SparseMoeRankedValue;
+constexpr int kHidden           = 2048;
+constexpr int kExperts          = 256;
+constexpr int kRouterRows       = kExperts + 1;
+constexpr int kTopK             = 8;
+constexpr int kIntermediate     = 512;
+constexpr int kD1Warps          = 8;
+constexpr int kAdaptiveD3Blocks = 5 * kIntermediate;
+constexpr int kAdaptiveD4Blocks = 5 * (kHidden / 4);
 
 __device__ __forceinline__ float dot_bf16_eight(const __nv_bfloat16* a, const __nv_bfloat16* b) {
     const uint4 av  = load_vec<uint4>(a);
@@ -52,10 +53,8 @@ __device__ __forceinline__ float dot_bf16_eight(const __nv_bfloat16* a, const __
     return sum;
 }
 
-template <int Warps>
 __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __nv_bfloat16* row) {
-    static_assert(Warps == 4 || Warps == 8);
-    constexpr int kSlice = kHidden / Warps;
+    constexpr int kSlice = kHidden / kD1Warps;
     constexpr int kVecs  = kSlice / (32 * 8);
     const int warp       = static_cast<int>(threadIdx.x) >> 5;
     const int lane       = static_cast<int>(threadIdx.x) & 31;
@@ -68,20 +67,19 @@ __device__ __forceinline__ float router_row_dot(const __nv_bfloat16* x, const __
     return warp_reduce_sum(sum);
 }
 
-template <int Warps>
 __global__ void sparse_moe_d1_kernel(const __nv_bfloat16* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ router,
                                      float* __restrict__ scores) {
-    __shared__ float partial[Warps];
+    __shared__ float partial[kD1Warps];
     const int row   = static_cast<int>(blockIdx.x);
     const int warp  = static_cast<int>(threadIdx.x) >> 5;
     const int lane  = static_cast<int>(threadIdx.x) & 31;
-    const float dot = router_row_dot<Warps>(x, router + static_cast<std::int64_t>(row) * kHidden);
+    const float dot = router_row_dot(x, router + static_cast<std::int64_t>(row) * kHidden);
     if (lane == 0) { partial[warp] = dot; }
     __syncthreads();
     if (warp == 0) {
-        float value = lane < Warps ? partial[lane] : 0.0f;
-        value       = warp_reduce_sum<Warps>(value);
+        float value = lane < kD1Warps ? partial[lane] : 0.0f;
+        value       = warp_reduce_sum<kD1Warps>(value);
         if (lane == 0) { scores[row] = value; }
     }
 }
@@ -90,46 +88,8 @@ __global__ void sparse_moe_d2_warp_kernel(const float* __restrict__ scores, int*
                                           float* __restrict__ alpha,
                                           float* __restrict__ shared_scale) {
     __shared__ float selected_logits[kTopK];
+    if (threadIdx.x == 0) { pdl::trigger_dependents(); }
     sparse_moe_select_top8_warp(scores, ids, alpha, shared_scale, selected_logits);
-}
-
-__global__ void sparse_moe_d2_serial_control_kernel(const float* __restrict__ scores,
-                                                    int* __restrict__ ids,
-                                                    float* __restrict__ alpha,
-                                                    float* __restrict__ shared_scale) {
-    if (threadIdx.x != 0) { return; }
-    float selected[kTopK];
-    int selected_ids[kTopK];
-#pragma unroll
-    for (int i = 0; i < kTopK; ++i) {
-        selected[i]     = -CUDART_INF_F;
-        selected_ids[i] = 0x7fffffff;
-    }
-    for (int id = 0; id < kExperts; ++id) {
-        const RankedValue value{scores[id], id, 0};
-        const RankedValue tail{selected[kTopK - 1], selected_ids[kTopK - 1], 0};
-        if (!sparse_moe_ranked_better(value, tail)) { continue; }
-        int position = kTopK - 1;
-        while (position > 0 &&
-               sparse_moe_ranked_better(
-                   value, RankedValue{selected[position - 1], selected_ids[position - 1], 0})) {
-            selected[position]     = selected[position - 1];
-            selected_ids[position] = selected_ids[position - 1];
-            --position;
-        }
-        selected[position]     = value.value;
-        selected_ids[position] = value.id;
-    }
-    float denominator = 0.0f;
-#pragma unroll
-    for (int rank = 0; rank < kTopK; ++rank) {
-        ids[rank]   = selected_ids[rank];
-        alpha[rank] = expf(selected[rank] - selected[0]);
-        denominator += alpha[rank];
-    }
-#pragma unroll
-    for (int rank = 0; rank < kTopK; ++rank) { alpha[rank] /= denominator; }
-    *shared_scale = sigmoid(scores[kExperts]);
 }
 
 struct Q4Codec {
@@ -275,6 +235,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
+    if (tid == 0) { pdl::trigger_dependents(); }
     if (tid < 256) { store_vec(x_shared + tid * 8, load_vec<uint4>(x + tid * 8)); }
     __syncthreads();
 
@@ -282,6 +243,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     float gate  = 0.0f;
     float up    = 0.0f;
     if (warp < kTopK) {
+        pdl::wait_for_dependencies();
         const int expert   = ids[warp];
         const int row_base = expert * 1024;
         dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
@@ -294,90 +256,68 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
     if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
 }
 
-template <class RoutedCodec, int PathsPerBlock>
+template <class RoutedCodec, int PathsPerBlock, bool Adaptive>
 __global__ void sparse_moe_d3_path_tiled_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ token_ids,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations) {
+    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ token_activations,
+    int tokens, const int* __restrict__ adaptive_route_jobs) {
     // Three path CTAs per token/output row expose enough blocks for the 170-SM target and keep the
     // heavier shared W8 path from holding eight completed routed warps resident.
     static_assert(PathsPerBlock > 0 && (kTopK + 1) % PathsPerBlock == 0);
     constexpr int kPathBlocks = (kTopK + 1) / PathsPerBlock;
     __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
-    const int tid        = static_cast<int>(threadIdx.x);
-    const int warp       = tid >> 5;
-    const int lane       = tid & 31;
-    const int token      = static_cast<int>(blockIdx.y) / kPathBlocks;
-    const int path_block = static_cast<int>(blockIdx.y) - token * kPathBlocks;
-    const int path       = path_block * PathsPerBlock + warp;
-    const auto* input    = x + static_cast<std::int64_t>(token) * kHidden;
-    for (int vector = tid; vector < kHidden / 8; vector += static_cast<int>(blockDim.x)) {
-        store_vec(x_shared + vector * 8, load_vec<uint4>(input + vector * 8));
-    }
-    __syncthreads();
-
-    const int j = static_cast<int>(blockIdx.x);
-    float gate  = 0.0f;
-    float up    = 0.0f;
-    if (path < kTopK) {
-        const int expert   = token_ids[token * kTopK + path];
-        const int row_base = expert * (2 * kIntermediate);
-        dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
-                                           row_base + kIntermediate + j, x_shared, 0, kHidden, gate,
-                                           up);
-    } else {
-        dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
-                                       x_shared, 0, kHidden, gate, up);
-    }
-    if (lane == 0) {
-        token_activations[(static_cast<std::int64_t>(token) * (kTopK + 1) + path) * kIntermediate +
-                          j] = silu(gate) * up;
-    }
-}
-
-template <class RoutedCodec>
-__global__ void sparse_moe_d3_balanced_kernel(
-    const __nv_bfloat16* __restrict__ x, const int* __restrict__ ids,
-    const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
-    const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, float* __restrict__ act) {
-    __shared__ __align__(16) __nv_bfloat16 x_shared[kHidden];
-    __shared__ float shared_gate_partial[kTopK];
-    __shared__ float shared_up_partial[kTopK];
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    store_vec(x_shared + tid * 8, load_vec<uint4>(x + tid * 8));
-    __syncthreads();
-
-    const int j        = static_cast<int>(blockIdx.x);
-    const int expert   = ids[warp];
-    const int row_base = expert * 1024;
-    float gate         = 0.0f;
-    float up           = 0.0f;
-    dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales, row_base + j,
-                                       row_base + kIntermediate + j, x_shared, 0, kHidden, gate,
-                                       up);
-    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
-
-    float shared_gate = 0.0f;
-    float shared_up   = 0.0f;
-    dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j, kIntermediate + j,
-                                   x_shared, warp * 256, (warp + 1) * 256, shared_gate, shared_up);
-    if (lane == 0) {
-        shared_gate_partial[warp] = shared_gate;
-        shared_up_partial[warp]   = shared_up;
+    if constexpr (Adaptive) {
+        if (*adaptive_route_jobs >= 0) { return; }
     }
-    __syncthreads();
-    if (warp == 0) {
-        float gate_sum = lane < kTopK ? shared_gate_partial[lane] : 0.0f;
-        float up_sum   = lane < kTopK ? shared_up_partial[lane] : 0.0f;
-        gate_sum       = warp_reduce_sum<kTopK>(gate_sum);
-        up_sum         = warp_reduce_sum<kTopK>(up_sum);
-        if (lane == 0) {
-            act[static_cast<std::int64_t>(kTopK) * kIntermediate + j] = silu(gate_sum) * up_sum;
+    const int total_work = tokens * kPathBlocks * kIntermediate;
+    const int first_work =
+        Adaptive ? static_cast<int>(blockIdx.x)
+                 : static_cast<int>(blockIdx.y) * kIntermediate + static_cast<int>(blockIdx.x);
+    const int work_stride = Adaptive ? static_cast<int>(gridDim.x) : total_work;
+    for (int work = first_work; work < total_work; work += work_stride) {
+        const int token_path = work / kIntermediate;
+        const int j          = work - token_path * kIntermediate;
+        const int token      = token_path / kPathBlocks;
+        const int path_block = token_path - token * kPathBlocks;
+        const int path       = path_block * PathsPerBlock + warp;
+        const auto* input    = x + static_cast<std::int64_t>(token) * kHidden;
+        for (int vector = tid; vector < kHidden / 8; vector += static_cast<int>(blockDim.x)) {
+            store_vec(x_shared + vector * 8, load_vec<uint4>(input + vector * 8));
         }
+        __syncthreads();
+
+        constexpr int kRouterPartitions = 4;
+        const int activation_begin      = (token * (kTopK + 1) + path) * kIntermediate;
+        // Routed paths need S2's ids. A shared path is independent only when its output lies
+        // beyond the partial-score prefix that S2 may still read from the lifetime-unioned scratch.
+        const bool must_wait_for_s2 =
+            path < kTopK || activation_begin < tokens * kRouterRows * kRouterPartitions;
+        if constexpr (!Adaptive) {
+            if (must_wait_for_s2) { pdl::wait_for_dependencies(); }
+        }
+        float gate = 0.0f;
+        float up   = 0.0f;
+        if (path < kTopK) {
+            const int expert   = token_ids[token * kTopK + path];
+            const int row_base = expert * (2 * kIntermediate);
+            dot_two_rows<RoutedCodec, kHidden>(routed_codes, routed_high, routed_scales,
+                                               row_base + j, row_base + kIntermediate + j, x_shared,
+                                               0, kHidden, gate, up);
+        } else {
+            dot_two_rows<W8Codec, kHidden>(shared_codes, nullptr, shared_scales, j,
+                                           kIntermediate + j, x_shared, 0, kHidden, gate, up);
+        }
+        if (lane == 0) {
+            token_activations[(static_cast<std::int64_t>(token) * (kTopK + 1) + path) *
+                                  kIntermediate +
+                              j] = silu(gate) * up;
+        }
+        if constexpr (Adaptive) { __syncthreads(); }
     }
 }
 
@@ -432,7 +372,7 @@ __device__ __forceinline__ void dot_fp32_rows(const std::uint8_t* codes, const s
     for (int row = 0; row < Rows; ++row) { result[row] = warp_reduce_sum(acc[row]); }
 }
 
-template <class RoutedCodec, int Rows, SparseMoeEpilogue Epilogue>
+template <class RoutedCodec, int Rows>
 __global__ void sparse_moe_d4_nine_warp_kernel(
     const int* __restrict__ ids, const float* __restrict__ alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ act,
@@ -440,6 +380,7 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
     const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination) {
     __shared__ float paths[kTopK + 1][Rows];
+    pdl::wait_for_dependencies();
     const int warp     = static_cast<int>(threadIdx.x) >> 5;
     const int lane     = static_cast<int>(threadIdx.x) & 31;
     const int row_base = static_cast<int>(blockIdx.x) * Rows;
@@ -466,7 +407,6 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     }
     __syncthreads();
     if (warp == 0 && lane < Rows) {
-        static_assert(Epilogue == SparseMoeEpilogue::AddResidual);
         float value = __bfloat162float(destination[row_base + lane]);
 #pragma unroll
         for (int path = 0; path < kTopK + 1; ++path) { value += paths[path][lane]; }
@@ -474,109 +414,84 @@ __global__ void sparse_moe_d4_nine_warp_kernel(
     }
 }
 
-template <class RoutedCodec, int Rows>
+template <class RoutedCodec, int Rows, bool Adaptive>
 __global__ void sparse_moe_d4_token_kernel(
     const int* __restrict__ token_ids, const float* __restrict__ token_alpha,
     const float* __restrict__ shared_scale, const float* __restrict__ token_activations,
     const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
     const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination) {
+    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination,
+    int tokens, const int* __restrict__ adaptive_route_jobs) {
     // Token is a grid dimension rather than an in-CTA serial loop. Rows lets one routed-weight
     // stream serve adjacent outputs while retaining the deterministic rank-order FP32 epilogue.
     __shared__ float paths[kTopK + 1][Rows];
-    const int warp     = static_cast<int>(threadIdx.x) >> 5;
-    const int lane     = static_cast<int>(threadIdx.x) & 31;
-    const int row_base = static_cast<int>(blockIdx.x) * Rows;
-    const int token    = static_cast<int>(blockIdx.y);
-    const float* act =
-        token_activations + static_cast<std::int64_t>(token) * (kTopK + 1) * kIntermediate;
-    if (warp < kTopK) {
-        const int expert = token_ids[token * kTopK + warp];
-        float dot[Rows];
-        dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
-                                         expert * kHidden + row_base,
-                                         act + static_cast<std::int64_t>(warp) * kIntermediate, 0,
-                                         kIntermediate / RoutedCodec::kGroupK, dot);
-        if (lane == 0) {
-#pragma unroll
-            for (int row = 0; row < Rows; ++row) {
-                paths[warp][row] = token_alpha[token * kTopK + warp] * dot[row];
-            }
-        }
-    } else {
-        float dot[Rows];
-        dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
-                                     act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
-                                     kIntermediate / W8Codec::kGroupK, dot);
-        if (lane == 0) {
-#pragma unroll
-            for (int row = 0; row < Rows; ++row) {
-                paths[kTopK][row] = shared_scale[token] * dot[row];
-            }
-        }
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    if constexpr (Adaptive) {
+        if (*adaptive_route_jobs >= 0) { return; }
     }
-    __syncthreads();
-    if (warp == 0 && lane < Rows) {
-        __nv_bfloat16* output =
-            destination + static_cast<std::int64_t>(token) * kHidden + row_base + lane;
-        float value = __bfloat162float(*output);
+    constexpr int kRowBlocks = kHidden / Rows;
+    const int total_work     = tokens * kRowBlocks;
+    const int first_work =
+        Adaptive ? static_cast<int>(blockIdx.x)
+                 : static_cast<int>(blockIdx.y) * kRowBlocks + static_cast<int>(blockIdx.x);
+    const int work_stride = Adaptive ? static_cast<int>(gridDim.x) : total_work;
+    for (int work = first_work; work < total_work; work += work_stride) {
+        const int token     = work / kRowBlocks;
+        const int row_block = work - token * kRowBlocks;
+        const int row_base  = row_block * Rows;
+        const float* act =
+            token_activations + static_cast<std::int64_t>(token) * (kTopK + 1) * kIntermediate;
+        if (warp < kTopK) {
+            const int expert = token_ids[token * kTopK + warp];
+            float dot[Rows];
+            dot_fp32_rows<RoutedCodec, Rows>(routed_codes, routed_high, routed_scales,
+                                             expert * kHidden + row_base,
+                                             act + static_cast<std::int64_t>(warp) * kIntermediate,
+                                             0, kIntermediate / RoutedCodec::kGroupK, dot);
+            if (lane == 0) {
 #pragma unroll
-        for (int path = 0; path < kTopK + 1; ++path) { value += paths[path][lane]; }
-        *output = __float2bfloat16_rn(value);
+                for (int row = 0; row < Rows; ++row) {
+                    paths[warp][row] = token_alpha[token * kTopK + warp] * dot[row];
+                }
+            }
+        } else {
+            float dot[Rows];
+            dot_fp32_rows<W8Codec, Rows>(shared_codes, nullptr, shared_scales, row_base,
+                                         act + static_cast<std::int64_t>(kTopK) * kIntermediate, 0,
+                                         kIntermediate / W8Codec::kGroupK, dot);
+            if (lane == 0) {
+#pragma unroll
+                for (int row = 0; row < Rows; ++row) {
+                    paths[kTopK][row] = shared_scale[token] * dot[row];
+                }
+            }
+        }
+        __syncthreads();
+        if (warp == 0 && lane < Rows) {
+            __nv_bfloat16* output =
+                destination + static_cast<std::int64_t>(token) * kHidden + row_base + lane;
+            float value = __bfloat162float(*output);
+#pragma unroll
+            for (int path = 0; path < kTopK + 1; ++path) { value += paths[path][lane]; }
+            *output = __float2bfloat16_rn(value);
+        }
+        if constexpr (Adaptive) { __syncthreads(); }
     }
 }
 
-template <class RoutedCodec, SparseMoeEpilogue Epilogue>
-__global__ void sparse_moe_d4_balanced_r4_kernel(
-    const int* __restrict__ ids, const float* __restrict__ alpha,
-    const float* __restrict__ shared_scale, const float* __restrict__ act,
-    const std::uint8_t* __restrict__ routed_codes, const std::uint8_t* __restrict__ routed_high,
-    const std::uint8_t* __restrict__ routed_scales, const std::uint8_t* __restrict__ shared_codes,
-    const std::uint8_t* __restrict__ shared_scales, __nv_bfloat16* __restrict__ destination) {
-    __shared__ float routed_partial[kTopK][4];
-    __shared__ float shared_partial[kTopK][4];
-    const int warp     = static_cast<int>(threadIdx.x) >> 5;
-    const int lane     = static_cast<int>(threadIdx.x) & 31;
-    const int row_base = static_cast<int>(blockIdx.x) * 4;
-
-    const int expert = ids[warp];
-    float routed[4];
-    dot_fp32_rows<RoutedCodec, 4>(routed_codes, routed_high, routed_scales,
-                                  expert * kHidden + row_base,
-                                  act + static_cast<std::int64_t>(warp) * kIntermediate, 0,
-                                  kIntermediate / RoutedCodec::kGroupK, routed);
-
-    float shared[4];
-    constexpr int kSharedGroupsPerWarp = 64 / W8Codec::kGroupK;
-    dot_fp32_rows<W8Codec, 4>(shared_codes, nullptr, shared_scales, row_base,
-                              act + static_cast<std::int64_t>(kTopK) * kIntermediate,
-                              warp * kSharedGroupsPerWarp, (warp + 1) * kSharedGroupsPerWarp,
-                              shared);
-    if (lane == 0) {
-#pragma unroll
-        for (int row = 0; row < 4; ++row) {
-            routed_partial[warp][row] = routed[row];
-            shared_partial[warp][row] = shared[row];
-        }
-    }
-    __syncthreads();
-
-    if (warp == 0 && lane < 4) {
-        static_assert(Epilogue == SparseMoeEpilogue::AddResidual);
-        float value = __bfloat162float(destination[row_base + lane]);
-#pragma unroll
-        for (int route = 0; route < kTopK; ++route) {
-            value += alpha[route] * routed_partial[route][lane];
-            value += *shared_scale * shared_partial[route][lane];
-        }
-        destination[row_base + lane] = __float2bfloat16_rn(value);
-    }
+void launch_d1(const Tensor& x, const Weight& router_shared_gate,
+               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+    sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(router_shared_gate.qdata),
+        static_cast<float*>(workspace.scratch.data));
+    CUDA_CHECK(cudaGetLastError());
 }
 
 template <class Codec>
-void launch_d3_codec(const Tensor& x, const SparseMoeWeights& weights,
-                     const SparseMoeDecodeWorkspace& workspace, SparseMoeD3Schedule schedule,
-                     cudaStream_t stream) {
+void launch_d3_dependent_codec(const Tensor& x, const SparseMoeWeights& weights,
+                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
     const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
     const auto* ids           = static_cast<const int*>(workspace.ids.data);
     auto* act                 = static_cast<float*>(workspace.scratch.data);
@@ -585,25 +500,35 @@ void launch_d3_codec(const Tensor& x, const SparseMoeWeights& weights,
     const auto* routed_scales = static_cast<const std::uint8_t*>(weights.routed_gate_up.scales);
     const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_gate_up.scales);
-    switch (schedule) {
-    case SparseMoeD3Schedule::NineWarp:
-        sparse_moe_d3_nine_warp_kernel<Codec><<<kIntermediate, 9 * 32, 0, stream>>>(
-            input, ids, routed_codes, routed_high, routed_scales, shared_codes, shared_scales, act);
-        CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_dependent(
+        {dim3(kIntermediate), dim3(9 * 32), 0, stream}, sparse_moe_d3_nine_warp_kernel<Codec>,
+        input, ids, routed_codes, routed_high, routed_scales, shared_codes, shared_scales, act));
+}
+
+void launch_d2_d3(const Tensor& x, const SparseMoeWeights& weights,
+                  const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+    const auto* scores = static_cast<const float*>(workspace.scratch.data);
+    auto* ids          = static_cast<int*>(workspace.ids.data);
+    auto* alpha        = static_cast<float*>(workspace.alpha.data);
+    auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
+    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale);
+    CUDA_CHECK(cudaGetLastError());
+
+    switch (weights.routed_gate_up.qtype) {
+    case QType::Q4G64_F16S:
+        launch_d3_dependent_codec<Q4Codec>(x, weights, workspace, stream);
         return;
-    case SparseMoeD3Schedule::BalancedEightWarp:
-        sparse_moe_d3_balanced_kernel<Codec><<<kIntermediate, 8 * 32, 0, stream>>>(
-            input, ids, routed_codes, routed_high, routed_scales, shared_codes, shared_scales, act);
-        CUDA_CHECK(cudaGetLastError());
+    case QType::W8G32_F16S:
+        launch_d3_dependent_codec<W8Codec>(x, weights, workspace, stream);
         return;
+    default:
+        throw std::invalid_argument("sparse_moe: unsupported D3 codec");
     }
-    throw std::logic_error("sparse_moe: unknown D3 schedule");
 }
 
 template <class Codec>
-void launch_d4_codec(const SparseMoeWeights& weights, Tensor& destination,
-                     const SparseMoeDecodeWorkspace& workspace, SparseMoeD4Schedule schedule,
-                     cudaStream_t stream) {
+void launch_d4_dependent_codec(const SparseMoeWeights& weights, Tensor& destination,
+                               const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
     const auto* ids           = static_cast<const int*>(workspace.ids.data);
     const auto* alpha         = static_cast<const float*>(workspace.alpha.data);
     const auto* shared_scale  = static_cast<const float*>(workspace.shared_scale.data);
@@ -614,92 +539,116 @@ void launch_d4_codec(const SparseMoeWeights& weights, Tensor& destination,
     const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_down.qdata);
     const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_down.scales);
     auto* output              = static_cast<__nv_bfloat16*>(destination.data);
-    switch (schedule) {
-    case SparseMoeD4Schedule::NineWarpRows1:
-        sparse_moe_d4_nine_warp_kernel<Codec, 1, SparseMoeEpilogue::AddResidual>
-            <<<kHidden, 9 * 32, 0, stream>>>(ids, alpha, shared_scale, act, routed_codes,
-                                             routed_high, routed_scales, shared_codes,
-                                             shared_scales, output);
-        CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(pdl::launch_dependent({dim3(kHidden), dim3(9 * 32), 0, stream},
+                                     sparse_moe_d4_nine_warp_kernel<Codec, 1>, ids, alpha,
+                                     shared_scale, act, routed_codes, routed_high, routed_scales,
+                                     shared_codes, shared_scales, output));
+}
+
+void launch_d4_dependent(const SparseMoeWeights& weights, Tensor& destination,
+                         const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+    switch (weights.routed_down.qtype) {
+    case QType::Q5G64_F16S:
+        launch_d4_dependent_codec<Q5Codec>(weights, destination, workspace, stream);
         return;
-    case SparseMoeD4Schedule::BalancedEightWarpRows4:
-        sparse_moe_d4_balanced_r4_kernel<Codec, SparseMoeEpilogue::AddResidual>
-            <<<kHidden / 4, 8 * 32, 0, stream>>>(ids, alpha, shared_scale, act, routed_codes,
-                                                 routed_high, routed_scales, shared_codes,
-                                                 shared_scales, output);
-        CUDA_CHECK(cudaGetLastError());
+    case QType::Q6G64_F16S:
+        launch_d4_dependent_codec<Q6Codec>(weights, destination, workspace, stream);
         return;
+    case QType::W8G32_F16S:
+        launch_d4_dependent_codec<W8Codec>(weights, destination, workspace, stream);
+        return;
+    default:
+        throw std::invalid_argument("sparse_moe: unsupported D4 codec");
     }
-    throw std::logic_error("sparse_moe: unknown D4 schedule");
 }
 
-template <class Codec, int PathsPerBlock>
+template <class Codec, int PathsPerBlock, bool Adaptive>
 void launch_d3_small_t_paths(const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
-                             float* token_activations, std::int32_t tokens, cudaStream_t stream) {
+                             float* token_activations, std::int32_t tokens, cudaStream_t stream,
+                             const int* adaptive_route_jobs) {
     constexpr int kPathBlocks = (kTopK + 1) / PathsPerBlock;
-    sparse_moe_d3_path_tiled_kernel<Codec, PathsPerBlock>
-        <<<dim3(kIntermediate, tokens * kPathBlocks), PathsPerBlock * 32, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data), token_ids,
-            static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
-            static_cast<const std::uint8_t*>(weights.routed_gate_up.qhigh),
-            static_cast<const std::uint8_t*>(weights.routed_gate_up.scales),
-            static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata),
-            static_cast<const std::uint8_t*>(weights.shared_gate_up.scales), token_activations);
-    CUDA_CHECK(cudaGetLastError());
+    const auto* input         = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* routed_codes  = static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata);
+    const auto* routed_high   = static_cast<const std::uint8_t*>(weights.routed_gate_up.qhigh);
+    const auto* routed_scales = static_cast<const std::uint8_t*>(weights.routed_gate_up.scales);
+    const auto* shared_codes  = static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata);
+    const auto* shared_scales = static_cast<const std::uint8_t*>(weights.shared_gate_up.scales);
+    if constexpr (Adaptive) {
+        sparse_moe_d3_path_tiled_kernel<Codec, PathsPerBlock, true>
+            <<<kAdaptiveD3Blocks, PathsPerBlock * 32, 0, stream>>>(
+                input, token_ids, routed_codes, routed_high, routed_scales, shared_codes,
+                shared_scales, token_activations, tokens, adaptive_route_jobs);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(kIntermediate, tokens * kPathBlocks), dim3(PathsPerBlock * 32), 0, stream},
+            sparse_moe_d3_path_tiled_kernel<Codec, PathsPerBlock, false>, input, token_ids,
+            routed_codes, routed_high, routed_scales, shared_codes, shared_scales,
+            token_activations, tokens, nullptr));
+    }
 }
 
-template <class Codec>
+template <class Codec, bool Adaptive>
 void launch_d3_small_t_codec(const Tensor& x, const SparseMoeWeights& weights, const int* token_ids,
                              float* token_activations, std::int32_t tokens,
-                             SparseMoeSmallTD3Schedule schedule, cudaStream_t stream) {
+                             SparseMoeSmallTD3Schedule schedule, cudaStream_t stream,
+                             const int* adaptive_route_jobs) {
     switch (schedule) {
     case SparseMoeSmallTD3Schedule::Paths1:
-        launch_d3_small_t_paths<Codec, 1>(x, weights, token_ids, token_activations, tokens, stream);
+        launch_d3_small_t_paths<Codec, 1, Adaptive>(x, weights, token_ids, token_activations,
+                                                    tokens, stream, adaptive_route_jobs);
         return;
     case SparseMoeSmallTD3Schedule::Paths3:
-        launch_d3_small_t_paths<Codec, 3>(x, weights, token_ids, token_activations, tokens, stream);
+        launch_d3_small_t_paths<Codec, 3, Adaptive>(x, weights, token_ids, token_activations,
+                                                    tokens, stream, adaptive_route_jobs);
         return;
     case SparseMoeSmallTD3Schedule::Paths9:
-        launch_d3_small_t_paths<Codec, 9>(x, weights, token_ids, token_activations, tokens, stream);
+        launch_d3_small_t_paths<Codec, 9, Adaptive>(x, weights, token_ids, token_activations,
+                                                    tokens, stream, adaptive_route_jobs);
         return;
     }
     throw std::logic_error("sparse_moe: unknown small-T D3 schedule");
 }
 
-template <class Codec, int Rows>
+template <class Codec, int Rows, bool Adaptive>
 void launch_d4_small_t_rows(const SparseMoeWeights& weights, Tensor& destination,
                             const int* token_ids, const float* token_alpha,
                             const float* shared_scale, const float* token_activations,
-                            std::int32_t tokens, cudaStream_t stream) {
-    sparse_moe_d4_token_kernel<Codec, Rows><<<dim3(kHidden / Rows, tokens), 9 * 32, 0, stream>>>(
+                            std::int32_t tokens, cudaStream_t stream,
+                            const int* adaptive_route_jobs) {
+    const dim3 grid = Adaptive ? dim3(kAdaptiveD4Blocks) : dim3(kHidden / Rows, tokens);
+    sparse_moe_d4_token_kernel<Codec, Rows, Adaptive><<<grid, 9 * 32, 0, stream>>>(
         token_ids, token_alpha, shared_scale, token_activations,
         static_cast<const std::uint8_t*>(weights.routed_down.qdata),
         static_cast<const std::uint8_t*>(weights.routed_down.qhigh),
         static_cast<const std::uint8_t*>(weights.routed_down.scales),
         static_cast<const std::uint8_t*>(weights.shared_down.qdata),
         static_cast<const std::uint8_t*>(weights.shared_down.scales),
-        static_cast<__nv_bfloat16*>(destination.data));
+        static_cast<__nv_bfloat16*>(destination.data), tokens, adaptive_route_jobs);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <class Codec>
+template <class Codec, bool Adaptive>
 void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destination,
                              const int* token_ids, const float* token_alpha,
                              const float* shared_scale, const float* token_activations,
                              std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
-                             cudaStream_t stream) {
+                             cudaStream_t stream, const int* adaptive_route_jobs) {
     switch (schedule) {
     case SparseMoeSmallTD4Schedule::Rows1:
-        launch_d4_small_t_rows<Codec, 1>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, stream);
+        launch_d4_small_t_rows<Codec, 1, Adaptive>(weights, destination, token_ids, token_alpha,
+                                                   shared_scale, token_activations, tokens, stream,
+                                                   adaptive_route_jobs);
         return;
     case SparseMoeSmallTD4Schedule::Rows2:
-        launch_d4_small_t_rows<Codec, 2>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, stream);
+        launch_d4_small_t_rows<Codec, 2, Adaptive>(weights, destination, token_ids, token_alpha,
+                                                   shared_scale, token_activations, tokens, stream,
+                                                   adaptive_route_jobs);
         return;
     case SparseMoeSmallTD4Schedule::Rows4:
-        launch_d4_small_t_rows<Codec, 4>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, stream);
+        launch_d4_small_t_rows<Codec, 4, Adaptive>(weights, destination, token_ids, token_alpha,
+                                                   shared_scale, token_activations, tokens, stream,
+                                                   adaptive_route_jobs);
         return;
     }
     throw std::logic_error("sparse_moe: unknown small-T D4 schedule");
@@ -707,90 +656,23 @@ void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destinatio
 
 } // namespace
 
-void sparse_moe_decode_launch_d1(const Tensor& x, const Weight& router_shared_gate,
-                                 const SparseMoeDecodeWorkspace& workspace,
-                                 SparseMoeD1Schedule schedule, cudaStream_t stream) {
-    const auto* input  = static_cast<const __nv_bfloat16*>(x.data);
-    const auto* router = static_cast<const __nv_bfloat16*>(router_shared_gate.qdata);
-    auto* scores       = static_cast<float*>(workspace.scratch.data);
-    switch (schedule) {
-    case SparseMoeD1Schedule::RowCta4:
-        sparse_moe_d1_kernel<4><<<kRouterRows, 4 * 32, 0, stream>>>(input, router, scores);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    case SparseMoeD1Schedule::RowCta8:
-        sparse_moe_d1_kernel<8><<<kRouterRows, 8 * 32, 0, stream>>>(input, router, scores);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-    throw std::logic_error("sparse_moe: unknown D1 schedule");
-}
-
-void sparse_moe_decode_launch_d2(const SparseMoeDecodeWorkspace& workspace,
-                                 SparseMoeD2Schedule schedule, cudaStream_t stream) {
-    const auto* scores = static_cast<const float*>(workspace.scratch.data);
-    auto* ids          = static_cast<int*>(workspace.ids.data);
-    auto* alpha        = static_cast<float*>(workspace.alpha.data);
-    auto* shared_scale = static_cast<float*>(workspace.shared_scale.data);
-    switch (schedule) {
-    case SparseMoeD2Schedule::SerialControl:
-        sparse_moe_d2_serial_control_kernel<<<1, 256, 0, stream>>>(scores, ids, alpha,
-                                                                   shared_scale);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    case SparseMoeD2Schedule::WarpRegister:
-        sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(scores, ids, alpha, shared_scale);
-        CUDA_CHECK(cudaGetLastError());
-        return;
-    }
-    throw std::logic_error("sparse_moe: unknown D2 schedule");
-}
-
-void sparse_moe_decode_launch_d3(const Tensor& x, const SparseMoeWeights& weights,
-                                 const SparseMoeDecodeWorkspace& workspace,
-                                 SparseMoeD3Schedule schedule, cudaStream_t stream) {
-    switch (weights.routed_gate_up.qtype) {
-    case QType::Q4G64_F16S:
-        launch_d3_codec<Q4Codec>(x, weights, workspace, schedule, stream);
-        return;
-    case QType::W8G32_F16S:
-        launch_d3_codec<W8Codec>(x, weights, workspace, schedule, stream);
-        return;
-    default:
-        throw std::invalid_argument("sparse_moe: unsupported D3 codec");
-    }
-}
-
-void sparse_moe_decode_launch_d4(const SparseMoeWeights& weights, Tensor& destination,
-                                 const SparseMoeDecodeWorkspace& workspace,
-                                 SparseMoeD4Schedule schedule, cudaStream_t stream) {
-    switch (weights.routed_down.qtype) {
-    case QType::Q5G64_F16S:
-        launch_d4_codec<Q5Codec>(weights, destination, workspace, schedule, stream);
-        return;
-    case QType::Q6G64_F16S:
-        launch_d4_codec<Q6Codec>(weights, destination, workspace, schedule, stream);
-        return;
-    case QType::W8G32_F16S:
-        launch_d4_codec<W8Codec>(weights, destination, workspace, schedule, stream);
-        return;
-    default:
-        throw std::invalid_argument("sparse_moe: unsupported D4 codec");
-    }
-}
-
 void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
                                          const int* token_ids, float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD3Schedule schedule,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, const int* adaptive_route_jobs) {
     switch (weights.routed_gate_up.qtype) {
     case QType::Q4G64_F16S:
-        launch_d3_small_t_codec<Q4Codec>(x, weights, token_ids, token_activations, tokens, schedule,
-                                         stream);
+        if (adaptive_route_jobs == nullptr) {
+            launch_d3_small_t_codec<Q4Codec, false>(x, weights, token_ids, token_activations,
+                                                    tokens, schedule, stream, nullptr);
+        } else {
+            launch_d3_small_t_codec<Q4Codec, true>(x, weights, token_ids, token_activations, tokens,
+                                                   schedule, stream, adaptive_route_jobs);
+        }
         return;
     case QType::W8G32_F16S:
-        launch_d3_small_t_codec<W8Codec>(x, weights, token_ids, token_activations, tokens, schedule,
-                                         stream);
+        launch_d3_small_t_codec<W8Codec, false>(x, weights, token_ids, token_activations, tokens,
+                                                schedule, stream, nullptr);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D3 codec");
@@ -801,19 +683,34 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
                                          const int* token_ids, const float* token_alpha,
                                          const float* shared_scale, const float* token_activations,
                                          std::int32_t tokens, SparseMoeSmallTD4Schedule schedule,
-                                         cudaStream_t stream) {
+                                         cudaStream_t stream, const int* adaptive_route_jobs) {
     switch (weights.routed_down.qtype) {
     case QType::Q5G64_F16S:
-        launch_d4_small_t_codec<Q5Codec>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, schedule, stream);
+        if (adaptive_route_jobs == nullptr) {
+            launch_d4_small_t_codec<Q5Codec, false>(weights, destination, token_ids, token_alpha,
+                                                    shared_scale, token_activations, tokens,
+                                                    schedule, stream, nullptr);
+        } else {
+            launch_d4_small_t_codec<Q5Codec, true>(weights, destination, token_ids, token_alpha,
+                                                   shared_scale, token_activations, tokens,
+                                                   schedule, stream, adaptive_route_jobs);
+        }
         return;
     case QType::Q6G64_F16S:
-        launch_d4_small_t_codec<Q6Codec>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, schedule, stream);
+        if (adaptive_route_jobs == nullptr) {
+            launch_d4_small_t_codec<Q6Codec, false>(weights, destination, token_ids, token_alpha,
+                                                    shared_scale, token_activations, tokens,
+                                                    schedule, stream, nullptr);
+        } else {
+            launch_d4_small_t_codec<Q6Codec, true>(weights, destination, token_ids, token_alpha,
+                                                   shared_scale, token_activations, tokens,
+                                                   schedule, stream, adaptive_route_jobs);
+        }
         return;
     case QType::W8G32_F16S:
-        launch_d4_small_t_codec<W8Codec>(weights, destination, token_ids, token_alpha, shared_scale,
-                                         token_activations, tokens, schedule, stream);
+        launch_d4_small_t_codec<W8Codec, false>(weights, destination, token_ids, token_alpha,
+                                                shared_scale, token_activations, tokens, schedule,
+                                                stream, nullptr);
         return;
     default:
         throw std::invalid_argument("sparse_moe: unsupported small-T D4 codec");
@@ -821,12 +718,10 @@ void sparse_moe_decode_launch_d4_small_t(const SparseMoeWeights& weights, Tensor
 }
 
 void sparse_moe_decode_launch(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
-                              const SparseMoeDecodeWorkspace& workspace,
-                              const SparseMoeDecodePlan& plan, cudaStream_t stream) {
-    sparse_moe_decode_launch_d1(x, weights.router_shared_gate, workspace, plan.d1, stream);
-    sparse_moe_decode_launch_d2(workspace, plan.d2, stream);
-    sparse_moe_decode_launch_d3(x, weights, workspace, plan.d3, stream);
-    sparse_moe_decode_launch_d4(weights, destination, workspace, plan.d4, stream);
+                              const SparseMoeDecodeWorkspace& workspace, cudaStream_t stream) {
+    launch_d1(x, weights.router_shared_gate, workspace, stream);
+    launch_d2_d3(x, weights, workspace, stream);
+    launch_d4_dependent(weights, destination, workspace, stream);
 }
 
 } // namespace ninfer::ops::detail

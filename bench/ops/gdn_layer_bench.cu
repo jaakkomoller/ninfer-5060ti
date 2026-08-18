@@ -213,7 +213,7 @@ struct Resources {
           conv_weight(bench::make_bf16(static_cast<std::size_t>(kConvRows) * 4)),
           a_log(make_constant_f32(kValueHeads, -1.0F)),
           dt_bias(make_constant_f32(kValueHeads, 0.0F)),
-          initial_slot(make_constant_i32(kInitialSlot)),
+          initial_slot(make_constant_i32(kInitialSlot)), snapshot_base_slot(make_constant_i32(0)),
           residual(bench::make_bf16(static_cast<std::size_t>(kHidden) * max_tokens)),
           hidden(static_cast<std::size_t>(kHidden) * max_tokens * sizeof(std::uint16_t)),
           qkv(static_cast<std::size_t>(kConvRows) * max_tokens * sizeof(std::uint16_t)),
@@ -236,7 +236,7 @@ struct Resources {
                               ops::gdn_norm_gating_proj_workspace_capacity_bytes(
                                   kValueHeads, kHidden, 1, max_tokens),
                               ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                                  kKeyRows, kKeyRows, kValueRows, 1, max_tokens),
+                                  kKeyRows, kKeyRows, kValueRows, 1, 1, max_tokens),
                               ops::linear_add_workspace_capacity_bytes(
                                   QType::W8G32_F16S, kHidden, kValueRows, 1, max_tokens)})) {}
 
@@ -256,6 +256,7 @@ struct Resources {
     ninfer::DeviceBuffer a_log;
     ninfer::DeviceBuffer dt_bias;
     ninfer::DeviceBuffer initial_slot;
+    ninfer::DeviceBuffer snapshot_base_slot;
 
     ninfer::DeviceBuffer residual;
     ninfer::DeviceBuffer hidden;
@@ -287,6 +288,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
     Tensor conv_states(resources.conv_states.p, DType::BF16,
                        {kConvRows, kConvStateRows, kSnapshotSlots});
     Tensor initial_slot(resources.initial_slot.p, DType::I32, {1});
+    Tensor snapshot_base_slot(resources.snapshot_base_slot.p, DType::I32, {1});
     Tensor qkv_conv(resources.qkv_conv.p, DType::BF16, {kConvRows, tokens});
     Tensor a_log(resources.a_log.p, DType::FP32, {kValueHeads});
     Tensor dt_bias(resources.dt_bias.p, DType::FP32, {kValueHeads});
@@ -312,13 +314,13 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
             ops::rmsnorm(residual, input_norm, kEps, true, hidden, s);
         }
         if (options.route == "fused") {
-            ops::gdn_input_proj_conv_snapshot(hidden, resources.input_weight.weight, conv_weight,
-                                              conv_states, initial_slot, q, k, v, z,
-                                              resources.workspace, s);
+            ops::gdn_input_proj_conv_snapshot(
+                hidden, resources.input_weight.weight, conv_weight, conv_states, Tensor{},
+                initial_slot, snapshot_base_slot, q, k, v, z, resources.workspace, s);
         } else {
             ops::gdn_input_proj(hidden, resources.input_weight.weight, qkv, z, s);
-            ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states, initial_slot, qkv_conv,
-                                             s);
+            ops::causal_conv1d_silu_snapshot(qkv, conv_weight, conv_states, Tensor{}, initial_slot,
+                                             snapshot_base_slot, qkv_conv, s);
             ops::extract_bf16_columns(qkv_conv, 0, q, s);
             ops::extract_bf16_columns(qkv_conv, kKeyRows, k, s);
             ops::extract_bf16_columns(qkv_conv, 2 * kKeyRows, v, s);
@@ -338,7 +340,8 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         }
         ops::gated_delta_net_snapshot(q_recurrent, k_recurrent,
                                       v.view({kHeadDim, kValueHeads, tokens}), g, beta, kGdnScale,
-                                      fused_qk_norm, ssm_states, initial_slot, recurrent_out, s);
+                                      fused_qk_norm, ssm_states, Tensor{}, initial_slot,
+                                      snapshot_base_slot, recurrent_out, s);
         if (options.gated_rms == "dv10-b1024") {
             constexpr int block          = 1024;
             constexpr int rows_per_block = block / 32;
@@ -370,8 +373,8 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
 
     const auto input_plan = ops::detail::w8_gdn_input_resolve_plan(
         {kHidden, kConvRows, kValueRows, kInputRows, kHidden, tokens});
-    const auto snapshot_plan = ops::detail::w8_gdn_input_snapshot_resolve_plan(
-        {kHidden, kConvRows, kValueRows, kInputRows, kHidden, tokens});
+    const auto snapshot_plan = ops::detail::w8_gdn_input_conv_resolve_plan(
+        {kHidden, kConvRows, kValueRows, kInputRows, kHidden, tokens}, 1);
     const auto control_plan =
         ops::detail::bf16_gdn_gating_resolve_plan({kValueHeads, kHidden, tokens});
     const auto norm_control_plan =
@@ -379,24 +382,24 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
     const auto output_plan =
         ops::detail::w8_linear_add_resolve_plan({kHidden, kValueRows, kValueRows, tokens});
 
-    return {tokens,
-            graph.nodes(),
-            options.route == "fused"
-                ? std::string(
-                      ops::detail::w8_gdn_input_snapshot_schedule_name(snapshot_plan.schedule)) +
-                      "+gated_delta_net_snapshot.bf16.recurrent." +
-                      (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4")
-                : std::string("gdn_input_proj_conv_snapshot.w8.composed_control+") +
-                      ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
-                      "+gated_delta_net_snapshot.bf16.recurrent." +
-                      (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4"),
-            options.norm_control == "fused"
-                ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)
-                : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
-            options.gated_rms == "dv10-b1024" ? "gated_rms.candidate.warp_bf16x2_b1024"
-                                              : "gated_rms.production",
-            ops::detail::w8_linear_add_schedule_name(output_plan.schedule),
-            timing};
+    return {
+        tokens,
+        graph.nodes(),
+        options.route == "fused"
+            ? std::string(ops::detail::w8_gdn_input_conv_schedule_name(snapshot_plan.schedule)) +
+                  "+gated_delta_net_snapshot.bf16.recurrent." +
+                  (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4")
+            : std::string("gdn_input_proj_conv_snapshot.w8.composed_control+") +
+                  ops::detail::w8_gdn_input_schedule_name(input_plan.schedule) +
+                  "+gated_delta_net_snapshot.bf16.recurrent." +
+                  (options.qk_norm == "fused" ? "qk_fused.w4" : "qk_pre_normalized.w4"),
+        options.norm_control == "fused"
+            ? ops::detail::bf16_gdn_norm_gating_schedule_name(norm_control_plan.schedule)
+            : ops::detail::bf16_gdn_gating_schedule_name(control_plan.schedule),
+        options.gated_rms == "dv10-b1024" ? "gated_rms.candidate.warp_bf16x2_b1024"
+                                          : "gated_rms.production",
+        ops::detail::w8_linear_add_schedule_name(output_plan.schedule),
+        timing};
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results) {
