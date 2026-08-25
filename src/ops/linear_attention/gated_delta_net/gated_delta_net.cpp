@@ -77,7 +77,9 @@ Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_dtype(out, DType::BF16, "out must be BF16");
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
-    require_dtype(ssm_state, DType::FP32, "ssm_state must be FP32");
+    if (ssm_state.dtype != DType::FP32 && ssm_state.dtype != DType::BF16) {
+        throw std::invalid_argument("ssm_state must be FP32 or BF16");
+    }
 
     const Geometry geometry = require_geometry(q, v);
     require_shape(q, detail::gated_delta_net::kStateDim, geometry.qk_heads, geometry.tokens, 1,
@@ -119,7 +121,9 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
     require_dtype(out, DType::BF16, "out must be BF16");
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
-    require_dtype(ssm_states, DType::FP32, "ssm_states must be FP32");
+    if (ssm_states.dtype != DType::FP32 && ssm_states.dtype != DType::BF16) {
+        throw std::invalid_argument("ssm_states must be FP32 or BF16");
+    }
     if (masked) { require_dtype(valid_columns, DType::I32, "valid_columns must be I32"); }
     require_dtype(initial_state_slots, DType::I32, "initial_state_slots must be I32");
     require_dtype(snapshot_base_slots, DType::I32, "snapshot_base_slots must be I32");
@@ -169,7 +173,9 @@ void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const T
     // ssm_state_out carries the running-state contract validated by validate_recurrent;
     // ssm_state_in is an equally-shaped read view (may alias ssm_state_out for in-place).
     const Geometry geometry = validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out);
-    require_dtype(ssm_state_in, DType::FP32, "ssm_state_in must be FP32");
+    if (ssm_state_in.dtype != DType::FP32 && ssm_state_in.dtype != DType::BF16) {
+        throw std::invalid_argument("ssm_state_in must be FP32 or BF16");
+    }
     require_shape(ssm_state_in, detail::gated_delta_net::kStateDim,
                   detail::gated_delta_net::kStateDim, geometry.value_heads, 1, "ssm_state_in");
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");

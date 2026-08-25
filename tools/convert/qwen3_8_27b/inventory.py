@@ -3,6 +3,10 @@
 The graph and all non-vocabulary storage roles are identical to the registered
 Qwen3.6-27B groupwise artifact.  The embedding and full output head use the W8
 format already supported by the 27B runtime.
+
+The MTP transformer tensors are quantized with a smaller-than-upstream format
+mix for the RTX 5060 Ti 16 GB path; the upstream W8 representation is preserved
+on targets that do not need this compression.
 """
 
 from __future__ import annotations
@@ -34,9 +38,31 @@ RESOURCE_SPECS = qwen3_6_inventory.RESOURCE_SPECS
 
 
 def _w8_vocabulary_endpoint(spec: TensorSpec) -> TensorSpec:
-    if spec.name in ("text/token_embedding", "text/output_head"):
-        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, W8)
+    if spec.name == "text/token_embedding":
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q6)
+    if spec.name == "text/output_head":
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q4)
     return spec
+
+
+# RTX 5060 Ti-specific MTP format mix. The Qwen3.6-27B inventory declares the
+# MTP transformer in W8G32_F16S; the RTX 5060 Ti 16 GB path needs ~180 MiB less
+# resident weight so the 27B model fits with MTP enabled. Each entry is
+# selected to match a Q4G64_F16S or Q5G64_F16S dispatch case in the runtime.
+_MTP_RTX5060TI_FORMAT = {
+    "mtp/input_projection": Q4,
+    "mtp/layer/attention/query_key_gate_value": Q4,
+    "mtp/layer/attention/output": Q4,
+    "mtp/layer/mlp/gate_up": Q4,
+    "mtp/layer/mlp/down": Q4,
+}
+
+
+def _rtx5060ti_mtp(spec: TensorSpec) -> TensorSpec:
+    target = _MTP_RTX5060TI_FORMAT.get(spec.name)
+    if target is None:
+        return spec
+    return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, target)
 
 
 TEXT_CORE_TENSOR_SPECS = tuple(
@@ -44,7 +70,9 @@ TEXT_CORE_TENSOR_SPECS = tuple(
     for spec in qwen3_6_inventory.TEXT_CORE_TENSOR_SPECS
 )
 DRAFT_HEAD_TENSOR_SPECS = qwen3_6_inventory.DRAFT_HEAD_TENSOR_SPECS
-MTP_TENSOR_SPECS = qwen3_6_inventory.MTP_TENSOR_SPECS
+MTP_TENSOR_SPECS = tuple(
+    _rtx5060ti_mtp(spec) for spec in qwen3_6_inventory.MTP_TENSOR_SPECS
+)
 VISION_TENSOR_SPECS = qwen3_6_inventory.VISION_TENSOR_SPECS
 
 TENSOR_SPECS = (

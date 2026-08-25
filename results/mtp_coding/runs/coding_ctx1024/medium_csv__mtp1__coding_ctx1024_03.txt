@@ -1,0 +1,112 @@
+```python
+import csv
+
+
+def read_data(filename: str) -> list[dict]:
+    """Read CSV file and return list of row dictionaries."""
+    with open(filename, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        rows = []
+        for row in reader:
+            rows.append(row)
+    return rows
+
+
+def compute_average_score(rows: list[dict]) -> float:
+    """Compute the average score from the list of row dictionaries."""
+    if not rows:
+        return 0.0
+    total = 0.0
+    count = 0
+    for row in rows:
+        try:
+            score = float(row['score'])
+            total += score
+            count += 1
+        except (ValueError, KeyError):
+            continue
+    if count == 0:
+        return 0.0
+    return total / count
+
+
+def get_names_above_average(rows: list[dict], average: float) -> list[str]:
+    """Return names of entries whose score is above the given average."""
+    names = []
+    for row in rows:
+        try:
+            score = float(row['score'])
+        except (ValueError, KeyError):
+            continue
+        if score > average:
+            name = row.get('name', '')
+            if name:
+                names.append(name)
+    return names
+
+
+def main():
+    filename = 'data.csv'
+    rows = read_data(filename)
+    average = compute_average_score(rows)
+    names = get_names_above_average(rows, average)
+    for name in names:
+        print(name)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB     5.139 s
+load        engine construction            7.036 s
+load        artifact/materialize           6.894 s
+load        host to device                 5.139 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.261 s
+generate    decode                         9.203 s
+generate    total                          9.466 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             71
+summary     reused prompt tokens      0
+summary     generated tokens          372
+summary     model elapsed             9.465 s
+summary     prefill speed             271.85 tok/s
+summary     decode speed              40.31 tok/s
+summary     throughput (overall)      39.30 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         116.86 MiB / 116.86 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.06 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       139.64 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        47.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             39.42 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.30 GiB
+summary     mtp draft window          1
+summary     mtp rounds                190
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        190
+summary     mtp accepted tokens       182
+summary     mtp acceptance rate       95.79%
+summary     mtp acceptance length     1.96 tok/round
+summary     mtp accepted by pos       182

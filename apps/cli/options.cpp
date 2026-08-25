@@ -84,7 +84,7 @@ std::string usage_text(const char* argv0) {
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
            "       [--raw-output] [--print-token-ids] [--no-thinking]\n"
            "       [--reasoning-effort low|medium|xhigh] [--vision]\n"
-           "       [--no-cuda-graph]\n"
+           "       [--no-cuda-graph] [--no-prefix-reuse]\n"
            "\n"
            "Streams answer content to stdout and reasoning plus diagnostics to stderr.\n"
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
@@ -93,6 +93,9 @@ std::string usage_text(const char* argv0) {
            "--kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
+           "--no-prefix-reuse halves the Linear Attention state pool by dropping the rewrite\n"
+           "checkpoint slot, useful for memory-constrained GPUs that do not need cross-request\n"
+           "prefix caching.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
            "individual fields.\n";
 }
@@ -149,6 +152,8 @@ Options parse_options(int argc, char** argv) {
             options.enable_vision = true;
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--no-prefix-reuse") {
+            options.persistent_prefix_reuse = false;
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -200,8 +205,8 @@ Options parse_options(int argc, char** argv) {
     if (has_prompt == has_messages) {
         throw std::invalid_argument("pass exactly one of --prompt or --messages");
     }
-    if (options.prefill_chunk % 128 != 0) {
-        throw std::invalid_argument("--prefill-chunk must be a multiple of 128");
+    if (options.prefill_chunk % 64 != 0) {
+        throw std::invalid_argument("--prefill-chunk must be a multiple of 64");
     }
     if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {

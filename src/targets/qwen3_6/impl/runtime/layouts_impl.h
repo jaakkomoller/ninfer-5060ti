@@ -92,7 +92,7 @@ TensorLayout add_tensor(LayoutBuilder& builder, DType dtype,
 
 PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     const std::int32_t linear_state_slots =
-        LinearStateSlots::state_slot_count(plan.max_concurrency);
+        LinearStateSlots::state_slot_count(plan.max_concurrency, plan.persistent_prefix_reuse);
     const auto effective_prefill_chunk =
         static_cast<std::int32_t>(std::min(plan.prefill_chunk, plan.capacity));
     const std::uint32_t logical_pages  = page_count(plan.capacity);
@@ -131,6 +131,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .key_head_dim   = TextConfig::gdn_key_head_dim,
                              .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
+                             // RTX 5060 Ti 16 GB path: store the Qwen3.8 27B
+                             // GDN recurrent state as BF16. Computation stays in
+                             // FP32 inside the kernels; load-convert-store
+                             // wraps each kernel. Halves the persistent
+                             // recurrent footprint (~144 MiB -> ~72 MiB).
+                             .recurrent_dtype = DType::BF16,
                          },
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
@@ -623,6 +629,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->device              = inputs.device;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
+    impl->persistent_prefix_reuse = inputs.persistent_prefix_reuse;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->features.vision) {
@@ -700,6 +707,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
         .use_cuda_graph = options.use_cuda_graph,
+        .persistent_prefix_reuse = options.persistent_prefix_reuse,
         .device         = options.device,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);

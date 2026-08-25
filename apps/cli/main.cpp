@@ -266,6 +266,7 @@ int main(int argc, char** argv) {
         engine_options.speculative    = cli.speculative;
         engine_options.enable_vision  = cli.enable_vision;
         engine_options.use_cuda_graph = cli.use_cuda_graph;
+        engine_options.persistent_prefix_reuse = cli.persistent_prefix_reuse;
         engine_options.load_progress  = load_progress.callback();
 
         const auto load_started = Clock::now();

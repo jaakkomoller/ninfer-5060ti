@@ -70,8 +70,9 @@ struct SequencePlanningInputs {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
-    bool use_cuda_graph = true;
-    int device          = 0;
+    bool use_cuda_graph         = true;
+    bool persistent_prefix_reuse = true;
+    int device                  = 0;
 };
 
 } // namespace ninfer::targets::qwen3_6::detail::NINFER_QWEN36_RUNTIME_NS
@@ -92,8 +93,9 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     std::int32_t kv_quant_group            = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
-    bool use_cuda_graph = true;
-    int device          = 0;
+    bool use_cuda_graph         = true;
+    bool persistent_prefix_reuse = true;
+    int device                  = 0;
     NINFER_QWEN36_RUNTIME_NS::PersistentLayout persistent;
     NINFER_QWEN36_RUNTIME_NS::WorkspacePlan workspace;
     std::size_t request_transient_capacity_bytes = 0;

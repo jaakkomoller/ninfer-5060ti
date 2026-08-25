@@ -1,0 +1,69 @@
+### Plain English Explanation
+
+This regex matches a **URL** (or a domain name) that ends with one of three specific top-level domains: `.com`, `.org`, or `.io`.
+
+Here’s the breakdown in simple terms:
+1.  **Optional Protocol**: It may start with `http://` or `https://` (but it’s not required).
+2.  **Optional `www.`**: It may include `www.` before the domain name (but it’s not required).
+3.  **Domain Name**: It requires a domain name made of lowercase letters, numbers, or hyphens (e.g., `example`, `my-site`).
+4.  **Specific TLD**: The domain **must** end with `.com`, `.org`, or `.io`.
+5.  **Optional Path**: It may have a path after the domain (e.g., `/products`), but the regex as written actually **does not capture or allow arbitrary paths** correctly in the way typical URL regexes do. *Wait, let’s look closer at the regex structure.*
+
+    Actually, looking at the regex: `.../?(?:\?([^#]*))?(?:#(.*))?$`
+    - The `/?` allows an optional single slash.
+    - Then it optionally matches a query string starting with `?`.
+    - Then it optionally matches a fragment starting with `#`.
+    - **Crucially**: It does **not** allow for a path like `/products/page`. If you have `/products`, the regex will fail because after the `.com`, it expects either `?`, `#`, or the end of the string. A `/` followed by letters is not allowed unless it’s immediately followed by `?` or `#` (which is unlikely) or if the path is empty.
+
+    **Correction/Refinement**: This regex is designed to match:
+    - A domain (with optional protocol/www) ending in `.com`, `.org`, or `.io`.
+    - Optionally followed by a **query string** (starting with `?`).
+    - Optionally followed by a **fragment** (starting with `#`).
+    - It does **not** support paths like `/about` or `/products`. If you have a path, it will not match unless the path is empty or the regex is modified.
+
+    So, in plain English
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     9.423 s
+load        engine construction           11.299 s
+load        artifact/materialize          11.168 s
+load        host to device                 9.423 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.340 s
+generate    decode                        20.091 s
+generate    total                         20.434 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             86
+summary     reused prompt tokens      0
+summary     generated tokens          500
+summary     model elapsed             20.431 s
+summary     prefill speed             252.79 tok/s
+summary     decode speed              24.84 tok/s
+summary     throughput (overall)      24.47 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         110.36 MiB / 110.36 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       133.15 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        267.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             259.91 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.09 GiB

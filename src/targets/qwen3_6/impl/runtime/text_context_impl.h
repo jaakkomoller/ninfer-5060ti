@@ -243,7 +243,7 @@ TextContext::~TextContext() = default;
 void TextContext::set_linear_state_slots(std::int32_t current_slot,
                                          std::int32_t rewrite_checkpoint_slot) {
     if (current_slot < 0 || current_slot >= state_.slot_count() || rewrite_checkpoint_slot < 0 ||
-        rewrite_checkpoint_slot >= state_.slot_count() || current_slot == rewrite_checkpoint_slot) {
+        rewrite_checkpoint_slot >= state_.slot_count()) {
         throw std::invalid_argument("TextContext Linear Attention slots are invalid");
     }
     linear_state_current_slot_            = current_slot;

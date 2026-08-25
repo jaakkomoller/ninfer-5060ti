@@ -167,15 +167,32 @@ __device__ __forceinline__ void unpack_bf16x2_to_fp32_bits(unsigned packed, unsi
 
 // The narrow geometry targets two 128-register CTAs per SM. The wide geometry
 // uses one 512-thread CTA; both expose 16 resident warps without local spills.
-template <int NStrip>
+__device__ __forceinline__ float load_state_value(const float* base, std::int64_t off) {
+    return base[off];
+}
+
+__device__ __forceinline__ float load_state_value(const __nv_bfloat16* base, std::int64_t off) {
+    return __bfloat162float(base[off]);
+}
+
+__device__ __forceinline__ void store_state_value(float* base, std::int64_t off, float value) {
+    base[off] = value;
+}
+
+__device__ __forceinline__ void store_state_value(__nv_bfloat16* base, std::int64_t off,
+                                                  float value) {
+    base[off] = __float2bfloat16(value);
+}
+
+template <int NStrip, class StateInPtr, class StateOutPtr>
 __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS) __global__
     void state_passing_kernel(const __nv_bfloat16* __restrict__ W_in,
-                              const __nv_bfloat16* __restrict__ U_in,
-                              const __nv_bfloat16* __restrict__ k_in,
-                              const float* __restrict__ g_cumsum, const float* state_in,
-                              __nv_bfloat16* __restrict__ v_new,
-                              __nv_bfloat16* __restrict__ h_chunk, float* state_out,
-                              head_map qk_map, int chunks) {
+                               const __nv_bfloat16* __restrict__ U_in,
+                               const __nv_bfloat16* __restrict__ k_in,
+                               const float* __restrict__ g_cumsum, StateInPtr state_in,
+                               __nv_bfloat16* __restrict__ v_new,
+                               __nv_bfloat16* __restrict__ h_chunk, StateOutPtr state_out,
+                               head_map qk_map, int chunks) {
     using D                         = kernel_dims<NStrip>;
     using L                         = smem_layout<NStrip>;
     constexpr int N_STRIP_PER_BLOCK = D::N_STRIP_PER_BLOCK;
@@ -263,13 +280,13 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
             const int col_d0 = warp_d_global + 2 * lane_t;
             const int col_d1 = col_d0 + 1;
             h_frag[m][0] =
-                load_ldg<float>(state_in + st_base + (int64_t)col_d0 * kStateDim + row_g0);
+                load_state_value(state_in, st_base + (int64_t)col_d0 * kStateDim + row_g0);
             h_frag[m][1] =
-                load_ldg<float>(state_in + st_base + (int64_t)col_d1 * kStateDim + row_g0);
+                load_state_value(state_in, st_base + (int64_t)col_d1 * kStateDim + row_g0);
             h_frag[m][2] =
-                load_ldg<float>(state_in + st_base + (int64_t)col_d0 * kStateDim + row_g1);
+                load_state_value(state_in, st_base + (int64_t)col_d0 * kStateDim + row_g1);
             h_frag[m][3] =
-                load_ldg<float>(state_in + st_base + (int64_t)col_d1 * kStateDim + row_g1);
+                load_state_value(state_in, st_base + (int64_t)col_d1 * kStateDim + row_g1);
         }
     }
 
@@ -528,10 +545,10 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
         const int k_g1 = k_g0 + 8;
         const int d0   = warp_d_global + 2 * lane_t;
         const int d1   = d0 + 1;
-        state_out[st_base + (int64_t)d0 * kStateDim + k_g0] = h_frag[m][0];
-        state_out[st_base + (int64_t)d1 * kStateDim + k_g0] = h_frag[m][1];
-        state_out[st_base + (int64_t)d0 * kStateDim + k_g1] = h_frag[m][2];
-        state_out[st_base + (int64_t)d1 * kStateDim + k_g1] = h_frag[m][3];
+        store_state_value(state_out, st_base + (int64_t)d0 * kStateDim + k_g0, h_frag[m][0]);
+        store_state_value(state_out, st_base + (int64_t)d1 * kStateDim + k_g0, h_frag[m][1]);
+        store_state_value(state_out, st_base + (int64_t)d0 * kStateDim + k_g1, h_frag[m][2]);
+        store_state_value(state_out, st_base + (int64_t)d1 * kStateDim + k_g1, h_frag[m][3]);
     }
 }
 

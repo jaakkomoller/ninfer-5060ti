@@ -1,0 +1,92 @@
+### Plain English Explanation
+
+This regex matches a **URL** (or a domain name) that ends with one of three specific top-level domains: `.com`, `.org`, or `.io`.
+
+Here’s the breakdown in simple terms:
+1.  **Optional Protocol**: It may start with `http://` or `https://` (but it’s not required).
+2.  **Optional `www.`**: It may include `www.` before the domain name (but it’s not required).
+3.  **Domain Name**: It requires a domain name made of lowercase letters, numbers, or hyphens (e.g., `example`, `my-site`).
+4.  **Specific TLD**: The domain **must** end with `.com`, `.org`, or `.io`. Other TLDs like `.net` or `.edu` will **not** match.
+5.  **Optional Path**: It may include a path after the domain (e.g., `/products`).
+6.  **Optional Query String**: It may include a query string starting with `?` (e.g., `?id=123`).
+7.  **Optional Fragment**: It may include a fragment starting with `#` (e.g., `#section`).
+8.  **Strict End**: The string must end exactly after the fragment (or query/path if no fragment). No extra characters are allowed at the end.
+
+---
+
+### Example Strings
+
+#### ✅ Matches:
+```
+https://www.example.com/products?id=123#details
+```
+- **Why it matches**:
+  - Starts with `https://` (optional, present).
+  - Has `www.` (optional, present).
+  - Domain is `example` (valid `[a-z0-9-]+`).
+  - TLD is `.com` (one of the allowed: `com`, `org`, `io`).
+  - Path is `/products`.
+  - Query is `?id=123`.
+  - Fragment is `#details`.
+  - Ends cleanly.
+
+#### ❌ Does Not Match:
+```
+http://example.net
+```
+- **Why it does not match**:
+  - The TLD is `.net`, which is **not** in the allowed list (`com`, `org`, `io`).
+  - Even though the rest of the
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB     5.043 s
+load        engine construction            6.982 s
+load        artifact/materialize           6.844 s
+load        host to device                 5.043 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.351 s
+generate    decode                         9.643 s
+generate    total                          9.996 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             86
+summary     reused prompt tokens      0
+summary     generated tokens          500
+summary     model elapsed             9.995 s
+summary     prefill speed             244.73 tok/s
+summary     decode speed              51.75 tok/s
+summary     throughput (overall)      50.03 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         121.38 MiB / 121.38 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       144.17 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        43.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             34.90 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.31 GiB
+summary     mtp draft window          3
+summary     mtp rounds                155
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        463
+summary     mtp accepted tokens       344
+summary     mtp acceptance rate       74.30%
+summary     mtp acceptance length     3.22 tok/round
+summary     mtp accepted by pos       139,114,91

@@ -1,0 +1,79 @@
+```python
+def is_balanced(s: str) -> bool:
+    """
+    Determine whether the brackets in the given string are balanced.
+
+    Args:
+        s: A string containing only the characters '(', ')', '{', '}', '[', ']'.
+
+    Returns:
+        True if the brackets are balanced, False otherwise.
+
+    Examples:
+        >>> is_balanced("()")
+        True
+        >>> is_balanced("([{}])")
+        True
+        >>> is_balanced("([)]")
+        False
+    """
+    stack = []
+    matching = {')': '(', '}': '{', ']': '['}
+    opening = {'(', '{', '['}
+
+    for char in s:
+        if char in opening:
+            stack.append(char)
+        elif char in matching:
+            if not stack or stack[-1] != matching[char]:
+                return False
+            stack.pop()
+        # If char is not a bracket, ignore (though problem states only brackets)
+
+    return len(stack) == 0
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     5.415 s
+load        engine construction            7.315 s
+load        artifact/materialize           7.182 s
+load        host to device                 5.415 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.212 s
+generate    decode                         9.223 s
+generate    total                          9.436 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             54
+summary     reused prompt tokens      0
+summary     generated tokens          230
+summary     model elapsed             9.435 s
+summary     prefill speed             255.21 tok/s
+summary     decode speed              24.83 tok/s
+summary     throughput (overall)      24.38 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         110.36 MiB / 110.36 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        5.96 MiB / 10.79 MiB
+summary     runtime reservation       133.15 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        267.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             259.91 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.09 GiB

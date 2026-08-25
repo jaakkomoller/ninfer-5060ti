@@ -1,0 +1,77 @@
+```python
+from typing import List
+
+
+def two_sum(nums: List[int], target: int) -> List[int]:
+    """
+    Given a list of integers `nums` and an integer `target`, return the indices
+    of the two numbers such that they add up to `target`.
+
+    Each input is guaranteed to have exactly one solution, and you may not use
+    the same element twice. You can return the answer in any order.
+
+    Args:
+        nums: A list of integers.
+        target: The target sum.
+
+    Returns:
+        A list containing the two indices whose corresponding values sum to target.
+
+    Example:
+        >>> two_sum([2, 7, 11, 15], 9)
+        [0, 1]
+    """
+    seen: dict[int, int] = {}
+    for i, num in enumerate(nums):
+        complement = target - num
+        if complement in seen:
+            return [seen[complement], i]
+        seen[num] = i
+    # This line should never be reached given the problem constraints
+    return []
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     5.230 s
+load        engine construction            7.126 s
+load        artifact/materialize           6.990 s
+load        host to device                 5.230 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.216 s
+generate    decode                         9.784 s
+generate    total                         10.001 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             66
+summary     reused prompt tokens      0
+summary     generated tokens          244
+summary     model elapsed             10.000 s
+summary     prefill speed             305.79 tok/s
+summary     decode speed              24.84 tok/s
+summary     throughput (overall)      24.40 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         110.36 MiB / 110.36 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        7.39 MiB / 10.79 MiB
+summary     runtime reservation       133.15 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        267.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             259.91 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.09 GiB

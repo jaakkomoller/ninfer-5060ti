@@ -35,8 +35,8 @@ bool is_bf16_gdn_output(std::size_t layer) { return layer == 4; }
 NumericFormat endpoint_format(WeightsProfile weights_profile) {
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
-        return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen38GroupwiseInt:
+        return NumericFormat::Q6G64_F16S;
     case WeightsProfile::Qwen36Nvfp4:
         return NumericFormat::W8G32_F16S;
     case WeightsProfile::Qwen38Nvfp4:
@@ -130,6 +130,28 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     out.weight_scale_divisor = std::bit_cast<float>(plan.weight_scale_divisor_bits);
     out.input_scale_divisor  = std::bit_cast<float>(plan.input_scale_divisor_bits);
     return out;
+}
+
+// Return the format that the artifact actually stores for a given MTP tensor,
+// selected from a list of acceptable formats. The format determines which
+// runtime dispatch path will be taken when --spec mtp is enabled.
+NumericFormat mtp_format_for(artifact::Binder& binder, std::string_view name,
+                            std::initializer_list<NumericFormat> acceptable) {
+    const auto* object = binder.reader().find(name);
+    if (object == nullptr) {
+        throw artifact::ArtifactError("MTP format probe: tensor " + std::string(name) +
+                                     " is missing from the artifact");
+    }
+    const auto* tensor = std::get_if<artifact::TensorDescriptor>(object);
+    if (tensor == nullptr) {
+        throw artifact::ArtifactError("MTP format probe: object " + std::string(name) +
+                                     " is not a tensor");
+    }
+    for (NumericFormat candidate : acceptable) {
+        if (tensor->format == candidate) { return candidate; }
+    }
+    throw artifact::ArtifactError("MTP format probe: tensor " + std::string(name) +
+                                 " has unsupported format");
 }
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
@@ -418,8 +440,19 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     out.features     = features;
 
     const NumericFormat vocabulary_format = endpoint_format(weights_profile);
+
+    const NumericFormat embedding_format =
+        weights_profile == WeightsProfile::Qwen38GroupwiseInt
+            ? NumericFormat::Q6G64_F16S
+            : vocabulary_format;
+
+    const NumericFormat output_head_format =
+        weights_profile == WeightsProfile::Qwen38GroupwiseInt
+            ? NumericFormat::Q4G64_F16S
+            : vocabulary_format;
+
     out.token_embedding =
-        bind_weight(binder, "text/token_embedding", vocabulary_format, {248320, 5120});
+        bind_weight(binder, "text/token_embedding", embedding_format, {248320, 5120});
     switch (weights_profile) {
     case WeightsProfile::Qwen36GroupwiseInt:
     case WeightsProfile::Qwen38GroupwiseInt:
@@ -436,7 +469,8 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     }
     out.final_norm =
         artifact::bind_device_tensor(binder, "text/final_norm", NumericFormat::BF16, {5120});
-    out.output_head = bind_weight(binder, "text/output_head", vocabulary_format, {248320, 5120});
+    out.output_head =
+        bind_weight(binder, "text/output_head", output_head_format, {248320, 5120});
     const artifact::TensorPlacement proposal_placement =
         features.optimized_proposal() ? artifact::TensorPlacement::Device
                                       : artifact::TensorPlacement::ValidateOnly;
@@ -453,25 +487,46 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
                               std::initializer_list<std::uint64_t> shape) {
         return artifact::bind_tensor(binder, name, format, shape, mtp_placement);
     };
+    // MTP transformer tensor formats differ between the upstream artifact (W8) and
+    // the RTX 5060 Ti 16 GB artifact (Q4/Q5). Probe the artifact's actual MTP
+    // format and use it; the binding then routes through the dispatch tables
+    // appropriate to the format present.
+    const NumericFormat mtp_input_projection_format =
+        mtp_format_for(binder, "mtp/input_projection",
+                       {NumericFormat::W8G32_F16S, NumericFormat::Q4G64_F16S});
+    const NumericFormat mtp_qkv_format =
+        mtp_format_for(binder, "mtp/layer/attention/query_key_gate_value",
+                       {NumericFormat::W8G32_F16S, NumericFormat::Q4G64_F16S});
+    const NumericFormat mtp_output_format =
+        mtp_format_for(binder, "mtp/layer/attention/output",
+                       {NumericFormat::W8G32_F16S, NumericFormat::Q5G64_F16S,
+                        NumericFormat::Q4G64_F16S});
+    const NumericFormat mtp_gate_up_format =
+        mtp_format_for(binder, "mtp/layer/mlp/gate_up",
+                       {NumericFormat::W8G32_F16S, NumericFormat::Q4G64_F16S});
+    const NumericFormat mtp_down_format =
+        mtp_format_for(binder, "mtp/layer/mlp/down",
+                       {NumericFormat::W8G32_F16S, NumericFormat::Q5G64_F16S,
+                        NumericFormat::Q4G64_F16S});
     out.mtp.input_projection =
-        bind_mtp("mtp/input_projection", NumericFormat::W8G32_F16S, {5120, 10240});
+        bind_mtp("mtp/input_projection", mtp_input_projection_format, {5120, 10240});
     out.mtp.embedding_norm       = bind_mtp("mtp/embedding_norm", NumericFormat::BF16, {5120});
     out.mtp.hidden_norm          = bind_mtp("mtp/hidden_norm", NumericFormat::BF16, {5120});
     out.mtp.input_norm           = bind_mtp("mtp/layer/input_norm", NumericFormat::BF16, {5120});
     out.mtp.query_key_gate_value = bind_mtp("mtp/layer/attention/query_key_gate_value",
-                                            NumericFormat::W8G32_F16S, {14336, 5120});
+                                            mtp_qkv_format, {14336, 5120});
     out.mtp.query_norm = bind_mtp("mtp/layer/attention/query_norm", NumericFormat::BF16, {256});
     out.mtp.key_norm   = bind_mtp("mtp/layer/attention/key_norm", NumericFormat::BF16, {256});
     out.mtp.output =
-        bind_mtp("mtp/layer/attention/output", NumericFormat::W8G32_F16S, {5120, 6144});
+        bind_mtp("mtp/layer/attention/output", mtp_output_format, {5120, 6144});
     out.mtp.post_attention_norm =
         bind_mtp("mtp/layer/post_attention_norm", NumericFormat::BF16, {5120});
     out.mtp.mlp.gate_up = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/gate_up", NumericFormat::W8G32_F16S, {34816, 5120}),
-        .format = NumericFormat::W8G32_F16S};
+        .object = bind_mtp("mtp/layer/mlp/gate_up", mtp_gate_up_format, {34816, 5120}),
+        .format = mtp_gate_up_format};
     out.mtp.mlp.down = WeightPlan{
-        .object = bind_mtp("mtp/layer/mlp/down", NumericFormat::W8G32_F16S, {5120, 17408}),
-        .format = NumericFormat::W8G32_F16S};
+        .object = bind_mtp("mtp/layer/mlp/down", mtp_down_format, {5120, 17408}),
+        .format = mtp_down_format};
     out.mtp.final_norm = bind_mtp("mtp/final_norm", NumericFormat::BF16, {5120});
 
     const artifact::TensorPlacement vision_placement =
@@ -556,15 +611,15 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
     if (plan.features.mtp()) {
         auto& mtp            = runtime.mtp.emplace();
         mtp.input_projection = artifact::materialized_weight(
-            backing, plan.mtp.input_projection, NumericFormat::W8G32_F16S, 5120, 10240);
+            backing, plan.mtp.input_projection, NumericFormat::Q4G64_F16S, 5120, 10240);
         mtp.embedding_norm   = artifact::materialized_tensor(backing, plan.mtp.embedding_norm,
-                                                             NumericFormat::BF16, {5120});
+                                                              NumericFormat::BF16, {5120});
         mtp.hidden_norm      = artifact::materialized_tensor(backing, plan.mtp.hidden_norm,
-                                                             NumericFormat::BF16, {5120});
+                                                              NumericFormat::BF16, {5120});
         mtp.input_norm       = artifact::materialized_tensor(backing, plan.mtp.input_norm,
-                                                             NumericFormat::BF16, {5120});
+                                                              NumericFormat::BF16, {5120});
         mtp.attention.packed = artifact::materialized_weight(
-            backing, plan.mtp.query_key_gate_value, NumericFormat::W8G32_F16S, 14336, 5120);
+            backing, plan.mtp.query_key_gate_value, NumericFormat::Q4G64_F16S, 14336, 5120);
         mtp.attention.query       = row_view(mtp.attention.packed, 0, 6144);
         mtp.attention.key         = row_view(mtp.attention.packed, 6144, 1024);
         mtp.attention.output_gate = row_view(mtp.attention.packed, 7168, 6144);
@@ -574,7 +629,7 @@ LoadedModelData::LoadedModelData(BindingPlan plan, artifact::MaterializedArtifac
         mtp.key_norm =
             artifact::materialized_tensor(backing, plan.mtp.key_norm, NumericFormat::BF16, {256});
         mtp.output              = artifact::materialized_weight(backing, plan.mtp.output,
-                                                                NumericFormat::W8G32_F16S, 5120, 6144);
+                                                                NumericFormat::Q4G64_F16S, 5120, 6144);
         mtp.post_attention_norm = artifact::materialized_tensor(
             backing, plan.mtp.post_attention_norm, NumericFormat::BF16, {5120});
         mtp.post_mixer = load_mlp(plan.mtp.mlp, backing);

@@ -185,7 +185,8 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
       draft_window(plan.draft_window), speculative_backend(plan.speculative_backend),
       kv_dtype(plan.kv_dtype), kv_quant_group(plan.kv_quant_group),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
-      use_cuda_graph(plan.use_cuda_graph), kv_payload_bytes(plan.persistent.kv_payload_bytes),
+      use_cuda_graph(plan.use_cuda_graph), persistent_prefix_reuse(plan.persistent_prefix_reuse),
+      kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
       persistent(plan.persistent.bytes), workspace_storage(plan.workspace.capacity),
       work(DeviceSpan{workspace_storage.base(), workspace_storage.capacity()}),
@@ -542,7 +543,8 @@ runtime::PrefillStepResult ProgramImplCore::start_prefill_lane(std::uint32_t lan
             resize_sequence_kv_entitlement(sequence, request_plan.text_kv_page_entitlement,
                                            request_plan.backend_kv_page_entitlement);
             decoder->linear_attention.copy_slot(
-                LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+                LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency,
+                                                                 persistent_prefix_reuse),
                 LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
                 device.stream);
             if (base == prompt_tokens) { copy_tail(sequence, sequence.rewrite_checkpoint_hidden); }
@@ -1539,7 +1541,8 @@ runtime::PrefillStepResult ProgramImplCore::advance_prefill(SequenceState& seque
                 sampling_config.slice(1, static_cast<std::int32_t>(sequence.lane), 1).data),
             &sequence.rewrite_checkpoint_hidden,
             LinearStateSlots::current_state_slot(sequence.lane, max_concurrency),
-            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency),
+            LinearStateSlots::rewrite_checkpoint_state_slot(sequence.lane, max_concurrency,
+                                                             persistent_prefix_reuse),
             staged.initial_mtp_extent,
             dflash_host_ingress};
 

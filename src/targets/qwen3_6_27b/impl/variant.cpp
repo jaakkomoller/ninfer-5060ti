@@ -192,7 +192,14 @@ void Variant::mtp_attention_projection(const Tensor& hidden,
 
 void Variant::mtp_kv_projection(const Tensor& hidden, const MtpAttentionProjectionWeights& weights,
                                 Tensor& key, Tensor& value, WorkspaceArena&, cudaStream_t stream) {
-    ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
+    if (weights.key.qtype == QType::W8G32_F16S && weights.value.qtype == QType::W8G32_F16S) {
+        ops::linear_pair(hidden, weights.key, weights.value, key, value, stream);
+        return;
+    }
+    // RTX 5060 Ti 16 GB path: the MTP KV weights are stored in a non-W8 format
+    // (Q5/Q4). linear_pair is W8-only, so fall back to two unfused linear calls.
+    ops::linear(hidden, weights.key, key, stream);
+    ops::linear(hidden, weights.value, value, stream);
 }
 
 void Variant::mtp_q_gate_projection(const Tensor& hidden,

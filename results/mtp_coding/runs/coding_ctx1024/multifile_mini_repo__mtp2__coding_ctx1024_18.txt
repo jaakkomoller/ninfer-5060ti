@@ -1,0 +1,99 @@
+```python
+class Counter:
+    def __init__(self):
+        self._data = {}
+    def incr(self, key, by=1):
+        self._data[key] = self._data.get(key, 0) + by
+    def get(self, key):
+        return self._data.get(key, 0)
+    def __str__(self):
+        if not self._data:
+            return ""
+        items = sorted(self._data.items(), key=lambda x: (-x[1], x[0]))
+        return ", ".join(f"{k}={v}" for k, v in items)
+```
+
+```python
+from storage import Counter
+
+# Existing test
+c = Counter()
+c.incr('a'); c.incr('b', 2); c.incr('a')
+assert c.get('a') == 2
+
+# New tests for __str__
+c2 = Counter()
+c2.incr('a'); c2.incr('b', 2); c2.incr('a')
+assert str(c2) == "a=2, b=2"
+
+c3 = Counter()
+c3.incr('z', 5)
+c3.incr('a', 3)
+c3.incr('m', 5)
+assert str(c3) == "m=5, z=5, a=3"
+
+c4 = Counter()
+assert str(c4) == ""
+
+c5 = Counter()
+c5.incr('x', 1)
+c5.incr('y', 2)
+c5.incr('x', 1)
+assert str(c5) == "x=2, y=2"
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                     32.96%      5.00 GiB /      15.17 GiB    10.154 s
+load        weights                     62.22%      9.44 GiB /      15.17 GiB    20.318 s
+load        weights                     91.48%     13.87 GiB /      15.17 GiB    30.396 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB    32.636 s
+load        engine construction           34.546 s
+load        artifact/materialize          34.412 s
+load        host to device                32.636 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.001 s
+generate    vision                         0.000 s
+generate    text prefill                   0.702 s
+generate    decode                         7.024 s
+generate    total                          7.728 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             259
+summary     reused prompt tokens      0
+summary     generated tokens          372
+summary     model elapsed             7.726 s
+summary     prefill speed             368.73 tok/s
+summary     decode speed              52.82 tok/s
+summary     throughput (overall)      48.15 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         119.18 MiB / 119.18 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       141.97 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        45.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             37.09 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.31 GiB
+summary     mtp draft window          2
+summary     mtp rounds                129
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        258
+summary     mtp accepted tokens       244
+summary     mtp acceptance rate       94.57%
+summary     mtp acceptance length     2.89 tok/round
+summary     mtp accepted by pos       125,119

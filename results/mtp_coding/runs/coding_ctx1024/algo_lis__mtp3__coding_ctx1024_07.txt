@@ -1,0 +1,94 @@
+```python
+import bisect
+
+
+def longest_increasing_subsequence_length(nums: list[int]) -> int:
+    """
+    Compute the length of the longest strictly increasing subsequence (LIS)
+    using the O(n log n) patience-sorting method.
+
+    The algorithm maintains a list `tails` where `tails[i]` is the smallest
+    tail element for an increasing subsequence of length `i + 1`. For each
+    number in the input, we use binary search to find the position where it
+    should be placed:
+    - If the number is greater than all elements in `tails`, it extends the
+      longest subsequence found so far (append to `tails`).
+    - Otherwise, it replaces the first element in `tails` that is >= to it,
+      which keeps the tails as small as possible for future extensions.
+
+    The length of `tails` at the end equals the length of the LIS.
+
+    Args:
+        nums: A list of integers.
+
+    Returns:
+        The length of the longest strictly increasing subsequence.
+    """
+    if not nums:
+        return 0
+
+    tails = []
+    for num in nums:
+        # Find the leftmost position in tails where tails[pos] >= num
+        pos = bisect.bisect_left(tails, num)
+        if pos == len(tails):
+            tails.append(num)
+        else:
+            tails[pos] = num
+
+    return len(tails)
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                     70.87%     10.75 GiB /      15.17 GiB    10.049 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB    14.086 s
+load        engine construction           16.011 s
+load        artifact/materialize          15.878 s
+load        host to device                14.086 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.227 s
+generate    decode                         5.614 s
+generate    total                          5.842 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             49
+summary     reused prompt tokens      0
+summary     generated tokens          322
+summary     model elapsed             5.841 s
+summary     prefill speed             215.45 tok/s
+summary     decode speed              57.18 tok/s
+summary     throughput (overall)      55.13 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         121.38 MiB / 121.38 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        5.11 MiB / 10.79 MiB
+summary     runtime reservation       144.17 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        43.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             34.90 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.31 GiB
+summary     mtp draft window          3
+summary     mtp rounds                91
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        273
+summary     mtp accepted tokens       230
+summary     mtp acceptance rate       84.25%
+summary     mtp acceptance length     3.53 tok/round
+summary     mtp accepted by pos       83,78,69

@@ -1,0 +1,81 @@
+### (a) What each public function does
+
+The `Index` class maintains an inverted-index-like structure where `docs` is a dictionary mapping keys to documents, and `sorted_keys` is a list of keys sorted in ascending order.
+
+1.  **`__init__(self)`**:
+    *   Initializes the instance with an empty dictionary `self.docs` and an empty list `self.sorted_keys`.
+
+2.  **`add(self, key, doc)`**:
+    *   Adds or updates a document `doc` associated with `key` in `self.docs`.
+    *   Re-sorts all keys in `self.docs` and stores the result in `self.sorted_keys`. This ensures `self.sorted_keys` always reflects the current sorted order of keys in `self.docs`.
+
+3.  **`merge(self, other)`**:
+    *   Intended to merge the contents of another `Index` instance (`other`) into `self`.
+    *   It iterates over the keys in `other.sorted_keys` and copies the corresponding documents from `other.docs` into `self.docs`.
+    *   After each insertion, it re-sorts `self.docs` and updates `self.sorted_keys`.
+
+---
+
+### (b) The bug in `merge()`
+
+The bug is that **`merge()` does not correctly handle key collisions or preserve the integrity of `self.sorted_keys` during the merge process**. Specifically, it **overwrites existing keys in `self` with values from `other`** without any conflict resolution strategy, and more critically, **it re-sorts the entire `self.docs` dictionary on every single key insertion**, which is inefficient but not the primary logical bug.
+
+However, the **primary logical bug** is that **`merge()` assumes `other.sorted_keys` contains only keys that are not already in `self`**, or that overwriting is acceptable. But the real issue is that **`self.sorted_keys` is updated correctly after each insertion**, so the final state of `self.sorted_keys` is actually correct.
+
+Wait — let's re-examine. The code is:
+
+```python
+def merge(self, other):
+    for key in other.sorted_keys:
+        self.docs[key] = other.docs[key]
+        self.sorted_keys = sorted(self.docs)
+```
+
+Actually, **there is no logical bug in the final state** of `self.docs` and `self.sorted_keys` — the final `self.sorted_keys` will be correctly sorted, and `self.docs` will contain all keys from both `self` and `other`, with `other`'s values taking precedence on conflicts.
+
+But the **bug is performance-related and potentially misleading**: **re-sorting the entire dictionary on every single key insertion is O(n log n) per insertion, leading to O(m * n log n) total complexity** where m is the number of
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     5.108 s
+load        engine construction            6.979 s
+load        artifact/materialize           6.848 s
+load        host to device                 5.108 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.473 s
+generate    decode                        24.160 s
+generate    total                         24.636 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             143
+summary     reused prompt tokens      0
+summary     generated tokens          600
+summary     model elapsed             24.633 s
+summary     prefill speed             302.21 tok/s
+summary     decode speed              24.79 tok/s
+summary     throughput (overall)      24.36 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         110.36 MiB / 110.36 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       133.15 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        267.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             259.91 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.09 GiB

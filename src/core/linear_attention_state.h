@@ -19,6 +19,11 @@ struct LinearAttentionStatePoolSpec {
     std::int32_t key_head_dim   = 0;
     std::int32_t slot_count     = 1;
     DType conv_dtype            = DType::BF16;
+    // Persistent storage dtype for the recurrent state. Computation stays in FP32
+    // regardless: each consumer kernel loads to FP32, computes in FP32, then
+    // converts back to this dtype when storing. BF16 halves the persistent
+    // Linear Attention footprint at the cost of one rounding per save/load.
+    DType recurrent_dtype       = DType::FP32;
 };
 
 struct LinearAttentionStatePoolLayout {

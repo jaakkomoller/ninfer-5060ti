@@ -1,0 +1,83 @@
+```python
+import time
+
+
+class RateLimiter:
+    """
+    A token-bucket rate limiter.
+    
+    Args:
+        rate_per_sec: The rate at which tokens are added to the bucket (tokens per second).
+        burst: The maximum number of tokens the bucket can hold (burst capacity).
+    """
+    
+    def __init__(self, rate_per_sec: float, burst: int):
+        self.rate_per_sec = rate_per_sec
+        self.burst = burst
+        self.tokens = float(burst)  # Start with a full bucket
+        self.last_refill_time = time.monotonic()
+    
+    def _refill(self):
+        """Refill tokens based on elapsed time since last refill."""
+        now = time.monotonic()
+        elapsed = now - self.last_refill_time
+        if elapsed > 0:
+            new_tokens = elapsed * self.rate_per_sec
+            self.tokens = min(self.burst, self.tokens + new_tokens)
+            self.last_refill_time = now
+    
+    def acquire(self) -> bool:
+        """
+        Try to acquire a token. Returns True if a token is available, False otherwise.
+        """
+        self._refill()
+        if self.tokens >= 1.0:
+            self.tokens -= 1.0
+            return True
+        return False
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     5.230 s
+load        engine construction            7.124 s
+load        artifact/materialize           6.992 s
+load        host to device                 5.230 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.213 s
+generate    decode                        11.753 s
+generate    total                         11.967 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             60
+summary     reused prompt tokens      0
+summary     generated tokens          293
+summary     model elapsed             11.966 s
+summary     prefill speed             281.78 tok/s
+summary     decode speed              24.84 tok/s
+summary     throughput (overall)      24.49 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         110.36 MiB / 110.36 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        6.67 MiB / 10.79 MiB
+summary     runtime reservation       133.15 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        267.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             259.91 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.09 GiB

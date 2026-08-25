@@ -1,0 +1,84 @@
+### (a) What each public function does
+
+The `Index` class maintains an inverted-index-like structure where `docs` is a dictionary mapping keys to documents, and `sorted_keys` is a list of keys sorted in ascending order.
+
+1.  **`__init__(self)`**:
+    *   Initializes the instance with an empty dictionary `self.docs` and an empty list `self.sorted_keys`.
+
+2.  **`add(self, key, doc)`**:
+    *   Adds or updates a document `doc` associated with `key` in `self.docs`.
+    *   Re-sorts all keys in `self.docs` and stores the result in `self.sorted_keys`. This ensures `self.sorted_keys` always reflects the current sorted order of keys in `self.docs`.
+
+3.  **`merge(self, other)`**:
+    *   Intended to merge the contents of another `Index` instance (`other`) into `self`.
+    *   It iterates over the keys in `other.sorted_keys` and copies the corresponding documents from `other.docs` into `self.docs`.
+    *   After each insertion, it re-sorts `self.docs` and updates `self.sorted_keys`.
+
+---
+
+### (b) The bug in `merge()`
+
+The bug is that **`merge()` does not handle key collisions correctly when `other` contains keys that already exist in `self`**.
+
+Specifically, if a key exists in both `self` and `other`, the document from `other` will **overwrite** the document in `self`. While this might be intentional in some "last-write-wins" scenarios, the more critical issue is that **the method does not preserve the original documents in `self` for keys that are not in `other`** — wait, actually, that part is fine because it only iterates over `other`'s keys.
+
+Let’s re-examine. The real bug is more subtle and relates to **efficiency and correctness of the sorted list maintenance**, but actually, the most significant logical bug is:
+
+**The `merge` method does not account for the fact that `other.sorted_keys` may contain keys that are already in `self`. When it does `self.docs[key] = other.docs[key]`, it overwrites the existing document in `self` with the one from `other`.**
+
+However, the **most critical bug** is actually that **`merge()` is not idempotent or safe if `other` is the same object as `self`**, but that’s an edge case.
+
+Let’s look closer. The actual bug is that **`merge()` does not update `self.sorted_keys` to include keys that are in `self` but not in `other`** — no, it doesn’t need to, because `self.sorted_keys` is re-sorted from `self.docs` after each
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB     5.037 s
+load        engine construction            6.970 s
+load        artifact/materialize           6.838 s
+load        host to device                 5.037 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.478 s
+generate    decode                        15.671 s
+generate    total                         16.151 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             143
+summary     reused prompt tokens      0
+summary     generated tokens          600
+summary     model elapsed             16.149 s
+summary     prefill speed             299.28 tok/s
+summary     decode speed              38.22 tok/s
+summary     throughput (overall)      37.15 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         116.86 MiB / 116.86 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.06 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       139.64 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        47.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             39.42 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.30 GiB
+summary     mtp draft window          1
+summary     mtp rounds                322
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        322
+summary     mtp accepted tokens       277
+summary     mtp acceptance rate       86.02%
+summary     mtp acceptance length     1.86 tok/round
+summary     mtp accepted by pos       277

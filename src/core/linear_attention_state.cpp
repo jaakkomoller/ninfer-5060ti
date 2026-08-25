@@ -91,11 +91,15 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
     if (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32) {
         throw std::invalid_argument("LinearAttentionStatePool conv_dtype must be BF16 or FP32");
     }
+    if (spec.recurrent_dtype != DType::BF16 && spec.recurrent_dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "LinearAttentionStatePool recurrent_dtype must be BF16 or FP32");
+    }
 
     const Tensor conv_shape(nullptr, spec.conv_dtype,
                             {spec.conv_channels, spec.conv_width, spec.slot_count});
     const Tensor recurrent_shape(
-        nullptr, DType::FP32,
+        nullptr, spec.recurrent_dtype,
         {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
 
     LinearAttentionStatePoolLayout layout;
@@ -123,7 +127,7 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
     const Tensor conv_shape(nullptr, spec.conv_dtype,
                             {spec.conv_channels, spec.conv_width, spec.slot_count});
     const Tensor recurrent_shape(
-        nullptr, DType::FP32,
+        nullptr, spec.recurrent_dtype,
         {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
     conv.reserve(layout.conv.size());
     recurrent.reserve(layout.recurrent.size());
@@ -137,7 +141,7 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
                           std::initializer_list<std::int32_t>{spec.conv_channels, spec.conv_width,
                                                               spec.slot_count});
         recurrent.emplace_back(
-            layout.recurrent[layer].bind(backing).data, DType::FP32,
+            layout.recurrent[layer].bind(backing).data, spec.recurrent_dtype,
             std::initializer_list<std::int32_t>{spec.key_head_dim, spec.value_head_dim,
                                                 spec.value_heads, spec.slot_count});
     }
@@ -168,7 +172,7 @@ LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() co
         validate_state_tensor(conv[layer], spec.conv_dtype,
                               {spec.conv_channels, spec.conv_width, spec.slot_count}, "conv");
         validate_state_tensor(
-            recurrent[layer], DType::FP32,
+            recurrent[layer], spec.recurrent_dtype,
             {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count},
             "recurrent");
     }

@@ -1,0 +1,74 @@
+```python
+def factorial(n):
+    """
+    Compute the factorial of a non-negative integer n iteratively.
+
+    Args:
+        n: A non-negative integer.
+
+    Returns:
+        The factorial of n (n!).
+
+    Raises:
+        ValueError: If n is negative.
+        TypeError: If n is not an integer.
+
+    Example:
+        >>> factorial(5)
+        120
+    """
+    if not isinstance(n, int):
+        raise TypeError(f"Expected an integer, got {type(n).__name__}")
+    if n < 0:
+        raise ValueError("n must be a non-negative integer")
+    
+    result = 1
+    for i in range(2, n + 1):
+        result *= i
+    return result
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     5.236 s
+load        engine construction            7.129 s
+load        artifact/materialize           6.991 s
+load        host to device                 5.236 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.218 s
+generate    decode                         7.002 s
+generate    total                          7.221 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             46
+summary     reused prompt tokens      0
+summary     generated tokens          175
+summary     model elapsed             7.220 s
+summary     prefill speed             211.28 tok/s
+summary     decode speed              24.85 tok/s
+summary     throughput (overall)      24.24 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         110.36 MiB / 110.36 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        4.77 MiB / 10.79 MiB
+summary     runtime reservation       133.15 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        267.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             259.91 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.09 GiB

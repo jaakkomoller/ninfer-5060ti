@@ -6,23 +6,32 @@ namespace {
 
 namespace kernel = state_passing;
 
-template <int NStrip>
-cudaError_t launch_fixed(const state_passing_config& cfg, head_map qk_map, int NT) {
+template <int NStrip, class StateInPtr, class StateOutPtr>
+cudaError_t launch_fixed_t(const state_passing_config& cfg, head_map qk_map, int NT) {
     using D = kernel::kernel_dims<NStrip>;
     constexpr int smem_bytes =
         kernel::smem_layout<NStrip>::SMEM_FLOATS * static_cast<int>(sizeof(float));
 
-    cudaError_t err = cudaFuncSetAttribute(kernel::state_passing_kernel<NStrip>,
+    cudaError_t err = cudaFuncSetAttribute(kernel::state_passing_kernel<NStrip, StateInPtr, StateOutPtr>,
                                            cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
     if (err != cudaSuccess) { return err; }
 
     const dim3 grid(static_cast<unsigned>(static_cast<std::int64_t>(cfg.H_v) * D::D_STRIPS), 1, 1);
     const dim3 block(D::THREADS, 1, 1);
 
-    kernel::state_passing_kernel<NStrip><<<grid, block, smem_bytes, cfg.stream>>>(
-        cfg.W, cfg.U, cfg.k, cfg.g_cumsum, cfg.state_in, cfg.v_new, cfg.h_chunk, cfg.state_out,
-        qk_map, NT);
+    kernel::state_passing_kernel<NStrip, StateInPtr, StateOutPtr>
+        <<<grid, block, smem_bytes, cfg.stream>>>(
+            cfg.W, cfg.U, cfg.k, cfg.g_cumsum, reinterpret_cast<StateInPtr>(cfg.state_in), cfg.v_new,
+            cfg.h_chunk, reinterpret_cast<StateOutPtr>(cfg.state_out), qk_map, NT);
     return cudaGetLastError();
+}
+
+template <int NStrip>
+cudaError_t launch_fixed(const state_passing_config& cfg, head_map qk_map, int NT) {
+    if (cfg.state_is_bf16) {
+        return launch_fixed_t<NStrip, const __nv_bfloat16*, __nv_bfloat16*>(cfg, qk_map, NT);
+    }
+    return launch_fixed_t<NStrip, const float*, float*>(cfg, qk_map, NT);
 }
 
 } // namespace

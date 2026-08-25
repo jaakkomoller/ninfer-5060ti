@@ -1,0 +1,85 @@
+```python
+import heapq
+from typing import Dict, List, Tuple
+
+
+def dijkstra(graph: Dict[int, List[Tuple[int, int]]], source: int) -> Dict[int, int]:
+    """
+    Compute shortest paths from source to all reachable nodes using Dijkstra's algorithm.
+    
+    Args:
+        graph: A dictionary mapping each node to a list of (neighbor, weight) tuples.
+        source: The starting node.
+        
+    Returns:
+        A dictionary mapping each reachable node to its shortest distance from source.
+    """
+    # Initialize distances
+    distances: Dict[int, int] = {source: 0}
+    
+    # Min-heap: (distance, node)
+    heap: List[Tuple[int, int]] = [(0, source)]
+    
+    while heap:
+        dist, node = heapq.heappop(heap)
+        
+        # If we've already found a shorter path, skip
+        if dist > distances.get(node, float('inf')):
+            continue
+        
+        # Explore neighbors
+        if node in graph:
+            for neighbor, weight in graph[node]:
+                new_dist = dist + weight
+                # If we found a shorter path to neighbor, update
+                if new_dist < distances.get(neighbor, float('inf')):
+                    distances[neighbor] = new_dist
+                    heapq.heappush(heap, (new_dist, neighbor))
+    
+    return distances
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     5.176 s
+load        engine construction            7.086 s
+load        artifact/materialize           6.943 s
+load        host to device                 5.176 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.215 s
+generate    decode                        12.362 s
+generate    total                         12.580 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             66
+summary     reused prompt tokens      0
+summary     generated tokens          308
+summary     model elapsed             12.578 s
+summary     prefill speed             306.94 tok/s
+summary     decode speed              24.83 tok/s
+summary     throughput (overall)      24.49 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         110.36 MiB / 110.36 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        7.39 MiB / 10.79 MiB
+summary     runtime reservation       133.15 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        267.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             259.91 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.09 GiB

@@ -1,0 +1,82 @@
+```python
+"""Statistics helpers for TaskStore output."""
+
+from __future__ import annotations
+
+from typing import Dict, Iterable, List
+
+
+def completion_ratio(done: int, total: int) -> float:
+    if total <= 0:
+        return 0.0
+    return done / total
+
+
+def tag_histogram(tasks: Iterable) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for t in tasks:
+        for tag in t.tags:
+            counts[tag] = counts.get(tag, 0) + 1
+    return counts
+
+
+class TagIndex:
+    """In-memory index from tag -> list[task_key]."""
+
+    def __init__(self) -> None:
+        self._tag_to_keys: Dict[str, List[str]] = {}
+        self._key_to_tags: Dict[str, List[str]] = {}
+
+    def add(self, tag: str, key: str) -> None:
+        if key not in self._tag_to_keys.get(tag, []
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB     4.887 s
+load        engine construction            6.810 s
+load        artifact/materialize           6.678 s
+load        host to device                 4.887 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.003 s
+generate    vision                         0.000 s
+generate    text prefill                   4.099 s
+generate    decode                         3.490 s
+generate    total                          7.592 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             context-capacity
+summary     prompt tokens             1575
+summary     reused prompt tokens      0
+summary     generated tokens          218
+summary     model elapsed             7.589 s
+summary     prefill speed             384.27 tok/s
+summary     decode speed              62.17 tok/s
+summary     throughput (overall)      28.73 tok/s
+summary     device                    0
+summary     max context               1792
+summary     KV capacity policy        explicit
+summary     KV capacity               1792
+summary     KV page groups            28 / 28
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         147.68 MiB / 147.68 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          61.49 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       170.46 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        17.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             8.60 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.33 GiB
+summary     mtp draft window          3
+summary     mtp rounds                56
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        167
+summary     mtp accepted tokens       161
+summary     mtp acceptance rate       96.41%
+summary     mtp acceptance length     3.88 tok/round
+summary     mtp accepted by pos       55,54,52

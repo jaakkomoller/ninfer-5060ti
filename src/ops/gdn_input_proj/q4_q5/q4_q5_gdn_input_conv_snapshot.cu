@@ -267,14 +267,17 @@ void launch_t1(const Tensor& x, const Weight& qk_weight, const Weight& value_z_w
                const GdnConvEpilogue<Publish>& qk_epilogue,
                const GdnConvEpilogue<Publish>& value_epilogue, Tensor& query, Tensor& value,
                Tensor& z, cudaStream_t stream) {
+    // RTX 5060 Ti 16 GB path: disable PDL on this layer because the consumer-launch
+    // attribute fragments the GPU memory allocator and the small headroom on
+    // 16 GB class GPUs cannot absorb the extra reservation.
     if constexpr (Order == PdlOrder::Q5ThenQ4) {
         launch_q5_t1<Geometry, Publish, true, false, false>(x, value_z_weight, value_epilogue, value, z,
                                                             stream);
-        launch_q4_t1<Geometry, Publish, false, true, true>(x, qk_weight, qk_epilogue, query, stream);
+        launch_q4_t1<Geometry, Publish, false, true, false>(x, qk_weight, qk_epilogue, query, stream);
     } else {
         launch_q4_t1<Geometry, Publish, true, false, false>(x, qk_weight, qk_epilogue, query, stream);
-        launch_q5_t1<Geometry, Publish, false, true, true>(x, value_z_weight, value_epilogue, value, z,
-                                                           stream);
+        launch_q5_t1<Geometry, Publish, false, true, false>(x, value_z_weight, value_epilogue, value, z,
+                                                            stream);
     }
 }
 
@@ -283,16 +286,19 @@ void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Wei
                              const GdnConvEpilogue<Publish>& qk_epilogue,
                              const GdnConvEpilogue<Publish>& value_epilogue, Tensor& query,
                              Tensor& value, Tensor& z, cudaStream_t stream) {
+    // RTX 5060 Ti 16 GB path: disable PDL on this layer because the consumer-launch
+    // attribute fragments the GPU memory allocator and the small headroom on
+    // 16 GB class GPUs cannot absorb the extra reservation.
     if constexpr (Order == PdlOrder::Q5ThenQ4) {
         launch_q5_small_t<Geometry, Tokens, Publish, true, false, false>(x, value_z_weight, value_epilogue,
                                                                          value, z, stream);
-        launch_q4_small_t<Geometry, Tokens, Q4Schedule, Publish, false, true, true>(x, qk_weight, qk_epilogue,
-                                                                                    query, stream);
+        launch_q4_small_t<Geometry, Tokens, Q4Schedule, Publish, false, true, false>(x, qk_weight, qk_epilogue,
+                                                                                     query, stream);
     } else {
         launch_q4_small_t<Geometry, Tokens, Q4Schedule, Publish, true, false, false>(
             x, qk_weight, qk_epilogue, query, stream);
-        launch_q5_small_t<Geometry, Tokens, Publish, false, true, true>(x, value_z_weight, value_epilogue,
-                                                                        value, z, stream);
+        launch_q5_small_t<Geometry, Tokens, Publish, false, true, false>(x, value_z_weight, value_epilogue,
+                                                                         value, z, stream);
     }
 }
 

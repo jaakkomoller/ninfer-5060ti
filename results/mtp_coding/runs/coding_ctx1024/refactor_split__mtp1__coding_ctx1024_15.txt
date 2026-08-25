@@ -1,0 +1,65 @@
+```python
+def validate_age(age):
+    if age < 0:
+        raise ValueError('age must be >= 0')
+    if age > 150:
+        raise ValueError('age must be <= 150')
+
+
+def set_age(user, age):
+    validate_age(age)
+    user.age = age
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB     4.906 s
+load        engine construction            6.785 s
+load        artifact/materialize           6.647 s
+load        host to device                 4.906 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.362 s
+generate    decode                         1.784 s
+generate    total                          2.147 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             95
+summary     reused prompt tokens      0
+summary     generated tokens          75
+summary     model elapsed             2.146 s
+summary     prefill speed             262.41 tok/s
+summary     decode speed              41.49 tok/s
+summary     throughput (overall)      34.95 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         116.86 MiB / 116.86 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.06 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       139.64 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        47.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             39.42 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.30 GiB
+summary     mtp draft window          1
+summary     mtp rounds                37
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        37
+summary     mtp accepted tokens       37
+summary     mtp acceptance rate       100.00%
+summary     mtp acceptance length     2.00 tok/round
+summary     mtp accepted by pos       37

@@ -2,6 +2,7 @@
 
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace ninfer::ops {
 
@@ -25,7 +26,12 @@ template <class T, class V>
 __device__ __forceinline__ void store_vec(T* ptr, V value) {
     static_assert(sizeof(V) == 1 || sizeof(V) == 2 || sizeof(V) == 4 || sizeof(V) == 8 ||
                   sizeof(V) == 16);
-    *reinterpret_cast<V*>(ptr) = value;
+    if constexpr (std::is_const_v<T>) {
+        using NCV = std::remove_const_t<V>;
+        *const_cast<NCV*>(reinterpret_cast<const NCV*>(ptr)) = value;
+    } else {
+        *reinterpret_cast<V*>(ptr) = value;
+    }
 }
 
 __device__ __forceinline__ unsigned smem_addr(const void* ptr) {

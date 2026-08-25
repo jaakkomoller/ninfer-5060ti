@@ -1,0 +1,65 @@
+```python
+from typing import Any, List
+
+
+def add_item(cart: List[Any], item: Any) -> None:
+    if not cart:
+        cart.append(item)
+        return
+    if item in cart:
+        return
+    cart.append(item)
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB     4.904 s
+load        engine construction            6.796 s
+load        artifact/materialize           6.664 s
+load        host to device                 4.904 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.280 s
+generate    decode                         1.046 s
+generate    total                          1.326 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             74
+summary     reused prompt tokens      0
+summary     generated tokens          59
+summary     model elapsed             1.326 s
+summary     prefill speed             264.71 tok/s
+summary     decode speed              55.43 tok/s
+summary     throughput (overall)      44.50 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         121.38 MiB / 121.38 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       144.17 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        43.06 MiB
+summary     KV capacity headroom      0 B
+summary     planned slack             34.90 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.31 GiB
+summary     mtp draft window          3
+summary     mtp rounds                17
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        51
+summary     mtp accepted tokens       44
+summary     mtp acceptance rate       86.27%
+summary     mtp acceptance length     3.59 tok/round
+summary     mtp accepted by pos       17,15,12

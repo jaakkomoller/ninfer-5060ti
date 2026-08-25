@@ -89,6 +89,9 @@ struct EngineOptions {
     std::uint32_t media_preprocess_threads = 0;
     bool enable_vision                     = false;
     bool use_cuda_graph                    = true;
+    // Persistent Linear Attention rewrite-checkpoint slot is allocated only when true. Disabling
+    // it halves the Linear Attention state pool at the cost of cross-request prefix reuse.
+    bool persistent_prefix_reuse           = true;
     LoadProgress load_progress;
 };
 
