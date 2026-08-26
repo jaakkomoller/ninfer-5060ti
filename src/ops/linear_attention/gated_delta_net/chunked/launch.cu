@@ -16,9 +16,10 @@ std::size_t chunked_workspace_bytes(std::int32_t value_heads, std::int32_t token
 }
 
 void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                    const Tensor& beta, float scale, const Tensor& ssm_state_in,
-                    Tensor& ssm_state_out, Tensor& out, void* workspace,
-                    std::size_t workspace_bytes, cudaStream_t stream) {
+                     const Tensor& beta, float scale, const Tensor& ssm_state_in,
+                     const Tensor& ssm_state_in_scale, Tensor& ssm_state_out,
+                     const Tensor& ssm_state_out_scale, Tensor& out, void* workspace,
+                     std::size_t workspace_bytes, cudaStream_t stream) {
     const auto layout = chunked::compute_workspace_layout(v.ne[1], q.ne[2]);
     if (workspace == nullptr || workspace_bytes < layout.total_bytes) { throw std::bad_alloc(); }
 
@@ -56,14 +57,21 @@ void launch_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Ten
     state.stream    = stream;
     switch (ssm_state_in.dtype) {
     case DType::FP32:
-        state.state_in     = static_cast<const float*>(ssm_state_in.data);
-        state.state_out    = static_cast<float*>(ssm_state_out.data);
+        state.state_in      = static_cast<const float*>(ssm_state_in.data);
+        state.state_out     = static_cast<float*>(ssm_state_out.data);
         state.state_is_bf16 = false;
         break;
     case DType::BF16:
-        state.state_in     = static_cast<const __nv_bfloat16*>(ssm_state_in.data);
-        state.state_out    = static_cast<__nv_bfloat16*>(ssm_state_out.data);
+        state.state_in      = static_cast<const __nv_bfloat16*>(ssm_state_in.data);
+        state.state_out     = static_cast<__nv_bfloat16*>(ssm_state_out.data);
         state.state_is_bf16 = true;
+        break;
+    case DType::I8:
+        state.state_in        = static_cast<const std::int8_t*>(ssm_state_in.data);
+        state.state_out       = static_cast<std::int8_t*>(ssm_state_out.data);
+        state.state_is_i8     = true;
+        state.state_scale_in  = static_cast<const __half*>(ssm_state_in_scale.data);
+        state.state_scale_out = static_cast<__half*>(ssm_state_out_scale.data);
         break;
     default:
         throw std::invalid_argument("chunked state_passing: unsupported state dtype");

@@ -69,16 +69,17 @@ void require_scale(float scale) {
 }
 
 Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                            const Tensor& beta, float scale, const Tensor& ssm_state,
-                            const Tensor& out) {
+                             const Tensor& beta, float scale, const Tensor& ssm_state,
+                             const Tensor& ssm_state_scale, const Tensor& out) {
     require_dtype(q, DType::BF16, "q must be BF16");
     require_dtype(k, DType::BF16, "k must be BF16");
     require_dtype(v, DType::BF16, "v must be BF16");
     require_dtype(out, DType::BF16, "out must be BF16");
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
-    if (ssm_state.dtype != DType::FP32 && ssm_state.dtype != DType::BF16) {
-        throw std::invalid_argument("ssm_state must be FP32 or BF16");
+    if (ssm_state.dtype != DType::FP32 && ssm_state.dtype != DType::BF16 &&
+        ssm_state.dtype != DType::I8) {
+        throw std::invalid_argument("ssm_state must be FP32, BF16, or I8");
     }
 
     const Geometry geometry = require_geometry(q, v);
@@ -103,15 +104,24 @@ Geometry validate_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_contiguous_nonnull(ssm_state, "ssm_state");
     require_contiguous_nonnull(out, "out");
 
+    if (ssm_state.dtype == DType::I8) {
+        require_dtype(ssm_state_scale, DType::FP16, "ssm_state_scale must be FP16");
+        require_shape(ssm_state_scale, detail::gated_delta_net::kStateDim, geometry.value_heads, 1,
+                      1, "ssm_state_scale");
+        require_contiguous_nonnull(ssm_state_scale, "ssm_state_scale");
+    } else if (ssm_state_scale.data != nullptr) {
+        throw std::invalid_argument("ssm_state_scale must be empty for a non-I8 ssm_state");
+    }
+
     require_scale(scale);
     return geometry;
 }
 
 Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v,
-                                     const Tensor& g, const Tensor& beta, float scale,
-                                     const Tensor& ssm_states, const Tensor& valid_columns,
-                                     const Tensor& initial_state_slots,
-                                     const Tensor& snapshot_base_slots, const Tensor& out) {
+                                      const Tensor& g, const Tensor& beta, float scale,
+                                      const Tensor& ssm_states, const Tensor& ssm_states_scale,
+                                      const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                      const Tensor& snapshot_base_slots, const Tensor& out) {
     constexpr std::int32_t kMaximumBatch = 8;
     constexpr std::int32_t kMaximumWidth = 16;
     const bool masked                    = valid_columns.data != nullptr;
@@ -121,8 +131,9 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
     require_dtype(out, DType::BF16, "out must be BF16");
     require_dtype(g, DType::FP32, "g must be FP32");
     require_dtype(beta, DType::FP32, "beta must be FP32");
-    if (ssm_states.dtype != DType::FP32 && ssm_states.dtype != DType::BF16) {
-        throw std::invalid_argument("ssm_states must be FP32 or BF16");
+    if (ssm_states.dtype != DType::FP32 && ssm_states.dtype != DType::BF16 &&
+        ssm_states.dtype != DType::I8) {
+        throw std::invalid_argument("ssm_states must be FP32, BF16, or I8");
     }
     if (masked) { require_dtype(valid_columns, DType::I32, "valid_columns must be I32"); }
     require_dtype(initial_state_slots, DType::I32, "initial_state_slots must be I32");
@@ -148,6 +159,17 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
         ssm_states.ne[2] != geometry.value_heads || ssm_states.ne[3] < geometry.tokens * batch) {
         throw std::invalid_argument("gated_delta_net: invalid shape for ssm_states snapshot");
     }
+    if (ssm_states.dtype == DType::I8) {
+        require_dtype(ssm_states_scale, DType::FP16, "ssm_states_scale must be FP16");
+        if (ssm_states_scale.ne[0] != detail::gated_delta_net::kStateDim ||
+            ssm_states_scale.ne[1] != geometry.value_heads ||
+            ssm_states_scale.ne[2] != ssm_states.ne[3]) {
+            throw std::invalid_argument("gated_delta_net: invalid shape for ssm_states_scale");
+        }
+        require_contiguous_nonnull(ssm_states_scale, "ssm_states_scale");
+    } else if (ssm_states_scale.data != nullptr) {
+        throw std::invalid_argument("ssm_states_scale must be empty for a non-I8 ssm_states");
+    }
     if (masked) { require_shape(valid_columns, batch, 1, 1, 1, "valid_columns"); }
     require_shape(initial_state_slots, batch, 1, 1, 1, "initial_state_slots");
     require_shape(snapshot_base_slots, batch, 1, 1, 1, "snapshot_base_slots");
@@ -168,17 +190,28 @@ Geometry validate_recurrent_snapshot(const Tensor& q, const Tensor& k, const Ten
 }
 
 void validate_chunked(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, const Tensor& ssm_state_in,
-                      const Tensor& ssm_state_out, const Tensor& out) {
+                       const Tensor& beta, float scale, const Tensor& ssm_state_in,
+                       const Tensor& ssm_state_in_scale, const Tensor& ssm_state_out,
+                       const Tensor& ssm_state_out_scale, const Tensor& out) {
     // ssm_state_out carries the running-state contract validated by validate_recurrent;
     // ssm_state_in is an equally-shaped read view (may alias ssm_state_out for in-place).
-    const Geometry geometry = validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, out);
-    if (ssm_state_in.dtype != DType::FP32 && ssm_state_in.dtype != DType::BF16) {
-        throw std::invalid_argument("ssm_state_in must be FP32 or BF16");
+    const Geometry geometry =
+        validate_recurrent(q, k, v, g, beta, scale, ssm_state_out, ssm_state_out_scale, out);
+    if (ssm_state_in.dtype != DType::FP32 && ssm_state_in.dtype != DType::BF16 &&
+        ssm_state_in.dtype != DType::I8) {
+        throw std::invalid_argument("ssm_state_in must be FP32, BF16, or I8");
     }
     require_shape(ssm_state_in, detail::gated_delta_net::kStateDim,
                   detail::gated_delta_net::kStateDim, geometry.value_heads, 1, "ssm_state_in");
     require_contiguous_nonnull(ssm_state_in, "ssm_state_in");
+    if (ssm_state_in.dtype == DType::I8) {
+        require_dtype(ssm_state_in_scale, DType::FP16, "ssm_state_in_scale must be FP16");
+        require_shape(ssm_state_in_scale, detail::gated_delta_net::kStateDim, geometry.value_heads,
+                      1, 1, "ssm_state_in_scale");
+        require_contiguous_nonnull(ssm_state_in_scale, "ssm_state_in_scale");
+    } else if (ssm_state_in_scale.data != nullptr) {
+        throw std::invalid_argument("ssm_state_in_scale must be empty for a non-I8 ssm_state_in");
+    }
 }
 
 struct ChunkedWorkspace {
@@ -222,38 +255,42 @@ std::size_t gated_delta_net_workspace_capacity_bytes(std::int32_t qk_heads,
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                     Tensor& ssm_state, Tensor& out, cudaStream_t stream) {
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                      Tensor& ssm_state, const Tensor& ssm_state_scale, Tensor& out,
+                      cudaStream_t stream) {
     if (q.ne[2] != 1) {
-        gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state, out,
-                        stream);
+        gated_delta_net(q, k, v, g, beta, scale, normalize_qk, ws, ssm_state, ssm_state_scale,
+                        ssm_state, ssm_state_scale, out, stream);
         return;
     }
-    validate_recurrent(q, k, v, g, beta, scale, ssm_state, out);
+    validate_recurrent(q, k, v, g, beta, scale, ssm_state, ssm_state_scale, out);
 
     (void)ws;
-    detail::gated_delta_net::launch_recurrent(q, k, v, g, beta, scale, normalize_qk, ssm_state, out,
-                                              stream);
+    detail::gated_delta_net::launch_recurrent(q, k, v, g, beta, scale, normalize_qk, ssm_state,
+                                              ssm_state_scale, out, stream);
 }
 
 void gated_delta_net_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                              const Tensor& beta, float scale, bool normalize_qk,
-                              Tensor& ssm_states, const Tensor& valid_columns,
-                              const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
-                              Tensor& out, cudaStream_t stream) {
-    validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                initial_state_slots, snapshot_base_slots, out);
+                               const Tensor& beta, float scale, bool normalize_qk,
+                               Tensor& ssm_states, const Tensor& ssm_states_scale,
+                               const Tensor& valid_columns, const Tensor& initial_state_slots,
+                               const Tensor& snapshot_base_slots, Tensor& out,
+                               cudaStream_t stream) {
+    validate_recurrent_snapshot(q, k, v, g, beta, scale, ssm_states, ssm_states_scale,
+                                valid_columns, initial_state_slots, snapshot_base_slots, out);
 
     detail::gated_delta_net::launch_recurrent_snapshot(
-        q, k, v, g, beta, scale, normalize_qk, ssm_states, valid_columns, initial_state_slots,
-        snapshot_base_slots, out, stream);
+        q, k, v, g, beta, scale, normalize_qk, ssm_states, ssm_states_scale, valid_columns,
+        initial_state_slots, snapshot_base_slots, out, stream);
 }
 
 void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                     const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
-                     const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                     cudaStream_t stream) {
-    validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out, out);
+                      const Tensor& beta, float scale, bool normalize_qk, WorkspaceArena& ws,
+                      const Tensor& ssm_state_in, const Tensor& ssm_state_in_scale,
+                      Tensor& ssm_state_out, const Tensor& ssm_state_out_scale, Tensor& out,
+                      cudaStream_t stream) {
+    validate_chunked(q, k, v, g, beta, scale, ssm_state_in, ssm_state_in_scale, ssm_state_out,
+                     ssm_state_out_scale, out);
 
     auto scratch_scope   = ws.scope();
     const std::int32_t T = q.ne[2];
@@ -278,7 +315,8 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         Tensor beta_full = beta.slice(1, 0, T_full);
         Tensor out_full  = out.slice(2, 0, T_full);
         detail::gated_delta_net::launch_chunked(q_full, k_full, v_full, g_full, beta_full, scale,
-                                                ssm_state_in, ssm_state_out, out_full,
+                                                ssm_state_in, ssm_state_in_scale, ssm_state_out,
+                                                ssm_state_out_scale, out_full,
                                                 scratch.stage.data, scratch.stage.bytes, stream);
     }
 
@@ -294,9 +332,11 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
         // chunks) reads the caller-provided ssm_state_in. Either way the tail publishes to
         // ssm_state_out.
         const Tensor& tail_in = (T_full > 0) ? ssm_state_out : ssm_state_in;
+        const Tensor& tail_in_scale = (T_full > 0) ? ssm_state_out_scale : ssm_state_in_scale;
         detail::gated_delta_net::launch_recurrent_inout(q_tail, k_tail, v_tail, g_tail, beta_tail,
                                                         scale, recurrent_normalize, tail_in,
-                                                        ssm_state_out, out_tail, stream);
+                                                        tail_in_scale, ssm_state_out,
+                                                        ssm_state_out_scale, out_tail, stream);
     }
 }
 

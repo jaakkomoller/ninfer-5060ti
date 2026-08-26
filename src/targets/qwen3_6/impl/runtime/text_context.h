@@ -240,6 +240,10 @@ private:
     [[nodiscard]] const MtpW& mtp_weights() const;
     void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    // I8 recurrent state only: the FP16 per-(value_head, dv row) scale backing the state the
+    // GDN recurrence ops consume; empty for FP32/BF16 storage.
+    [[nodiscard]] Tensor gdn_state_scale_slot(std::uint32_t layer, std::int32_t slot) const;
+    [[nodiscard]] Tensor gdn_state_scale_layer(std::uint32_t layer) const;
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>

@@ -21,13 +21,17 @@ cudaError_t launch_fixed_t(const state_passing_config& cfg, head_map qk_map, int
 
     kernel::state_passing_kernel<NStrip, StateInPtr, StateOutPtr>
         <<<grid, block, smem_bytes, cfg.stream>>>(
-            cfg.W, cfg.U, cfg.k, cfg.g_cumsum, reinterpret_cast<StateInPtr>(cfg.state_in), cfg.v_new,
-            cfg.h_chunk, reinterpret_cast<StateOutPtr>(cfg.state_out), qk_map, NT);
+            cfg.W, cfg.U, cfg.k, cfg.g_cumsum, reinterpret_cast<StateInPtr>(cfg.state_in),
+            cfg.state_scale_in, cfg.v_new, cfg.h_chunk, reinterpret_cast<StateOutPtr>(cfg.state_out),
+            cfg.state_scale_out, qk_map, NT);
     return cudaGetLastError();
 }
 
 template <int NStrip>
 cudaError_t launch_fixed(const state_passing_config& cfg, head_map qk_map, int NT) {
+    if (cfg.state_is_i8) {
+        return launch_fixed_t<NStrip, const std::int8_t*, std::int8_t*>(cfg, qk_map, NT);
+    }
     if (cfg.state_is_bf16) {
         return launch_fixed_t<NStrip, const __nv_bfloat16*, __nv_bfloat16*>(cfg, qk_map, NT);
     }
@@ -43,6 +47,9 @@ cudaError_t launch_state_passing(const state_passing_config& cfg) {
     if (cfg.W == nullptr || cfg.U == nullptr || cfg.k == nullptr || cfg.g_cumsum == nullptr ||
         cfg.state_in == nullptr || cfg.v_new == nullptr || cfg.h_chunk == nullptr ||
         cfg.state_out == nullptr) {
+        return cudaErrorInvalidValue;
+    }
+    if (cfg.state_is_i8 && (cfg.state_scale_in == nullptr || cfg.state_scale_out == nullptr)) {
         return cudaErrorInvalidValue;
     }
 

@@ -65,8 +65,11 @@ struct smem_layout {
     // chunk start (Phase A) and then read from any sit's buffer in the unified
     // matmul1 / coop_write paths without per-sit re-scatter+sync.
     static constexpr int N_SNAP_BUF = N_SNAP_ITERS;
+    // I8 state storage: per-(d row, s split) absolute-max scratch used by the Phase-Z
+    // per-row quantization (one float per block d row per BT split).
+    static constexpr int ROWMAX_FLT  = NStrip * D::BT_SPLITS;
     static constexpr int SMEM_FLOATS =
-        W_STORAGE_FLT + UVD_FLT + K_STORAGE_FLT + SNAP_FLT * N_SNAP_BUF + BT;
+        W_STORAGE_FLT + UVD_FLT + K_STORAGE_FLT + SNAP_FLT * N_SNAP_BUF + BT + ROWMAX_FLT;
 };
 
 // Snapshot stores the FP32 state operand as [value, state] with a stride-32
@@ -165,14 +168,20 @@ __device__ __forceinline__ void unpack_bf16x2_to_fp32_bits(unsigned packed, unsi
     high = packed & 0xffff0000U;
 }
 
-// The narrow geometry targets two 128-register CTAs per SM. The wide geometry
-// uses one 512-thread CTA; both expose 16 resident warps without local spills.
-__device__ __forceinline__ float load_state_value(const float* base, std::int64_t off) {
+// State codec. The I8 form takes the per-(value_head, d row) FP16 scale already promoted to FP32
+// by the caller; element = code * scale.
+__device__ __forceinline__ float load_state_value(const float* base, std::int64_t off, float) {
     return base[off];
 }
 
-__device__ __forceinline__ float load_state_value(const __nv_bfloat16* base, std::int64_t off) {
+__device__ __forceinline__ float load_state_value(const __nv_bfloat16* base, std::int64_t off,
+                                                  float) {
     return __bfloat162float(base[off]);
+}
+
+__device__ __forceinline__ float load_state_value(const std::int8_t* base, std::int64_t off,
+                                                  float scale) {
+    return static_cast<float>(base[off]) * scale;
 }
 
 __device__ __forceinline__ void store_state_value(float* base, std::int64_t off, float value) {
@@ -190,8 +199,10 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
                                const __nv_bfloat16* __restrict__ U_in,
                                const __nv_bfloat16* __restrict__ k_in,
                                const float* __restrict__ g_cumsum, StateInPtr state_in,
+                               const __half* __restrict__ state_scale_in,
                                __nv_bfloat16* __restrict__ v_new,
                                __nv_bfloat16* __restrict__ h_chunk, StateOutPtr state_out,
+                               __half* __restrict__ state_scale_out,
                                head_map qk_map, int chunks) {
     using D                         = kernel_dims<NStrip>;
     using L                         = smem_layout<NStrip>;
@@ -247,6 +258,7 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     for (int b_ = 0; b_ < N_SNAP_BUF; ++b_) {
         snap_views[b_] = SnapView{snap_smem + b_ * SNAP_FLT};
     }
+    float* const rowmax_smem = g_smem + BT; // ROWMAX_FLT, I8 Phase-Z row quantization
 
     // Block / lane indexing.
     //   grid.x = hd in [0, H_v*D_STRIPS).
@@ -273,20 +285,27 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
     {
         const int64_t st_base = static_cast<int64_t>(h_v) * kStateDim * kStateDim;
         const int row_off     = s_idx * S_PER_WARP;
+        const int col_d0      = warp_d_global + 2 * lane_t;
+        const int col_d1      = col_d0 + 1;
+        float scale0          = 1.0f;
+        float scale1          = 1.0f;
+        if constexpr (std::is_same_v<std::decay_t<StateInPtr>, const std::int8_t*>) {
+            const __half* scale_row = state_scale_in + h_v * kStateDim;
+            scale0                  = __half2float(scale_row[col_d0]);
+            scale1                  = __half2float(scale_row[col_d1]);
+        }
 #pragma unroll
         for (int m = 0; m < M_TILES_H_PW; ++m) {
             const int row_g0 = row_off + m * MMA_M + lane_g;
             const int row_g1 = row_g0 + 8;
-            const int col_d0 = warp_d_global + 2 * lane_t;
-            const int col_d1 = col_d0 + 1;
             h_frag[m][0] =
-                load_state_value(state_in, st_base + (int64_t)col_d0 * kStateDim + row_g0);
+                load_state_value(state_in, st_base + (int64_t)col_d0 * kStateDim + row_g0, scale0);
             h_frag[m][1] =
-                load_state_value(state_in, st_base + (int64_t)col_d1 * kStateDim + row_g0);
+                load_state_value(state_in, st_base + (int64_t)col_d1 * kStateDim + row_g0, scale1);
             h_frag[m][2] =
-                load_state_value(state_in, st_base + (int64_t)col_d0 * kStateDim + row_g1);
+                load_state_value(state_in, st_base + (int64_t)col_d0 * kStateDim + row_g1, scale0);
             h_frag[m][3] =
-                load_state_value(state_in, st_base + (int64_t)col_d1 * kStateDim + row_g1);
+                load_state_value(state_in, st_base + (int64_t)col_d1 * kStateDim + row_g1, scale1);
         }
     }
 
@@ -538,17 +557,82 @@ __launch_bounds__(kernel_dims<NStrip>::THREADS, kernel_dims<NStrip>::MIN_BLOCKS)
 
     // === Phase Z: store h_frag -> state_out (AR-transposed) ===
     const int64_t st_base = static_cast<int64_t>(h_v) * kStateDim * kStateDim;
+    const int d0          = warp_d_global + 2 * lane_t;
+    const int d1          = d0 + 1;
+    const int d0_local    = d0 - d_off;
+    const int d1_local    = d1 - d_off;
 
+    if constexpr (std::is_same_v<std::decay_t<StateOutPtr>, std::int8_t*>) {
+        // Per-row quantization: each (d row, s split) pair is held by 8 lanes of one warp
+        // (lane_g 0..7, fixed lane_t); the full 128-k row spans the four s splits. Warp-local
+        // maxes accumulate in shared memory, then every lane re-derives the row scale and
+        // quantizes its own elements. The row scale (row max / 127, FP16) is published by the
+        // lane_g == 0, s_idx == 0 lane of the owning d-tile warp.
+        if (tid < L::ROWMAX_FLT) { rowmax_smem[tid] = 0.0f; }
+        __syncthreads();
+
+        float local0 = fabsf(h_frag[0][0]);
+        float local1 = fabsf(h_frag[0][1]);
 #pragma unroll
-    for (int m = 0; m < M_TILES_H_PW; ++m) {
-        const int k_g0 = s_idx * S_PER_WARP + m * MMA_M + lane_g;
-        const int k_g1 = k_g0 + 8;
-        const int d0   = warp_d_global + 2 * lane_t;
-        const int d1   = d0 + 1;
-        store_state_value(state_out, st_base + (int64_t)d0 * kStateDim + k_g0, h_frag[m][0]);
-        store_state_value(state_out, st_base + (int64_t)d1 * kStateDim + k_g0, h_frag[m][1]);
-        store_state_value(state_out, st_base + (int64_t)d0 * kStateDim + k_g1, h_frag[m][2]);
-        store_state_value(state_out, st_base + (int64_t)d1 * kStateDim + k_g1, h_frag[m][3]);
+        for (int m = 0; m < M_TILES_H_PW; ++m) {
+            local0 = fmaxf(local0, fmaxf(fabsf(h_frag[m][0]), fabsf(h_frag[m][2])));
+            local1 = fmaxf(local1, fmaxf(fabsf(h_frag[m][1]), fabsf(h_frag[m][3])));
+        }
+        // Row maxes are non-negative, so the uint32 bit pattern orders them exactly as floats.
+        atomicMax(reinterpret_cast<std::uint32_t*>(&rowmax_smem[d0_local * BT_SPLITS + s_idx]),
+                  __float_as_uint(local0));
+        atomicMax(reinterpret_cast<std::uint32_t*>(&rowmax_smem[d1_local * BT_SPLITS + s_idx]),
+                  __float_as_uint(local1));
+        __syncthreads();
+
+        float row_max0 = 0.0f;
+        float row_max1 = 0.0f;
+#pragma unroll
+        for (int s = 0; s < BT_SPLITS; ++s) {
+            row_max0 = fmaxf(row_max0, rowmax_smem[d0_local * BT_SPLITS + s]);
+            row_max1 = fmaxf(row_max1, rowmax_smem[d1_local * BT_SPLITS + s]);
+        }
+        const __half scale0_16 = __float2half_rn(row_max0 / 127.0f);
+        const __half scale1_16 = __float2half_rn(row_max1 / 127.0f);
+        const float scale0     = __half2float(scale0_16);
+        const float scale1     = __half2float(scale1_16);
+
+        const int d0_global = d_off + d0_local;
+        const int d1_global = d_off + d1_local;
+        if (lane_g == 0 && s_idx == 0) {
+            state_scale_out[h_v * kStateDim + d0_global] = scale0_16;
+            state_scale_out[h_v * kStateDim + d1_global] = scale1_16;
+        }
+
+        const auto quantize = [](float value, float scale) -> std::int8_t {
+            int code = 0;
+            if (scale != 0.0f) {
+                code = static_cast<int>(__float2int_rn(value / scale));
+                if (code > 127) { code = 127; }
+                if (code < -127) { code = -127; }
+            }
+            return static_cast<std::int8_t>(code);
+        };
+#pragma unroll
+        for (int m = 0; m < M_TILES_H_PW; ++m) {
+            const int k_g0 = s_idx * S_PER_WARP + m * MMA_M + lane_g;
+            const int k_g1 = k_g0 + 8;
+            state_out[st_base + (int64_t)d0 * kStateDim + k_g0] = quantize(h_frag[m][0], scale0);
+            state_out[st_base + (int64_t)d1 * kStateDim + k_g0] = quantize(h_frag[m][1], scale1);
+            state_out[st_base + (int64_t)d0 * kStateDim + k_g1] = quantize(h_frag[m][2], scale0);
+            state_out[st_base + (int64_t)d1 * kStateDim + k_g1] = quantize(h_frag[m][3], scale1);
+        }
+        return;
+    } else {
+#pragma unroll
+        for (int m = 0; m < M_TILES_H_PW; ++m) {
+            const int k_g0 = s_idx * S_PER_WARP + m * MMA_M + lane_g;
+            const int k_g1 = k_g0 + 8;
+            store_state_value(state_out, st_base + (int64_t)d0 * kStateDim + k_g0, h_frag[m][0]);
+            store_state_value(state_out, st_base + (int64_t)d1 * kStateDim + k_g0, h_frag[m][1]);
+            store_state_value(state_out, st_base + (int64_t)d0 * kStateDim + k_g1, h_frag[m][2]);
+            store_state_value(state_out, st_base + (int64_t)d1 * kStateDim + k_g1, h_frag[m][3]);
+        }
     }
 }
 

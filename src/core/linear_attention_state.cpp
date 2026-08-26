@@ -91,9 +91,10 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
     if (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32) {
         throw std::invalid_argument("LinearAttentionStatePool conv_dtype must be BF16 or FP32");
     }
-    if (spec.recurrent_dtype != DType::BF16 && spec.recurrent_dtype != DType::FP32) {
+    if (spec.recurrent_dtype != DType::BF16 && spec.recurrent_dtype != DType::FP32 &&
+        spec.recurrent_dtype != DType::I8) {
         throw std::invalid_argument(
-            "LinearAttentionStatePool recurrent_dtype must be BF16 or FP32");
+            "LinearAttentionStatePool recurrent_dtype must be BF16, FP32, or I8");
     }
 
     const Tensor conv_shape(nullptr, spec.conv_dtype,
@@ -101,25 +102,35 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
     const Tensor recurrent_shape(
         nullptr, spec.recurrent_dtype,
         {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
+    const Tensor recurrent_scale_shape(
+        nullptr, DType::FP16, {spec.value_head_dim, spec.value_heads, spec.slot_count});
 
+    const bool recurrent_i8 = spec.recurrent_dtype == DType::I8;
     LinearAttentionStatePoolLayout layout;
     layout.spec = spec;
     layout.conv.reserve(spec.layers);
     layout.recurrent.reserve(spec.layers);
+    if (recurrent_i8) { layout.recurrent_scale.reserve(spec.layers); }
     for (std::uint32_t layer = 0; layer < spec.layers; ++layer) {
         const std::string prefix = "Linear Attention layer " + std::to_string(layer);
         layout.conv.push_back(builder.add(conv_shape.bytes(), kArenaAlign, prefix + " conv"));
         layout.recurrent.push_back(
             builder.add(recurrent_shape.bytes(), kArenaAlign, prefix + " recurrent"));
+        if (recurrent_i8) {
+            layout.recurrent_scale.push_back(
+                builder.add(recurrent_scale_shape.bytes(), kArenaAlign, prefix + " recurrent scale"));
+        }
     }
     return layout;
 }
 
 LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
-                                                   const LinearAttentionStatePoolLayout& layout)
+                                                    const LinearAttentionStatePoolLayout& layout)
     : spec(layout.spec) {
+    const bool recurrent_i8 = spec.recurrent_dtype == DType::I8;
     if (layout.conv.empty() || layout.recurrent.size() != layout.conv.size() ||
-        layout.conv.size() != spec.layers) {
+        layout.conv.size() != spec.layers || layout.recurrent_scale.size() !=
+        (recurrent_i8 ? spec.layers : 0)) {
         throw std::invalid_argument(
             "LinearAttentionStatePool layout layer counts are inconsistent");
     }
@@ -129,11 +140,15 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
     const Tensor recurrent_shape(
         nullptr, spec.recurrent_dtype,
         {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count});
+    const Tensor recurrent_scale_shape(
+        nullptr, DType::FP16, {spec.value_head_dim, spec.value_heads, spec.slot_count});
     conv.reserve(layout.conv.size());
     recurrent.reserve(layout.recurrent.size());
+    if (recurrent_i8) { recurrent_scale.reserve(layout.recurrent_scale.size()); }
     for (std::size_t layer = 0; layer < layout.conv.size(); ++layer) {
         if (layout.conv[layer].bytes != conv_shape.bytes() ||
-            layout.recurrent[layer].bytes != recurrent_shape.bytes()) {
+            layout.recurrent[layer].bytes != recurrent_shape.bytes() ||
+            (recurrent_i8 && layout.recurrent_scale[layer].bytes != recurrent_scale_shape.bytes())) {
             throw std::logic_error(
                 "LinearAttentionStatePool layout tensor byte size is inconsistent");
         }
@@ -144,6 +159,12 @@ LinearAttentionStatePool::LinearAttentionStatePool(DeviceSpan backing,
             layout.recurrent[layer].bind(backing).data, spec.recurrent_dtype,
             std::initializer_list<std::int32_t>{spec.key_head_dim, spec.value_head_dim,
                                                 spec.value_heads, spec.slot_count});
+        if (recurrent_i8) {
+            recurrent_scale.emplace_back(
+                layout.recurrent_scale[layer].bind(backing).data, DType::FP16,
+                std::initializer_list<std::int32_t>{spec.value_head_dim, spec.value_heads,
+                                                    spec.slot_count});
+        }
     }
 }
 
@@ -152,6 +173,10 @@ std::uint32_t LinearAttentionStatePool::layer_count() const noexcept {
 }
 
 std::int32_t LinearAttentionStatePool::slot_count() const noexcept { return spec.slot_count; }
+
+bool LinearAttentionStatePool::recurrent_is_i8() const noexcept {
+    return spec.recurrent_dtype == DType::I8;
+}
 
 std::int64_t LinearAttentionStatePool::conv_slot_stride_elements() const noexcept {
     return static_cast<std::int64_t>(spec.conv_channels) *
@@ -165,7 +190,9 @@ std::int64_t LinearAttentionStatePool::recurrent_slot_stride_elements() const no
 }
 
 LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() const {
-    if (conv.size() != spec.layers || recurrent.size() != spec.layers || conv.empty()) {
+    const bool recurrent_i8 = spec.recurrent_dtype == DType::I8;
+    if (conv.size() != spec.layers || recurrent.size() != spec.layers || conv.empty() ||
+        recurrent_scale.size() != (recurrent_i8 ? spec.layers : 0)) {
         throw std::logic_error("LinearAttentionStatePool layer inventory is inconsistent");
     }
     for (std::size_t layer = 0; layer < conv.size(); ++layer) {
@@ -175,12 +202,21 @@ LinearAttentionStateAllLayersView LinearAttentionStatePool::all_layers_view() co
             recurrent[layer], spec.recurrent_dtype,
             {spec.key_head_dim, spec.value_head_dim, spec.value_heads, spec.slot_count},
             "recurrent");
+        if (recurrent_i8) {
+            validate_state_tensor(
+                recurrent_scale[layer], DType::FP16,
+                {spec.value_head_dim, spec.value_heads, spec.slot_count}, "recurrent scale");
+        }
     }
     return LinearAttentionStateAllLayersView{
         .conv_layer0                  = conv.front(),
         .recurrent_layer0             = recurrent.front(),
+        .recurrent_scale_layer0       =
+            recurrent_i8 ? recurrent_scale.front() : Tensor{},
         .conv_layer_stride_bytes      = layer_stride_bytes(conv, "conv"),
         .recurrent_layer_stride_bytes = layer_stride_bytes(recurrent, "recurrent"),
+        .recurrent_scale_layer_stride_bytes =
+            recurrent_i8 ? layer_stride_bytes(recurrent_scale, "recurrent scale") : 0,
         .spec                         = spec,
     };
 }
@@ -195,6 +231,19 @@ Tensor LinearAttentionStatePool::recurrent_slot(std::uint32_t layer, std::int32_
     return recurrent.at(layer)
         .slice(3, slot, 1)
         .view({spec.key_head_dim, spec.value_head_dim, spec.value_heads});
+}
+
+Tensor LinearAttentionStatePool::recurrent_scale_slot(std::uint32_t layer,
+                                                      std::int32_t slot) const {
+    validate_layer_slot(*this, layer, slot, "LinearAttentionStatePool recurrent_scale_slot");
+    return recurrent_scale.at(layer).slice(2, slot, 1).view({spec.value_head_dim, spec.value_heads});
+}
+
+Tensor LinearAttentionStatePool::recurrent_scale_layer(std::uint32_t layer) const {
+    if (layer >= layer_count()) {
+        throw std::out_of_range("LinearAttentionStatePool recurrent_scale_layer layer out of range");
+    }
+    return recurrent_scale.at(layer);
 }
 
 void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cudaStream_t stream) {
@@ -213,6 +262,14 @@ void LinearAttentionStatePool::copy_slot(std::int32_t src, std::int32_t dst, cud
         CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
     }
+    if (recurrent_is_i8()) {
+        for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+            const Tensor source      = recurrent_scale_slot(layer, src);
+            const Tensor destination = recurrent_scale_slot(layer, dst);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+    }
 }
 
 void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
@@ -224,6 +281,12 @@ void LinearAttentionStatePool::zero_slot(std::int32_t slot, cudaStream_t stream)
     for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
         const Tensor state = recurrent_slot(layer, slot);
         CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
+    }
+    if (recurrent_is_i8()) {
+        for (std::uint32_t layer = 0; layer < layer_count(); ++layer) {
+            const Tensor state = recurrent_scale_slot(layer, slot);
+            CUDA_CHECK(cudaMemsetAsync(state.data, 0, state.bytes(), stream));
+        }
     }
 }
 

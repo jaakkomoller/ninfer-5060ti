@@ -75,16 +75,22 @@ struct state_passing_config {
     const __nv_bfloat16* U = nullptr;
     const __nv_bfloat16* k = nullptr;
     const float* g_cumsum  = nullptr;
-    // State pointer type (FP32 or BF16) selected by the launcher based on the
+    // State pointer type (FP32, BF16, or I8) selected by the launcher based on the
     // persistent pool's recurrent_dtype. The kernel uses TF32 MMA and stages
-    // the state in FP32 smem internally, then converts on store when BF16.
+    // the state in FP32 internally, then converts on store when BF16 or re-quantizes
+    // per (value_head, d row) when I8.
     const void* state_in   = nullptr;
     // True when state_in / state_out are stored as BF16. False when FP32.
     bool state_is_bf16     = false;
+    // True when state_in / state_out are stored as I8 codes; the scale pointers below then
+    // reference the FP16 per-(value_head, d row) plane [value_head_dim, value_heads].
+    bool state_is_i8       = false;
+    const __half* state_scale_in  = nullptr;
 
     __nv_bfloat16* v_new   = nullptr;
     __nv_bfloat16* h_chunk = nullptr;
     void* state_out        = nullptr;
+    __half* state_scale_out = nullptr;
 
     cudaStream_t stream = nullptr;
 };

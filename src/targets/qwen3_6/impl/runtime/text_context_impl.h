@@ -850,6 +850,14 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Variant::attention_output_projection(a.view({kCfg.q_size, T}), *w.o_proj, x, ph, work_, s);
 }
 
+Tensor TextContext::gdn_state_scale_slot(std::uint32_t layer, std::int32_t slot) const {
+    return state_.recurrent_is_i8() ? state_.recurrent_scale_slot(layer, slot) : Tensor{};
+}
+
+Tensor TextContext::gdn_state_scale_layer(std::uint32_t layer) const {
+    return state_.recurrent_is_i8() ? state_.recurrent_scale_layer(layer) : Tensor{};
+}
+
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -932,12 +940,14 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         if (gdn_state_action_ == GdnStateAction::RecordForReplay) {
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
             ops::gated_delta_net_replay_record(q_batch, k_batch, v_batch, g_batch, beta_batch,
-                                               kGdnScale, recurrent_states, valid,
+                                               kGdnScale, recurrent_states,
+                                               gdn_state_scale_layer(gidx), valid,
                                                *active_linear_state_slots_, records.key,
                                                records.value, records.gate, out_batch, s);
         } else {
             ops::gated_delta_net_snapshot(q_batch, k_batch, v_batch, g_batch, beta_batch, kGdnScale,
-                                          /*normalize_qk=*/true, recurrent_states, valid,
+                                          /*normalize_qk=*/true, recurrent_states,
+                                          gdn_state_scale_layer(gidx), valid,
                                           *active_linear_state_slots_, *active_linear_state_slots_,
                                           out_batch, s);
         }
@@ -945,7 +955,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor recurrent_state =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
         ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta, kGdnScale,
-                             /*normalize_qk=*/true, work_, recurrent_state, o, s);
+                             /*normalize_qk=*/true, work_, recurrent_state,
+                             gdn_state_scale_slot(gidx, linear_state_current_slot_), o, s);
     }
 
     Tensor on = workspace_recipe::gdn_normalized_output<TextConfig>(work_, T).view(

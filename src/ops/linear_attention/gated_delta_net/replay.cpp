@@ -95,10 +95,11 @@ void require_scale(float scale, const char* op) {
 }
 
 void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                            const Tensor& beta, float scale, const Tensor& states,
-                            const Tensor& valid_columns, const Tensor& initial_slots,
-                            const Tensor& key_record, const Tensor& value_record,
-                            const Tensor& gate_record, const Tensor& out) {
+                             const Tensor& beta, float scale, const Tensor& states,
+                             const Tensor& states_scale, const Tensor& valid_columns,
+                             const Tensor& initial_slots,
+                             const Tensor& key_record, const Tensor& value_record,
+                             const Tensor& gate_record, const Tensor& out) {
     constexpr const char* kOp      = "gated_delta_net_replay_record";
     const std::int32_t qk_heads    = q.ne[1];
     const std::int32_t value_heads = v.ne[1];
@@ -117,11 +118,18 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
     require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
     require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
-    if (states.dtype != DType::FP32 && states.dtype != DType::BF16) {
-        throw std::invalid_argument(std::string(kOp) + ": states dtype must be FP32 or BF16");
+    if (states.dtype != DType::FP32 && states.dtype != DType::BF16 && states.dtype != DType::I8) {
+        throw std::invalid_argument(std::string(kOp) + ": states dtype must be FP32, BF16, or I8");
     }
     require_tensor(states, states.dtype, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
                    "states");
+    if (states.dtype == DType::I8) {
+        require_tensor(states_scale, DType::FP16, {kStateDim, value_heads, states.ne[3]}, 256, kOp,
+                       "states scale");
+    } else if (states_scale.data != nullptr) {
+        throw std::invalid_argument(std::string(kOp) + ": states scale must be empty for a "
+                                                    "non-I8 state");
+    }
     require_tensor(initial_slots, DType::I32, {rows}, 4, kOp, "initial state slots");
     if (valid_columns.data != nullptr) {
         require_tensor(valid_columns, DType::I32, {rows}, 4, kOp, "valid columns");
@@ -134,18 +142,19 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(out, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "out");
     require_scale(scale, kOp);
 
-    const std::array<const Tensor*, 12> tensors{&q,
-                                                &k,
-                                                &v,
-                                                &g,
-                                                &beta,
-                                                &states,
-                                                &valid_columns,
-                                                &initial_slots,
-                                                &key_record,
-                                                &value_record,
-                                                &gate_record,
-                                                &out};
+    std::vector<const Tensor*> tensors{&q,
+                                       &k,
+                                       &v,
+                                       &g,
+                                       &beta,
+                                       &states,
+                                       &valid_columns,
+                                       &initial_slots,
+                                       &key_record,
+                                       &value_record,
+                                       &gate_record,
+                                       &out};
+    if (states.dtype == DType::I8) { tensors.push_back(&states_scale); }
     std::vector<MemoryRange> ranges;
     ranges.reserve(tensors.size());
     for (const Tensor* tensor : tensors) {
@@ -192,15 +201,18 @@ void validate_fold_records(const GdnReplayRecords& records) {
 }
 
 void validate_fold_states(const GdnReplayRecords& records,
-                          LinearAttentionStateAllLayersView states) {
+                           LinearAttentionStateAllLayersView states) {
     constexpr const char* kOp = "gdn_replay_fold";
     const auto& record        = records.spec;
     const auto& state         = states.spec;
+    const bool recurrent_i8   = state.recurrent_dtype == DType::I8;
     if (state.layers != static_cast<std::uint32_t>(record.layers) ||
         state.conv_channels != record.conv_channels || state.conv_width != 3 ||
         state.value_heads != record.value_heads || state.value_head_dim != kStateDim ||
         state.key_head_dim != kStateDim || state.slot_count <= 0 ||
-        state.conv_dtype != DType::BF16) {
+        state.conv_dtype != DType::BF16 ||
+        (state.recurrent_dtype != DType::FP32 && state.recurrent_dtype != DType::BF16 &&
+         state.recurrent_dtype != DType::I8)) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
     require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
@@ -208,12 +220,22 @@ void validate_fold_states(const GdnReplayRecords& records,
     require_tensor(states.recurrent_layer0, state.recurrent_dtype,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
                    "recurrent state layer 0");
+    const std::int64_t recurrent_elem_bytes =
+        state.recurrent_dtype == DType::BF16 ? static_cast<std::int64_t>(sizeof(std::uint16_t))
+        : state.recurrent_dtype == DType::I8 ? static_cast<std::int64_t>(1)
+                                             : static_cast<std::int64_t>(sizeof(float));
+    if (recurrent_i8) {
+        require_tensor(states.recurrent_scale_layer0, DType::FP16,
+                       {kStateDim, record.value_heads, state.slot_count}, 256, kOp,
+                       "recurrent scale state layer 0");
+    } else if (states.recurrent_scale_layer0.data != nullptr) {
+        throw std::invalid_argument(std::string(kOp) +
+                                    ": recurrent scale must be empty for a non-I8 state");
+    }
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
-        states.recurrent_layer_stride_bytes %
-                static_cast<std::int64_t>(
-                    state.recurrent_dtype == DType::BF16 ? sizeof(std::uint16_t) : sizeof(float)) !=
-            0 ||
+        states.recurrent_layer_stride_bytes % recurrent_elem_bytes != 0 ||
+        (recurrent_i8 && states.recurrent_scale_layer_stride_bytes < states.recurrent_scale_layer0.bytes()) ||
         static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
         static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
             states.recurrent_layer0.bytes()) {
@@ -225,6 +247,11 @@ void validate_fold_states(const GdnReplayRecords& records,
                           "gdn_replay_fold conv state");
         (void)layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes, layer,
                           "gdn_replay_fold recurrent state");
+        if (recurrent_i8) {
+            (void)layer_range(states.recurrent_scale_layer0,
+                              states.recurrent_scale_layer_stride_bytes, layer,
+                              "gdn_replay_fold recurrent scale state");
+        }
     }
     std::int32_t conv_layer      = 0;
     std::int32_t recurrent_layer = 0;
@@ -234,10 +261,15 @@ void validate_fold_states(const GdnReplayRecords& records,
         const MemoryRange recurrent =
             layer_range(states.recurrent_layer0, states.recurrent_layer_stride_bytes,
                         recurrent_layer, "gdn_replay_fold recurrent state");
-        if (overlaps(conv, recurrent)) {
+        const MemoryRange scale_range = recurrent_i8
+            ? layer_range(states.recurrent_scale_layer0, states.recurrent_scale_layer_stride_bytes,
+                          recurrent_layer, "gdn_replay_fold recurrent scale state")
+            : MemoryRange{0, 0};
+        if (overlaps(conv, recurrent) || (recurrent_i8 && overlaps(recurrent, scale_range))) {
             throw std::invalid_argument("gdn_replay_fold: state layer regions overlap");
         }
-        if (conv.end <= recurrent.begin) {
+        if (conv.end <= recurrent.begin &&
+            (!recurrent_i8 || conv.end <= scale_range.begin)) {
             ++conv_layer;
         } else {
             ++recurrent_layer;
@@ -246,7 +278,8 @@ void validate_fold_states(const GdnReplayRecords& records,
 }
 
 void require_records_disjoint_from_states(const GdnReplayRecords& records,
-                                          LinearAttentionStateAllLayersView states) {
+                                           LinearAttentionStateAllLayersView states) {
+    const bool recurrent_i8 = states.spec.recurrent_dtype == DType::I8;
     const std::array<MemoryRange, 4> record_ranges{
         tensor_range(records.conv, "gdn_replay_fold conv records"),
         tensor_range(records.key, "gdn_replay_fold key records"),
@@ -261,6 +294,16 @@ void require_records_disjoint_from_states(const GdnReplayRecords& records,
                             "gdn_replay_fold recurrent state");
             if (overlaps(record, conv) || overlaps(record, recurrent)) {
                 throw std::invalid_argument("gdn_replay_fold: records overlap state storage");
+            }
+            if (recurrent_i8) {
+                const MemoryRange scale =
+                    layer_range(states.recurrent_scale_layer0,
+                                states.recurrent_scale_layer_stride_bytes, layer,
+                                "gdn_replay_fold recurrent scale state");
+                if (overlaps(record, scale)) {
+                    throw std::invalid_argument(
+                        "gdn_replay_fold: records overlap recurrent scale storage");
+                }
             }
         }
     }
@@ -294,16 +337,18 @@ validate_fold_rows(const GdnReplayRecords& records, LinearAttentionStateAllLayer
 } // namespace
 
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
-                                   const Tensor& g, const Tensor& beta, float scale,
-                                   const Tensor& ssm_states, const Tensor& valid_columns,
-                                   const Tensor& initial_state_slots, Tensor& key_record,
-                                   Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
-    validate_replay_record(q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots,
-                           key_record, value_record, gate_record, out);
+                                    const Tensor& g, const Tensor& beta, float scale,
+                                    const Tensor& ssm_states, const Tensor& ssm_states_scale,
+                                    const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                    Tensor& key_record, Tensor& value_record, Tensor& gate_record,
+                                    Tensor& out,
+                                    cudaStream_t stream) {
+    validate_replay_record(q, k, v, g, beta, scale, ssm_states, ssm_states_scale, valid_columns,
+                           initial_state_slots, key_record, value_record, gate_record, out);
     detail::gated_delta_net::launch_recurrent_record(q, k, v, g, beta, scale, ssm_states,
-                                                     valid_columns, initial_state_slots, key_record,
-                                                     value_record, gate_record, out, stream);
+                                                      ssm_states_scale, valid_columns,
+                                                      initial_state_slots, key_record,
+                                                      value_record, gate_record, out, stream);
 }
 
 void gdn_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAllLayersView states,

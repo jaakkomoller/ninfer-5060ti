@@ -37,7 +37,8 @@ void launch_recurrent_fp32_fixed(const Tensor& q, const Tensor& k, const Tensor&
 template <bool NormalizeQK, class StateReadPtr, class StateWritePtr>
 void launch_recurrent_direct_fixed_t(const Tensor& q, const Tensor& k, const Tensor& v,
                                       const Tensor& g, const Tensor& beta, float scale,
-                                      const Tensor& state_read, Tensor& state_write,
+                                      const Tensor& state_read, const Tensor& state_read_scale,
+                                      Tensor& state_write, const Tensor& state_write_scale,
                                       Tensor& out, cudaStream_t stream) {
     const auto heads = head_map::of(q.ne[1], v.ne[1]);
     const dim3 grid(static_cast<unsigned>(v.ne[1]), 1, static_cast<unsigned>(kStateDim / kBlockDv));
@@ -49,23 +50,33 @@ void launch_recurrent_direct_fixed_t(const Tensor& q, const Tensor& k, const Ten
             static_cast<const float*>(beta.data),
             reinterpret_cast<StateReadPtr>(state_read.data),
             reinterpret_cast<StateWritePtr>(state_write.data),
+            static_cast<const __half*>(state_read_scale.data),
+            static_cast<__half*>(state_write_scale.data),
             static_cast<__nv_bfloat16*>(out.data), q.ne[2], heads, scale);
     CUDA_CHECK(cudaGetLastError());
 }
 
 template <bool NormalizeQK>
 void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
-                                   const Tensor& g, const Tensor& beta, float scale,
-                                   const Tensor& state_read, Tensor& state_write, Tensor& out,
-                                   cudaStream_t stream) {
+                                    const Tensor& g, const Tensor& beta, float scale,
+                                    const Tensor& state_read, const Tensor& state_read_scale,
+                                    Tensor& state_write, const Tensor& state_write_scale,
+                                    Tensor& out, cudaStream_t stream) {
     switch (state_read.dtype) {
     case DType::FP32:
         launch_recurrent_direct_fixed_t<NormalizeQK, const float*, float*>(
-            q, k, v, g, beta, scale, state_read, state_write, out, stream);
+            q, k, v, g, beta, scale, state_read, state_read_scale, state_write,
+            state_write_scale, out, stream);
         break;
     case DType::BF16:
         launch_recurrent_direct_fixed_t<NormalizeQK, const __nv_bfloat16*, __nv_bfloat16*>(
-            q, k, v, g, beta, scale, state_read, state_write, out, stream);
+            q, k, v, g, beta, scale, state_read, state_read_scale, state_write,
+            state_write_scale, out, stream);
+        break;
+    case DType::I8:
+        launch_recurrent_direct_fixed_t<NormalizeQK, const std::int8_t*, std::int8_t*>(
+            q, k, v, g, beta, scale, state_read, state_read_scale, state_write,
+            state_write_scale, out, stream);
         break;
     default:
         throw std::invalid_argument("recurrent_bf16_direct: unsupported state dtype");
@@ -75,7 +86,8 @@ void launch_recurrent_direct_fixed(const Tensor& q, const Tensor& k, const Tenso
 template <bool NormalizeInputs, bool Batched, bool Masked, class StatePtr>
 void launch_recurrent_snapshot_fixed_t(const Tensor& q, const Tensor& k, const Tensor& v,
                                         const Tensor& g, const Tensor& beta, float scale,
-                                        Tensor& ssm_states, const Tensor& valid_columns,
+                                        Tensor& ssm_states, const Tensor& ssm_states_scale,
+                                        const Tensor& valid_columns,
                                         const Tensor& initial_state_slots,
                                         const Tensor& snapshot_base_slots, Tensor& out,
                                         cudaStream_t stream) {
@@ -92,6 +104,7 @@ void launch_recurrent_snapshot_fixed_t(const Tensor& q, const Tensor& k, const T
         static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data),
         reinterpret_cast<StatePtr>(ssm_states.data),
+        static_cast<__half*>(ssm_states_scale.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int32_t*>(initial_state_slots.data),
         static_cast<const std::int32_t*>(snapshot_base_slots.data),
@@ -108,20 +121,26 @@ void launch_recurrent_snapshot_fixed_t(const Tensor& q, const Tensor& k, const T
 
 template <bool NormalizeInputs, bool Batched, bool Masked>
 void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
-                                     const Tensor& g, const Tensor& beta, float scale,
-                                     Tensor& ssm_states, const Tensor& valid_columns,
-                                     const Tensor& initial_state_slots,
-                                     const Tensor& snapshot_base_slots, Tensor& out,
-                                     cudaStream_t stream) {
+                                      const Tensor& g, const Tensor& beta, float scale,
+                                      Tensor& ssm_states, const Tensor& ssm_states_scale,
+                                      const Tensor& valid_columns,
+                                      const Tensor& initial_state_slots,
+                                      const Tensor& snapshot_base_slots, Tensor& out,
+                                      cudaStream_t stream) {
     switch (ssm_states.dtype) {
     case DType::FP32:
         launch_recurrent_snapshot_fixed_t<NormalizeInputs, Batched, Masked, float*>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, snapshot_base_slots,
+            q, k, v, g, beta, scale, ssm_states, ssm_states_scale, valid_columns, initial_state_slots, snapshot_base_slots,
             out, stream);
         break;
     case DType::BF16:
         launch_recurrent_snapshot_fixed_t<NormalizeInputs, Batched, Masked, __nv_bfloat16*>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, snapshot_base_slots,
+            q, k, v, g, beta, scale, ssm_states, ssm_states_scale, valid_columns, initial_state_slots, snapshot_base_slots,
+            out, stream);
+        break;
+    case DType::I8:
+        launch_recurrent_snapshot_fixed_t<NormalizeInputs, Batched, Masked, std::int8_t*>(
+            q, k, v, g, beta, scale, ssm_states, ssm_states_scale, valid_columns, initial_state_slots, snapshot_base_slots,
             out, stream);
         break;
     default:
@@ -132,7 +151,8 @@ void launch_recurrent_snapshot_fixed(const Tensor& q, const Tensor& k, const Ten
 template <bool Masked, class StatePtr>
 void launch_recurrent_record_fixed_t(const Tensor& q, const Tensor& k, const Tensor& v,
                                       const Tensor& g, const Tensor& beta, float scale,
-                                      const Tensor& ssm_states, const Tensor& valid_columns,
+                                      const Tensor& ssm_states, const Tensor& ssm_states_scale,
+                                      const Tensor& valid_columns,
                                       const Tensor& initial_state_slots, Tensor& key_record,
                                       Tensor& value_record, Tensor& gate_record, Tensor& out,
                                       cudaStream_t stream) {
@@ -149,6 +169,7 @@ void launch_recurrent_record_fixed_t(const Tensor& q, const Tensor& k, const Ten
         static_cast<const float*>(g.data),
         static_cast<const float*>(beta.data),
         reinterpret_cast<StatePtr>(ssm_states.data),
+        static_cast<const __half*>(ssm_states_scale.data),
         Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
         static_cast<const std::int32_t*>(initial_state_slots.data),
         static_cast<__nv_bfloat16*>(key_record.data),
@@ -166,20 +187,26 @@ void launch_recurrent_record_fixed_t(const Tensor& q, const Tensor& k, const Ten
 
 template <bool Masked>
 void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tensor& v,
-                                   const Tensor& g, const Tensor& beta, float scale,
-                                   const Tensor& ssm_states, const Tensor& valid_columns,
-                                   const Tensor& initial_state_slots, Tensor& key_record,
-                                   Tensor& value_record, Tensor& gate_record, Tensor& out,
-                                   cudaStream_t stream) {
+                                    const Tensor& g, const Tensor& beta, float scale,
+                                    const Tensor& ssm_states, const Tensor& ssm_states_scale,
+                                    const Tensor& valid_columns,
+                                    const Tensor& initial_state_slots, Tensor& key_record,
+                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
+                                    cudaStream_t stream) {
     switch (ssm_states.dtype) {
     case DType::FP32:
         launch_recurrent_record_fixed_t<Masked, const float*>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            q, k, v, g, beta, scale, ssm_states, ssm_states_scale, valid_columns, initial_state_slots, key_record,
             value_record, gate_record, out, stream);
         break;
     case DType::BF16:
         launch_recurrent_record_fixed_t<Masked, const __nv_bfloat16*>(
-            q, k, v, g, beta, scale, ssm_states, valid_columns, initial_state_slots, key_record,
+            q, k, v, g, beta, scale, ssm_states, ssm_states_scale, valid_columns, initial_state_slots, key_record,
+            value_record, gate_record, out, stream);
+        break;
+    case DType::I8:
+        launch_recurrent_record_fixed_t<Masked, const std::int8_t*>(
+            q, k, v, g, beta, scale, ssm_states, ssm_states_scale, valid_columns, initial_state_slots, key_record,
             value_record, gate_record, out, stream);
         break;
     default:
@@ -198,15 +225,18 @@ void launch_replay_fold_fixed_t(const GdnReplayRecords& records,
     const std::int64_t recurrent_elem_bytes =
         (states.recurrent_layer0.dtype == DType::FP32)
             ? static_cast<std::int64_t>(sizeof(float))
-            : static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+            : (states.recurrent_layer0.dtype == DType::I8) ? static_cast<std::int64_t>(1)
+                                                           : static_cast<std::int64_t>(sizeof(__nv_bfloat16));
     const FoldAccess<Geometry, StatePtr> access{
         static_cast<const __nv_bfloat16*>(records.key.data),
         static_cast<const __nv_bfloat16*>(records.value.data),
         reinterpret_cast<const uint2*>(records.gate.data),
         static_cast<const __nv_bfloat16*>(records.conv.data),
         reinterpret_cast<StatePtr>(states.recurrent_layer0.data),
+        static_cast<__half*>(states.recurrent_scale_layer0.data),
         static_cast<__nv_bfloat16*>(states.conv_layer0.data),
         states.recurrent_layer_stride_bytes / recurrent_elem_bytes,
+        states.recurrent_scale_layer_stride_bytes / static_cast<std::int64_t>(sizeof(__half)),
         states.conv_layer_stride_bytes / static_cast<std::int64_t>(sizeof(__nv_bfloat16)),
         records.spec.record_capacity,
         records.spec.width,
@@ -222,9 +252,9 @@ void launch_replay_fold_fixed_t(const GdnReplayRecords& records,
 
 template <class Geometry>
 void launch_replay_fold_fixed(const GdnReplayRecords& records,
-                              LinearAttentionStateAllLayersView states,
-                              const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
-                              cudaStream_t stream) {
+                               LinearAttentionStateAllLayersView states,
+                               const GdnReplayFoldKernelRows& rows, std::int32_t active_rows,
+                               cudaStream_t stream) {
     switch (states.recurrent_layer0.dtype) {
     case DType::FP32:
         launch_replay_fold_fixed_t<Geometry, float*>(records, states, rows, active_rows, stream);
@@ -232,6 +262,10 @@ void launch_replay_fold_fixed(const GdnReplayRecords& records,
     case DType::BF16:
         launch_replay_fold_fixed_t<Geometry, __nv_bfloat16*>(records, states, rows, active_rows,
                                                             stream);
+        break;
+    case DType::I8:
+        launch_replay_fold_fixed_t<Geometry, std::int8_t*>(records, states, rows, active_rows,
+                                                           stream);
         break;
     default:
         throw std::invalid_argument("recurrent_fold: unsupported state dtype");
@@ -247,76 +281,86 @@ void launch_recurrent_fp32(const Tensor& q, const Tensor& k, const Tensor& v, co
 }
 
 void launch_recurrent(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                      const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
-                      Tensor& out, cudaStream_t stream) {
+                       const Tensor& beta, float scale, bool normalize_qk, Tensor& ssm_state,
+                       const Tensor& ssm_state_scale, Tensor& out, cudaStream_t stream) {
     if (normalize_qk) {
-        launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
-                                            stream);
+        launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state, ssm_state_scale,
+                                            ssm_state, ssm_state_scale, out, stream);
     } else {
-        launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state, ssm_state, out,
-                                             stream);
+        launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state, ssm_state_scale,
+                                             ssm_state, ssm_state_scale, out, stream);
     }
 }
 
 void launch_recurrent_inout(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                            const Tensor& beta, float scale, bool normalize_qk,
-                            const Tensor& ssm_state_in, Tensor& ssm_state_out, Tensor& out,
-                            cudaStream_t stream) {
+                             const Tensor& beta, float scale, bool normalize_qk,
+                             const Tensor& ssm_state_in, const Tensor& ssm_state_in_scale,
+                             Tensor& ssm_state_out, const Tensor& ssm_state_out_scale, Tensor& out,
+                             cudaStream_t stream) {
     if (normalize_qk) {
-        launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
+        launch_recurrent_direct_fixed<true>(q, k, v, g, beta, scale, ssm_state_in,
+                                            ssm_state_in_scale, ssm_state_out, ssm_state_out_scale,
                                             out, stream);
     } else {
-        launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state_in, ssm_state_out,
+        launch_recurrent_direct_fixed<false>(q, k, v, g, beta, scale, ssm_state_in,
+                                             ssm_state_in_scale, ssm_state_out, ssm_state_out_scale,
                                              out, stream);
     }
 }
 
 void launch_recurrent_snapshot(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                               const Tensor& beta, float scale, bool normalize_qk,
-                               Tensor& ssm_states, const Tensor& valid_columns,
-                               const Tensor& initial_state_slots, const Tensor& snapshot_base_slots,
-                               Tensor& out, cudaStream_t stream) {
+                                const Tensor& beta, float scale, bool normalize_qk,
+                                Tensor& ssm_states, const Tensor& ssm_states_scale,
+                                const Tensor& valid_columns, const Tensor& initial_state_slots,
+                                const Tensor& snapshot_base_slots, Tensor& out, cudaStream_t stream) {
     const bool dense_single = q.ne[3] == 1 && valid_columns.data == nullptr;
     if (dense_single && normalize_qk) {
         launch_recurrent_snapshot_fixed<true, false, false>(q, k, v, g, beta, scale, ssm_states,
-                                                            valid_columns, initial_state_slots,
+                                                            ssm_states_scale, valid_columns,
+                                                            initial_state_slots,
                                                             snapshot_base_slots, out, stream);
     } else if (dense_single) {
         launch_recurrent_snapshot_fixed<false, false, false>(q, k, v, g, beta, scale, ssm_states,
-                                                             valid_columns, initial_state_slots,
+                                                             ssm_states_scale, valid_columns,
+                                                             initial_state_slots,
                                                              snapshot_base_slots, out, stream);
     } else if (valid_columns.data == nullptr && normalize_qk) {
         launch_recurrent_snapshot_fixed<true, true, false>(q, k, v, g, beta, scale, ssm_states,
-                                                           valid_columns, initial_state_slots,
+                                                           ssm_states_scale, valid_columns,
+                                                           initial_state_slots,
                                                            snapshot_base_slots, out, stream);
     } else if (valid_columns.data == nullptr) {
         launch_recurrent_snapshot_fixed<false, true, false>(q, k, v, g, beta, scale, ssm_states,
-                                                            valid_columns, initial_state_slots,
+                                                            ssm_states_scale, valid_columns,
+                                                            initial_state_slots,
                                                             snapshot_base_slots, out, stream);
     } else if (normalize_qk) {
         launch_recurrent_snapshot_fixed<true, true, true>(q, k, v, g, beta, scale, ssm_states,
-                                                          valid_columns, initial_state_slots,
+                                                          ssm_states_scale, valid_columns,
+                                                          initial_state_slots,
                                                           snapshot_base_slots, out, stream);
     } else {
         launch_recurrent_snapshot_fixed<false, true, true>(q, k, v, g, beta, scale, ssm_states,
-                                                           valid_columns, initial_state_slots,
+                                                           ssm_states_scale, valid_columns,
+                                                           initial_state_slots,
                                                            snapshot_base_slots, out, stream);
     }
 }
 
 void launch_recurrent_record(const Tensor& q, const Tensor& k, const Tensor& v, const Tensor& g,
-                             const Tensor& beta, float scale, const Tensor& ssm_states,
-                             const Tensor& valid_columns, const Tensor& initial_state_slots,
-                             Tensor& key_record, Tensor& value_record, Tensor& gate_record,
-                             Tensor& out, cudaStream_t stream) {
+                              const Tensor& beta, float scale, const Tensor& ssm_states,
+                              const Tensor& ssm_states_scale, const Tensor& valid_columns,
+                              const Tensor& initial_state_slots, Tensor& key_record,
+                              Tensor& value_record, Tensor& gate_record, Tensor& out,
+                              cudaStream_t stream) {
     if (valid_columns.data == nullptr) {
-        launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                             initial_state_slots, key_record, value_record,
-                                             gate_record, out, stream);
+        launch_recurrent_record_fixed<false>(q, k, v, g, beta, scale, ssm_states, ssm_states_scale,
+                                             valid_columns, initial_state_slots, key_record,
+                                             value_record, gate_record, out, stream);
     } else {
-        launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, valid_columns,
-                                            initial_state_slots, key_record, value_record,
-                                            gate_record, out, stream);
+        launch_recurrent_record_fixed<true>(q, k, v, g, beta, scale, ssm_states, ssm_states_scale,
+                                            valid_columns, initial_state_slots, key_record,
+                                            value_record, gate_record, out, stream);
     }
 }
 

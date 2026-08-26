@@ -142,6 +142,28 @@ Committed decode throughput across concurrent request waves with MTP3 (draft win
 | **C=4** | 1,024 tok | 5.019 s | **204.0 tok/s** | 197.4 tok/s | **1.72×** |
 | **C=8** | 2,048 tok | 6.443 s | **317.9 tok/s** | **347.8 tok/s** | **2.68× (2.93× decode)** |
 
+**Qwen3.8-27B (`groupwise-int`) Single-Request MTP3 on RTX 5060 Ti**
+
+The 15.17 GiB `q4mtp` artifact runs with INT8 KV, a 64-token prefill chunk, and MTP3. The GDN
+recurrent state is stored INT8 with a per-(head, dv-row) FP16 scale, which halves the resident GDN
+state pool (~78 MiB → ~41 MiB) and lifts the context ceiling on this card:
+
+| Flags | Max ctx | Prefill tok/s | Decode tok/s MTP3 | Decode tok/s MTP0 | MTP acceptance | Note |
+|---|---:|---:|---:|---:|---:|---|
+| defaults (prefix reuse) | 2,048 | 266.0 | 45.1 | 24.6 | 62.0% (2.85 tok/round) | 171 prompt, 192 gen |
+| `--no-prefix-reuse` | 3,200 | 278.2 | 45.1 | 24.6 | 62.0% (2.85 tok/round) | 171 prompt, 192 gen |
+
+Prefix reuse holds a second copy of the GDN snapshot pool, so it caps the default-flags context at
+2,048 tokens. MTP3 greedy output matches the MTP0 baseline up to a single near-tie token flip in
+192 generated tokens (0 fallback steps); CUDA Graph memory uses 2.00 MiB of the 4.00 MiB allowance.
+These are single-run measurements on a 40-SM consumer card. Reproduction:
+
+```
+build/apps/ninfer out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer \
+  --prompt <text> --max-context 3200 --kv-dtype int8 --prefill-chunk 64 \
+  --no-prefix-reuse --no-thinking --greedy --spec mtp --draft-tokens 3
+```
+
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
 and per-fixture results.
 

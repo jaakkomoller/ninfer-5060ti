@@ -131,12 +131,14 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .key_head_dim   = TextConfig::gdn_key_head_dim,
                              .slot_count     = linear_state_slots,
                              .conv_dtype     = DType::BF16,
-                             // RTX 5060 Ti 16 GB path: store the Qwen3.8 27B
-                             // GDN recurrent state as BF16. Computation stays in
-                             // FP32 inside the kernels; load-convert-store
-                             // wraps each kernel. Halves the persistent
-                             // recurrent footprint (~144 MiB -> ~72 MiB).
-                             .recurrent_dtype = DType::BF16,
+                             // RTX 5060 Ti 16 GB path: store the Qwen3.8 27B GDN recurrent
+                             // state as I8 codes with one FP16 scale per (value_head, dv row)
+                             // (element = code * scale). Computation stays in FP32 inside the
+                             // kernels; load-convert-store wraps each kernel. This cuts the
+                             // persistent recurrent footprint from ~72 MiB (BF16) to ~36.6 MiB
+                             // plus a ~0.6 MiB scale plane, which is the difference between a
+                             // ~2300 and ~3300 token context ceiling at 16 GB.
+                             .recurrent_dtype = DType::I8,
                          },
                  });
     if (plan.speculative_backend != SpeculativeBackend::None) {
@@ -646,6 +648,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
+            // RTX 5060 Ti 16 GB path: the MTP3 graph allocation observed at
+            // 1024–1792 contexts is ~2 MiB per batch, so the historical
+            // 12 MiB allowance is over-budget.  Keep a 4 MiB headroom to
+            // accommodate the (verify_window + 1) * 4-byte alignment pad
+            // and the (token_domain) * 4-byte I32 token counter plus the
+            // output_rows * 2-byte BF16 logits tensor; that fits well under
+            // 4 MiB on the measured MTP3 path.  This unlocks 8 MiB of
+            // persistent-room headroom per batch, which is what makes
+            // context > 2048 viable.
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
@@ -653,7 +664,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     const std::uint64_t final_visible = std::min<std::uint64_t>(
                         impl->capacity,
                         static_cast<std::uint64_t>(profile.max) + 2ULL * impl->draft_window);
-                    return (final_visible <= 4096 ? 12ULL : 82ULL) * kMiB;
+                    return (final_visible <= 4096 ? 4ULL : 8ULL) * kMiB;
                 },
                 "MTP graph allowance");
             impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,

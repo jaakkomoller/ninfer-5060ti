@@ -53,6 +53,42 @@ __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane],
     store_vec(dst, packed);
 }
 
+// I8 storage variants: one signed code per element plus one FP16 scale per
+// (value_head, dv row) of kStateDim dk values; element = code * scale. Loads convert
+// code * scale to FP32. Stores expect the caller to have reduced the absolute row max
+// across the full warp (all kStateDim dk values); the row scale is row_max / 127 rounded
+// to FP16, codes are round-to-nearest-even and clamped to [-127, 127].
+__device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const std::int8_t* base,
+                                             std::uint32_t dqk_base, float scale) {
+    const std::uint32_t packed =
+        load_vec<std::uint32_t>(reinterpret_cast<const std::uint32_t*>(base + dqk_base));
+#pragma unroll
+    for (int i = 0; i < kQkPerLane; ++i) {
+        const std::int8_t code = static_cast<std::int8_t>((packed >> (8 * i)) & 0xffU);
+        reg[i] = static_cast<float>(code) * scale;
+    }
+}
+
+__device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane],
+                                              const std::int8_t* base, std::uint32_t dqk_base,
+                                              float row_max, __half* row_scale) {
+    const __half scale16 = __float2half_rn(row_max / 127.0f);
+    const float scale    = __half2float(scale16);
+    std::uint32_t packed = 0;
+#pragma unroll
+    for (int i = 0; i < kQkPerLane; ++i) {
+        int code = 0;
+        if (scale != 0.0f) {
+            code = static_cast<int>(__float2int_rn(reg[i] / scale));
+            if (code > 127) { code = 127; }
+            if (code < -127) { code = -127; }
+        }
+        packed |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(code)) << (8 * i);
+    }
+    store_vec(reinterpret_cast<std::uint32_t*>(const_cast<std::int8_t*>(base) + dqk_base), packed);
+    if (row_scale != nullptr) { *row_scale = scale16; }
+}
+
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_fp32_kernel(const float* __restrict__ q, const float* __restrict__ k,
                           const float* __restrict__ v, const float* __restrict__ g,
@@ -240,6 +276,13 @@ __device__ __forceinline__ void readout_and_store(float (&state)[kDvPerWarp][kQk
     if (lane < kDvPerWarp) { output[dv_base + lane] = __float2bfloat16(attn_val * scale); }
 }
 
+__device__ __forceinline__ float lane_row_max(const float (&row)[kQkPerLane]) {
+    float m = fabsf(row[0]);
+#pragma unroll
+    for (int c = 1; c < kQkPerLane; ++c) { m = fmaxf(m, fabsf(row[c])); }
+    return warp_max(m);
+}
+
 template <bool NormalizeQK, class StateReadPtr, class StateWritePtr>
 __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     recurrent_bf16_direct_kernel(const __nv_bfloat16* __restrict__ q,
@@ -248,6 +291,8 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
                                  const float* __restrict__ beta,
                                  StateReadPtr __restrict__ state_read,
                                  StateWritePtr __restrict__ state_write,
+                                 const __half* __restrict__ state_scale,
+                                 __half* __restrict__ state_scale_out,
                                  __nv_bfloat16* __restrict__ out,
                                  std::int32_t width, head_map heads, float scale) {
     const int lane           = threadIdx.x;
@@ -260,10 +305,24 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     auto read_h = state_read + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
 
     __align__(16) float state[kDvPerWarp][kQkPerLane];
+    if constexpr (std::is_same_v<std::decay_t<StateReadPtr>, const std::int8_t*>) {
+        const __half* read_scale_h = state_scale + static_cast<std::int64_t>(h_v) * kStateDim;
+        float read_scale[kDvPerWarp];
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        load_qk_lane(state[r], read_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
-                     dqk_base);
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            read_scale[r] = __half2float(read_scale_h[dv_base + r]);
+        }
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            load_qk_lane(state[r], read_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
+                         dqk_base, read_scale[r]);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            load_qk_lane(state[r], read_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
+                         dqk_base);
+        }
     }
 
     RawQkLane key = load_raw_qk_lane(k + static_cast<std::int64_t>(h_qk) * kStateDim, dqk_base);
@@ -286,10 +345,20 @@ __global__ void __launch_bounds__(kWarpSize* kNumWarps, 2)
     }
 
     auto write_h = state_write + static_cast<std::int64_t>(h_v) * kStateDim * kStateDim;
+    if constexpr (std::is_same_v<std::decay_t<StateWritePtr>, std::int8_t*>) {
+        __half* write_scale_h = state_scale_out + static_cast<std::int64_t>(h_v) * kStateDim;
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
-                      dqk_base);
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            const float row_max = lane_row_max(state[r]);
+            store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
+                          dqk_base, row_max, lane == 0 ? write_scale_h + dv_base + r : nullptr);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            store_qk_lane(state[r], write_h + static_cast<std::int64_t>(dv_base + r) * kStateDim,
+                          dqk_base);
+        }
     }
 }
 
@@ -329,12 +398,16 @@ __device__ __forceinline__ RecurrentCoordinates make_coordinates(std::int32_t ba
 
 template <bool Batched, bool Masked, class StatePtr = float>
 struct SnapshotAccess {
+    using state_ptr_t = StatePtr;
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
     StatePtr states;
+    // FP16 per-(value_head, dv row) scale plane [value_head_dim, value_heads, slots]; null for
+    // non-I8 state storage.
+    __half* state_scale;
     const std::int32_t* valid_columns;
     const std::int32_t* initial_slots;
     const std::int32_t* snapshot_bases;
@@ -365,6 +438,24 @@ struct SnapshotAccess {
         return states +
                static_cast<std::int64_t>(initial_slots[coord.batch]) * state_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+    }
+
+    __device__ __forceinline__ std::int64_t scale_slot_stride() const {
+        return static_cast<std::int64_t>(kStateDim) * heads.H_v;
+    }
+
+    __device__ __forceinline__ const __half*
+    state_scale_read_base(const RecurrentCoordinates& coord) const {
+        return state_scale +
+               static_cast<std::int64_t>(initial_slots[coord.batch]) * scale_slot_stride() +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim;
+    }
+
+    __device__ __forceinline__ __half*
+    state_scale_write_base(const RecurrentCoordinates& coord, std::int32_t token) const {
+        return state_scale +
+               static_cast<std::int64_t>(snapshot_bases[coord.batch] + token) * scale_slot_stride() +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim;
     }
 
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
@@ -399,23 +490,39 @@ struct SnapshotAccess {
                          static_cast<std::int64_t>(snapshot_bases[coord.batch] + token) *
                              state_slot_stride +
                          static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+        if constexpr (std::is_same_v<StatePtr, std::int8_t*>) {
+            __half* snapshot_scale = state_scale_write_base(coord, token);
 #pragma unroll
-        for (int r = 0; r < kDvPerWarp; ++r) {
-            store_qk_lane(state[r],
-                          snapshot + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
-                          coord.dqk_base);
+            for (int r = 0; r < kDvPerWarp; ++r) {
+                const float row_max = lane_row_max(state[r]);
+                store_qk_lane(state[r],
+                              snapshot + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                              coord.dqk_base, row_max,
+                              coord.lane == 0 ? snapshot_scale + coord.dv_base + r : nullptr);
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < kDvPerWarp; ++r) {
+                store_qk_lane(state[r],
+                              snapshot + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                              coord.dqk_base);
+            }
         }
     }
 };
 
 template <bool Masked, class StatePtr = float>
 struct RecordAccess {
+    using state_ptr_t = StatePtr;
     const __nv_bfloat16* q;
     const __nv_bfloat16* k;
     const __nv_bfloat16* v;
     const float* g;
     const float* beta;
     StatePtr states;
+    // FP16 per-(value_head, dv row) scale plane [value_head_dim, value_heads, slots] (read-only
+    // for the record pass); null for non-I8 state storage.
+    const __half* state_scale;
     const std::int32_t* valid_columns;
     const std::int32_t* initial_slots;
     __nv_bfloat16* key_record;
@@ -447,6 +554,14 @@ struct RecordAccess {
     state_read_base(const RecurrentCoordinates& coord) const {
         return states + static_cast<std::int64_t>(initial_slots[coord.batch]) * state_slot_stride +
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
+    }
+
+    __device__ __forceinline__ const __half*
+    state_scale_read_base(const RecurrentCoordinates& coord) const {
+        return state_scale +
+               static_cast<std::int64_t>(initial_slots[coord.batch]) *
+                   (static_cast<std::int64_t>(kStateDim) * heads.H_v) +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim;
     }
 
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
@@ -517,13 +632,17 @@ using FoldGeometry24x32 = FoldGeometry<24, 16, 32, 8192>;
 
 template <class Geometry, class StatePtr = float>
 struct FoldAccess {
+    using state_ptr_t = StatePtr;
     const __nv_bfloat16* key_record;
     const __nv_bfloat16* value_record;
     const uint2* gate_record;
     const __nv_bfloat16* conv_record;
     StatePtr recurrent_layer0;
+    // FP16 per-(value_head, dv row) scale plane, layer 0; null for non-I8 state storage.
+    __half* recurrent_scale_layer0;
     __nv_bfloat16* conv_layer0;
     std::int64_t recurrent_layer_stride;
+    std::int64_t recurrent_scale_layer_stride;
     std::int64_t conv_layer_stride;
     std::int32_t record_capacity;
     std::int32_t width;
@@ -568,6 +687,21 @@ struct FoldAccess {
                static_cast<std::int64_t>(coord.value_head) * kStateDim * kStateDim;
     }
 
+    __device__ __forceinline__ __half*
+    state_scale_base(const RecurrentCoordinates& coord) const {
+        const std::int64_t slot_stride =
+            static_cast<std::int64_t>(Geometry::kValueHeads) * kStateDim;
+        return recurrent_scale_layer0 +
+               static_cast<std::int64_t>(coord.layer) * recurrent_scale_layer_stride +
+               static_cast<std::int64_t>(rows.row[coord.batch].linear_state_slot) * slot_stride +
+               static_cast<std::int64_t>(coord.value_head) * kStateDim;
+    }
+
+    __device__ __forceinline__ const __half*
+    state_scale_read_base(const RecurrentCoordinates& coord) const {
+        return state_scale_base(coord);
+    }
+
     __device__ __forceinline__ const __nv_bfloat16* key_ptr(const RecurrentCoordinates& coord,
                                                             std::int32_t token) const {
         const std::int64_t column = record_outer(coord) * width + token;
@@ -590,11 +724,23 @@ struct FoldAccess {
     store_final_state(const RecurrentCoordinates& coord,
                       const float (&state)[kDvPerWarp][kQkPerLane]) const {
         auto* destination = state_read_base(coord);
+        if constexpr (std::is_same_v<StatePtr, std::int8_t*>) {
+            __half* destination_scale = state_scale_base(coord);
 #pragma unroll
-        for (int r = 0; r < kDvPerWarp; ++r) {
-            store_qk_lane(state[r],
-                          destination + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
-                          coord.dqk_base);
+            for (int r = 0; r < kDvPerWarp; ++r) {
+                const float row_max = lane_row_max(state[r]);
+                store_qk_lane(state[r],
+                              destination + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                              coord.dqk_base, row_max,
+                              coord.lane == 0 ? destination_scale + coord.dv_base + r : nullptr);
+            }
+        } else {
+#pragma unroll
+            for (int r = 0; r < kDvPerWarp; ++r) {
+                store_qk_lane(state[r],
+                              destination + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                              coord.dqk_base);
+            }
         }
     }
 
@@ -646,10 +792,25 @@ __device__ __forceinline__ void recurrent_bf16_body(const Access& access,
 
     const auto initial = access.state_read_base(coord);
     __align__(16) float state[kDvPerWarp][kQkPerLane];
+    if constexpr (std::is_same_v<typename Access::state_ptr_t, std::int8_t*> ||
+                  std::is_same_v<typename Access::state_ptr_t, const std::int8_t*>) {
+        const __half* read_scale = access.state_scale_read_base(coord);
+        float read_scale_row[kDvPerWarp];
 #pragma unroll
-    for (int r = 0; r < kDvPerWarp; ++r) {
-        load_qk_lane(state[r], initial + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
-                     coord.dqk_base);
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            read_scale_row[r] = __half2float(read_scale[coord.dv_base + r]);
+        }
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            load_qk_lane(state[r], initial + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                         coord.dqk_base, read_scale_row[r]);
+        }
+    } else {
+#pragma unroll
+        for (int r = 0; r < kDvPerWarp; ++r) {
+            load_qk_lane(state[r], initial + static_cast<std::int64_t>(coord.dv_base + r) * kStateDim,
+                         coord.dqk_base);
+        }
     }
 
     RawQkLane key = load_raw_qk_lane(access.key_ptr(coord, 0), coord.dqk_base);
