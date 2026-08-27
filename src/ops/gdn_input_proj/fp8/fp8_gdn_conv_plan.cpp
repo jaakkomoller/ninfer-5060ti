@@ -173,7 +173,7 @@ void launch_snapshot_plan(const Tensor& x, const Weight& weight, const Tensor& c
     launch_projection(x_flat, weight, scratch.projected, z_flat, plan.schedule, workspace, stream);
 
     Tensor projected(scratch.projected.data, DType::BF16, {kChannels, width, batch});
-    gdn_projected_conv_snapshot_launch(projected, conv_weight, conv_states, valid_columns,
+    gdn_projected_conv_snapshot_launch(projected, conv_weight, conv_states, Tensor{}, valid_columns,
                                        initial_slot, snapshot_base_slot, query, key, value, stream);
 }
 
@@ -196,7 +196,7 @@ void launch_record_plan(const Tensor& x, const Weight& weight, const Tensor& con
     Tensor record_flat(conv_record.data, DType::BF16, {kChannels, aggregate_columns});
     Tensor z_flat(z.data, DType::BF16, {kZRows, aggregate_columns});
     launch_projection(x_flat, weight, record_flat, z_flat, plan.schedule, workspace, stream);
-    gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
+    gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, Tensor{}, valid_columns,
                                      initial_slot, query, key, value, stream);
 }
 

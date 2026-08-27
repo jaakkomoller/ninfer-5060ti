@@ -137,8 +137,8 @@ scale 隐藏在 Vision、Text 或某个 kernel 名称中。
 
 | 使用位置 | geometry | cache/布局 | 迁移后 entry |
 |---|---:|---|---|
-| Qwen3.6-27B Text/MTP | `D256/Hq24/Hkv4` | BF16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
-| Qwen3.6-35B-A3B Text/MTP | `D256/Hq16/Hkv2` | BF16 或 INT8-G64 线性 cache | `causal_softmax_attention` |
+| Qwen3.6-27B Text/MTP | `D256/Hq24/Hkv4` | BF16、INT8-G64 或 INT4-G64 线性 cache | `causal_softmax_attention` |
+| Qwen3.6-35B-A3B Text/MTP | `D256/Hq16/Hkv2` | BF16、INT8-G64 或 INT4-G64 线性 cache | `causal_softmax_attention` |
 | Qwen3.6 Vision | `D72/Hq16/Hkv16` | packed BF16 Q/K/V | `packed_softmax_attention` |
 | Qwen3.6-35B-A3B DFlash full | `D128/Hq32/Hkv8` | 只读 BF16 context + query K/V | `context_softmax_attention` |
 | Qwen3.6-35B-A3B DFlash local | `D128/Hq32/Hkv8` | 只读 BF16 cyclic context + query K/V | `sliding_window_attention` |
@@ -532,7 +532,7 @@ Oracle 必须从 geometry 和 entry 可见集合计算 Head 映射，不复制�
 必须覆盖：
 
 - 四个当前注册 geometry；
-- BF16 与 INT8-G64 causal cache profile；
+- BF16、INT8-G64 与 INT4-G64 causal cache profile；
 - append-and-attend、cached-only 和 standalone append；
 - plain single-segment entry，以及 packed 非等长与等长 segments；
 - context 为零和非零时的 context+query 可见域；

@@ -647,6 +647,16 @@ struct FoldAccess {
     std::int32_t record_capacity;
     std::int32_t width;
     GdnReplayFoldKernelRows rows;
+    // I8 conv state only: the FP16 conv scale plane, layer 0 (null for BF16 conv
+    // storage). The plane is slot-major: slot s owns the contiguous [groups] block
+    // [s * conv_scale_groups, (s + 1) * conv_scale_groups), element (group, slot) at
+    // slot * conv_scale_groups + group. When non-null, conv_layer0 holds I8 codes (one
+    // byte per element) and conv_layer_stride is in two-byte units; conv history is
+    // published as shifted codes plus the record values quantized under the slot's
+    // group scale, which is read-only and sticky.
+    const __half* conv_scale_layer0;
+    std::int64_t conv_scale_layer_stride;
+    std::int32_t conv_scale_groups;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
@@ -752,33 +762,80 @@ struct FoldAccess {
 
         const std::int32_t tid     = coord.warp * kWarpSize + coord.lane;
         const std::int32_t channel = tile_block * 128 + tid;
-        __nv_bfloat16* history =
-            conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
-            static_cast<std::int64_t>(rows.row[coord.batch].linear_state_slot) *
-                (3LL * Geometry::kConvChannels) +
-            channel;
+        if (conv_scale_layer0 == nullptr) {
+            __nv_bfloat16* history =
+                conv_layer0 + static_cast<std::int64_t>(coord.layer) * conv_layer_stride +
+                static_cast<std::int64_t>(rows.row[coord.batch].linear_state_slot) *
+                    (3LL * Geometry::kConvChannels) +
+                channel;
+            const __nv_bfloat16* record =
+                conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;
+
+            __nv_bfloat16 h0;
+            __nv_bfloat16 h1;
+            __nv_bfloat16 h2;
+            if (commit == 1) {
+                h0 = history[Geometry::kConvChannels];
+                h1 = history[2LL * Geometry::kConvChannels];
+                h2 = record[0];
+            } else if (commit == 2) {
+                h0 = history[2LL * Geometry::kConvChannels];
+                h1 = record[0];
+                h2 = record[Geometry::kConvChannels];
+            } else {
+                h0 = record[static_cast<std::int64_t>(commit - 3) * Geometry::kConvChannels];
+                h1 = record[static_cast<std::int64_t>(commit - 2) * Geometry::kConvChannels];
+                h2 = record[static_cast<std::int64_t>(commit - 1) * Geometry::kConvChannels];
+            }
+            history[0]                             = h0;
+            history[Geometry::kConvChannels]       = h1;
+            history[2LL * Geometry::kConvChannels] = h2;
+            return;
+        }
+
+        // I8 conv storage: the per-(128-channel group, slot) FP16 scale is read-only and sticky;
+        // old codes shift verbatim and only the incoming record taps are quantized under the
+// slot's group scale. Code layer stride is stored in two-byte units; for I8 storage each
+        // code is one byte, so the per-layer code count is 2 * conv_layer_stride. The per-slot
+        // layout is tap-major [3, C]: tap h of channel c sits at slot * 3*C + h*C + c.
+        constexpr std::int64_t kSlotStride = 3LL * Geometry::kConvChannels;
+        constexpr std::int64_t kTapStride  = Geometry::kConvChannels;
+        const std::int32_t slot            = rows.row[coord.batch].linear_state_slot;
+        std::int8_t* codes = reinterpret_cast<std::int8_t*>(conv_layer0) +
+                              static_cast<std::int64_t>(coord.layer) * (2 * conv_layer_stride) +
+                              static_cast<std::int64_t>(slot) * kSlotStride + channel;
         const __nv_bfloat16* record =
             conv_record + record_outer(coord) * width * Geometry::kConvChannels + channel;
+        const float scale =
+            __half2float(conv_scale_layer0[static_cast<std::int64_t>(coord.layer) *
+                                               conv_scale_layer_stride +
+                                           static_cast<std::int64_t>(slot) * conv_scale_groups +
+                                           tile_block]);
+        const auto q = [&record, scale](std::int32_t token) {
+            return i8_quantize(__bfloat162float(record[static_cast<std::int64_t>(token) *
+                                                       Geometry::kConvChannels]),
+                               scale);
+        };
 
-        __nv_bfloat16 h0;
-        __nv_bfloat16 h1;
-        __nv_bfloat16 h2;
+        std::int8_t h0;
+        std::int8_t h1;
+        std::int8_t h2;
         if (commit == 1) {
-            h0 = history[Geometry::kConvChannels];
-            h1 = history[2LL * Geometry::kConvChannels];
-            h2 = record[0];
+            h0 = codes[kTapStride];
+            h1 = codes[2 * kTapStride];
+            h2 = q(0);
         } else if (commit == 2) {
-            h0 = history[2LL * Geometry::kConvChannels];
-            h1 = record[0];
-            h2 = record[Geometry::kConvChannels];
+            h0 = codes[2 * kTapStride];
+            h1 = q(0);
+            h2 = q(1);
         } else {
-            h0 = record[static_cast<std::int64_t>(commit - 3) * Geometry::kConvChannels];
-            h1 = record[static_cast<std::int64_t>(commit - 2) * Geometry::kConvChannels];
-            h2 = record[static_cast<std::int64_t>(commit - 1) * Geometry::kConvChannels];
+            h0 = q(commit - 3);
+            h1 = q(commit - 2);
+            h2 = q(commit - 1);
         }
-        history[0]                             = h0;
-        history[Geometry::kConvChannels]       = h1;
-        history[2LL * Geometry::kConvChannels] = h2;
+        codes[0]             = h0;
+        codes[kTapStride]    = h1;
+        codes[2 * kTapStride] = h2;
     }
 };
 

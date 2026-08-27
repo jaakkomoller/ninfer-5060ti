@@ -244,6 +244,10 @@ private:
     // GDN recurrence ops consume; empty for FP32/BF16 storage.
     [[nodiscard]] Tensor gdn_state_scale_slot(std::uint32_t layer, std::int32_t slot) const;
     [[nodiscard]] Tensor gdn_state_scale_layer(std::uint32_t layer) const;
+    // I8 conv state only: the FP16 per-128-channel-group scale backing the conv window the GDN
+    // conv ops consume; empty for BF16 conv storage.
+    [[nodiscard]] Tensor gdn_conv_scale_slot(std::uint32_t layer, std::int32_t slot) const;
+    [[nodiscard]] Tensor gdn_conv_scale_layer(std::uint32_t layer) const;
     void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>

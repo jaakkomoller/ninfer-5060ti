@@ -36,7 +36,6 @@ struct DFlashPersistentLayout {
 
 struct PersistentLayout {
     qwen3_6::DecoderStateLayout decoder;
-    std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
     qwen3_6::RoundStateLayout round;
     TensorLayout prefill_hidden;
@@ -57,6 +56,13 @@ struct WorkspacePlan {
     std::size_t dflash_round   = 0;
     std::size_t vision_encode  = 0;
     std::size_t capacity       = 0;
+    // ReplaySSM records live in the workspace arena, not the persistent arena: they are written
+    // by the speculative target pass of one round and consumed by the replay fold at the next
+    // round boundary, so their lifetime is round-scoped. The plane layout is 0-based relative to
+    // the arena offset replay_records_base, which sits past every scratch allocation of the
+    // speculative round region so no round pass can alias a live record.
+    std::optional<GdnReplayRecordLayout> replay_records;
+    std::size_t replay_records_base = 0;
 };
 
 struct SequencePlanningInputs {

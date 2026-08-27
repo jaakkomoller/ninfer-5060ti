@@ -2,6 +2,7 @@
 
 #include "ops/input_projection_test_common.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -462,7 +463,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
     ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv, conv_state,
-                                      Tensor{}, initial, snapshot_base, q, k, v, z_output,
+                                      Tensor{}, Tensor{}, initial, snapshot_base, q, k, v, z_output,
                                       workspace, nullptr);
     cuda_synchronize();
 
@@ -550,11 +551,320 @@ int run_q4_q5() {
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace) {
             ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv,
-                                              state, valid, initial, snapshot_base, q, k, v, z,
-                                              workspace, nullptr);
+                                              state, Tensor{}, valid, initial, snapshot_base, q, k,
+                                              v, z, workspace, nullptr);
         });
     failures += query_key.verify_preserved("batched Q4/Q5 query/key weight");
     failures += value_z_weight.verify_preserved("batched Q4/Q5 value/z weight");
+    return failures;
+}
+
+// ===== I8 conv state form (two-parent Q4/Q5) =====================================
+// conv_states is I8 codes plus one FP16 scale per (128-channel group, slot). History taps
+// dequantize exactly (code * scale), stored codes shift verbatim into the published slots,
+// and only the incoming projected value is quantized under the sticky slot scale. Published
+// snapshot slots copy the source slot's group scale; every other scale entry is unchanged.
+
+std::uint16_t f32_to_fp16_rne(float f) { return __half_as_ushort(__float2half_rn(f)); }
+
+float fp16_bits_to_f32(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+
+std::int8_t i8_reference_code(float value, float scale) {
+    if (scale == 0.0F) { return 0; }
+    // FP32 division + RNE integer rounding, emulated exactly from the FP32-exact inputs.
+    const float quotient = static_cast<float>(value / scale);
+    double code          = std::nearbyint(static_cast<double>(quotient));
+    if (code > 127.0) { code = 127.0; }
+    if (code < -127.0) { code = -127.0; }
+    return static_cast<std::int8_t>(code);
+}
+
+struct I8InitialWindow {
+    std::vector<std::int8_t> codes;        // tap-major [3, C]
+    std::vector<std::uint16_t> scale_bits; // [C/128]
+    std::vector<float> decoded;            // exact dequantization, tap-major [3, C]
+};
+
+I8InitialWindow make_i8_initial(std::int32_t channels, std::uint32_t seed) {
+    const std::size_t slot_stride = static_cast<std::size_t>(channels) * 3;
+    std::vector<float> logical(slot_stride);
+    // The sticky slot scale is derived from the stored window, so the initial window must sit at
+    // the projected values' magnitude (the patterned projections here reach ~9); a far smaller
+    // window would clamp every incoming tap and hide the quantization the test must verify.
+    fill_uniform(logical, seed, -12.0F, 12.0F);
+    round_to_bf16(logical);
+
+    I8InitialWindow result;
+    result.codes.assign(slot_stride, 0);
+    const std::int32_t groups = channels / 128;
+    result.scale_bits.assign(static_cast<std::size_t>(groups), 0U);
+    result.decoded.assign(slot_stride, 0.0F);
+    for (std::int32_t g = 0; g < groups; ++g) {
+        const std::int32_t c_begin = g * 128;
+        double max_abs             = 0.0;
+        for (std::int32_t c = c_begin; c < c_begin + 128; ++c) {
+            for (std::int32_t s = 0; s < 3; ++s) {
+                max_abs = std::max(
+                    max_abs, static_cast<double>(std::fabs(
+                                 logical[static_cast<std::size_t>(s) * channels + c])));
+            }
+        }
+        const std::uint16_t scale_bits = f32_to_fp16_rne(static_cast<float>(max_abs / 127.0));
+        const float scale              = fp16_bits_to_f32(scale_bits);
+        result.scale_bits[static_cast<std::size_t>(g)] = scale_bits;
+        for (std::int32_t c = c_begin; c < c_begin + 128; ++c) {
+            for (std::int32_t s = 0; s < 3; ++s) {
+                const std::size_t index = static_cast<std::size_t>(s) * channels + c;
+                result.codes[index]     = i8_reference_code(logical[index], scale);
+                result.decoded[index]   = static_cast<float>(result.codes[index]) * scale;
+            }
+        }
+    }
+    return result;
+}
+
+int run_q4_q5_i8_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
+                      std::int32_t tokens, std::int32_t initial_slot) {
+    constexpr std::int32_t kHidden           = 5120;
+    constexpr std::int32_t kValueRows        = 6144;
+    constexpr std::int32_t kZRows            = 6144;
+    constexpr std::int32_t kChannels         = 10240;
+    constexpr std::int32_t kGroups           = kChannels / 128;
+    constexpr std::int32_t kSnapshotBaseSlot = 1;
+    const std::int32_t slots                 = std::max(tokens + 2, initial_slot + 1);
+    const std::size_t slot_stride            = static_cast<std::size_t>(kChannels) * 3;
+    const std::vector<float> activation      =
+        make_bf16_activation(kHidden, tokens, 7101U + tokens);
+    const std::vector<std::uint16_t> activation_bits  = bf16_bits(activation);
+    const std::vector<float> conv_weight              = make_conv_weight(kChannels, 7107U);
+    const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+    const I8InitialWindow initial = make_i8_initial(kChannels, 7113U + tokens);
+
+    std::vector<std::int8_t> codes(slot_stride * slots, 0x7e);
+    std::vector<std::uint16_t> scale_bits(static_cast<std::size_t>(kGroups) * slots, 0x0001U);
+    for (std::int32_t s = 0; s < 3; ++s) {
+        std::copy(initial.codes.begin() + s * kChannels, initial.codes.begin() + (s + 1) * kChannels,
+                  codes.begin() + static_cast<std::ptrdiff_t>(initial_slot) * slot_stride +
+                      s * kChannels);
+    }
+    // The scale plane is slot-major: slot s owns the contiguous [groups] block
+    // [s * groups, (s + 1) * groups), element (group, slot) at slot * groups + group.
+    for (std::int32_t g = 0; g < kGroups; ++g) {
+        scale_bits[static_cast<std::size_t>(initial_slot) * kGroups + g] =
+            initial.scale_bits[static_cast<std::size_t>(g)];
+    }
+    const std::vector<std::int32_t> initial_value{initial_slot};
+    const std::vector<std::int32_t> snapshot_base_value{kSnapshotBaseSlot};
+
+    DeviceBuffer device_activation    = to_device(activation_bits);
+    DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
+    DeviceBuffer device_codes(codes.size());
+    DeviceBuffer device_scale(scale_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer device_initial       = to_device(initial_value);
+    DeviceBuffer device_snapshot_base = to_device(snapshot_base_value);
+    device_codes.copy_from_host(codes.data(), codes.size());
+    device_scale.copy_from_host(scale_bits.data(), device_scale.bytes);
+    GuardedBf16Tensor query(kQueryRows, tokens);
+    GuardedBf16Tensor key(kKeyRows, tokens);
+    GuardedBf16Tensor value(kValueRows, tokens);
+    GuardedBf16Tensor z(kZRows, tokens);
+    Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor conv_state(device_codes.p, DType::I8, {kChannels, 3, slots});
+    Tensor conv_scale(device_scale.p, DType::FP16, {kGroups, 1, slots});
+    Tensor initial_tensor(device_initial.p, DType::I32, {1});
+    Tensor snapshot_base_tensor(device_snapshot_base.p, DType::I32, {1});
+    Tensor q        = query.tensor();
+    Tensor k        = key.tensor();
+    Tensor v        = value.tensor();
+    Tensor z_output = z.tensor();
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+        kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
+
+    ops::gdn_input_proj_conv_snapshot(x, query_key.view(), value_z_weight.view(), conv, conv_state,
+                                      conv_scale, Tensor{}, initial_tensor, snapshot_base_tensor,
+                                      q, k, v, z_output, workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " Q4/Q5 I8 T=" + std::to_string(tokens) +
+                               " initial=" + std::to_string(initial_slot) +
+                               " base=" + std::to_string(kSnapshotBaseSlot);
+    int failures = 0;
+    const auto project = [&](std::int32_t global_row, std::int32_t token) {
+        const float* token_activation =
+            activation.data() + static_cast<std::size_t>(token) * kHidden;
+        if (global_row < kQueryRows + kKeyRows) {
+            return quantized_weight::dot_fp64(query_key.host, global_row, token_activation,
+                                              kHidden);
+        }
+        return quantized_weight::dot_fp64(
+            value_z_weight.host, global_row - kQueryRows - kKeyRows, token_activation, kHidden);
+    };
+
+    // FP64 conv/SiLU oracle over the exactly dequantized initial window.
+    const std::int32_t sample_count               = snapshot_sample_count(tokens);
+    const std::vector<std::int32_t> query_rows    = sampled_rows(kQueryRows, sample_count);
+    const std::vector<std::int32_t> key_rows      = sampled_rows(kKeyRows, sample_count);
+    const std::vector<std::int32_t> value_rows    = sampled_rows(kValueRows, sample_count);
+    std::vector<double> ref_query, ref_key, ref_value;
+    const auto run_row = [&](std::int32_t global_row, std::vector<double>& output) {
+        double state0       = initial.decoded[global_row];
+        double state1       = initial.decoded[static_cast<std::size_t>(kChannels) + global_row];
+        double state2       = initial.decoded[2ULL * kChannels + global_row];
+        const double w0     = conv_weight[global_row];
+        const double w1     = conv_weight[static_cast<std::size_t>(kChannels) + global_row];
+        const double w2     = conv_weight[2ULL * kChannels + global_row];
+        const double w3     = conv_weight[3ULL * kChannels + global_row];
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const double projected = project(global_row, token);
+            output.push_back(
+                silu_fp64(w0 * state0 + w1 * state1 + w2 * state2 + w3 * projected));
+            state0  = state1;
+            state1  = state2;
+            state2  = projected;
+        }
+    };
+    for (const std::int32_t row : query_rows) { run_row(row, ref_query); }
+    for (const std::int32_t row : key_rows) { run_row(kQueryRows + row, ref_key); }
+    for (const std::int32_t row : value_rows) {
+        run_row(kQueryRows + kKeyRows + row, ref_value);
+    }
+    const SnapshotOracle oracle{ref_query, ref_key, ref_value, {}};
+    failures += verify_snapshot_outputs(suffix, query, key, value, kValueRows, tokens, oracle);
+
+    // Published slots carry the verbatim-shifted stored codes and the sticky group scale;
+    // every other scale entry is unchanged.
+    const std::vector<std::int8_t> codes_after =
+        from_device<std::int8_t>(device_codes, codes.size());
+    const std::vector<std::uint16_t> scale_after =
+        from_device<std::uint16_t>(device_scale, scale_bits.size());
+    int scale_mismatches = 0;
+    for (std::int32_t g = 0; g < kGroups; ++g) {
+        for (std::int32_t slot = 0; slot < slots; ++slot) {
+            const std::size_t index = static_cast<std::size_t>(slot) * kGroups + g;
+            const std::uint16_t expected =
+                (slot >= kSnapshotBaseSlot && slot < kSnapshotBaseSlot + tokens)
+                    ? initial.scale_bits[static_cast<std::size_t>(g)]
+                    : scale_bits[index];
+            if (scale_after[index] != expected) {
+                if (scale_mismatches < 8) {
+                    std::cerr << suffix << ": scale mismatch group=" << g << " slot=" << slot
+                              << " got=0x" << std::hex << scale_after[index] << " expected=0x"
+                              << expected << std::dec << "\n";
+                }
+                ++scale_mismatches;
+            }
+        }
+    }
+    if (scale_mismatches > 0) {
+        std::cerr << suffix << ": " << scale_mismatches << " conv scale entries mismatch\n";
+        ++failures;
+    }
+
+    // The window after token t stores v_{t+1..t+3}; v_j is the initial code j (j < 3, exact)
+    // or the quantization of the projected value at token j - 3 (checked against the FP64
+    // projection under the route's A16 bound plus one half-quantum).
+    const auto verify_sampled_row = [&](std::int32_t global_row) {
+        const float scale = fp16_bits_to_f32(initial.scale_bits[global_row / 128]);
+        for (std::int32_t token = 0; token < tokens; ++token) {
+            const std::int64_t slot_base =
+                static_cast<std::int64_t>(kSnapshotBaseSlot + token) *
+                static_cast<std::int64_t>(slot_stride);
+            for (std::int32_t tap = 0; tap < 3; ++tap) {
+                const std::int32_t j = token + 1 + tap;
+                const std::int8_t got = codes_after[static_cast<std::size_t>(slot_base) +
+                                                    static_cast<std::size_t>(tap) * kChannels +
+                                                    global_row];
+                if (j < 3) {
+                    const std::int8_t expected = initial.codes[static_cast<std::size_t>(j) *
+                                                                  kChannels +
+                                                              global_row];
+                    if (got != expected) {
+                        std::cerr << suffix << ": verbatim code mismatch row=" << global_row
+                                  << " slot=" << kSnapshotBaseSlot + token << " tap=" << tap
+                                  << " got=" << (int)got << " expected=" << (int)expected
+                                  << "\n";
+                        return 1;
+                    }
+                } else {
+                    const double projected = project(global_row, j - 3);
+                    const double dequant   = static_cast<double>(got) * scale;
+                    const double bound     = 0.5 * scale + 3.4e-3 * std::fabs(projected);
+                    if (std::fabs(dequant - projected) > bound) {
+                        std::cerr << suffix << ": quantized tap mismatch row=" << global_row
+                                  << " slot=" << kSnapshotBaseSlot + token << " tap=" << tap
+                                  << " dequant=" << dequant << " reference=" << projected
+                                  << " bound=" << bound << "\n";
+                        return 1;
+                    }
+                }
+            }
+        }
+        return 0;
+    };
+    for (const std::int32_t row : query_rows) { failures += verify_sampled_row(row); }
+    for (const std::int32_t row : key_rows) { failures += verify_sampled_row(kQueryRows + row); }
+    for (const std::int32_t row : value_rows) {
+        failures += verify_sampled_row(kQueryRows + kKeyRows + row);
+    }
+
+    // Unpublished slots (including the read-only initial slot) keep their exact codes.
+    int untouched_mismatches = 0;
+    for (std::int32_t slot = 0; slot < slots; ++slot) {
+        if (slot >= kSnapshotBaseSlot && slot < kSnapshotBaseSlot + tokens) { continue; }
+        const std::size_t base = static_cast<std::size_t>(slot) * slot_stride;
+        for (std::size_t index = 0; index < slot_stride; ++index) {
+            if (codes_after[base + index] != codes[base + index]) {
+                if (untouched_mismatches < 8) {
+                    std::cerr << suffix << ": unpublished slot " << slot << " code " << index
+                              << " was modified\n";
+                }
+                ++untouched_mismatches;
+            }
+        }
+    }
+    if (untouched_mismatches > 0) {
+        std::cerr << suffix << ": " << untouched_mismatches << " unpublished code entries "
+                     "modified\n";
+        ++failures;
+    }
+
+    failures += z.verify_guards("snapshot I8 z" + suffix);
+    failures += z.verify_fully_written("snapshot I8 z" + suffix);
+    failures += compare(
+        "snapshot I8 z" + suffix, gather_rows(z.values(), kZRows, 0, kZRows, tokens),
+        projection_oracle(value_z_weight.host, kValueRows, kZRows, activation, kHidden, tokens),
+        kGdnInputProjConvSnapshotA16Tolerance);
+    failures += verify_preserved("snapshot I8 x" + suffix, device_activation, activation_bits);
+    failures += verify_preserved("snapshot I8 conv weight" + suffix, device_conv_weight,
+                                 conv_weight_bits);
+    failures += verify_preserved("snapshot I8 initial slot" + suffix, device_initial,
+                                 initial_value);
+    failures += verify_preserved("snapshot I8 base slot" + suffix, device_snapshot_base,
+                                 snapshot_base_value);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "snapshot" << suffix << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int run_q4_q5_i8() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 7117U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 7119U));
+    int failures = 0;
+    // Every fused Small-T extent plus the T=4 composed route, with the same slot layout as the
+    // BF16 qualification (initial slot outside the published interval).
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7}) {
+        const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
+        failures += run_q4_q5_i8_case(query_key, value_z_weight, tokens, initial_slot);
+    }
+    failures += query_key.verify_preserved("I8 Q4/Q5 query/key weight");
+    failures += value_z_weight.verify_preserved("I8 Q4/Q5 value/z weight");
     return failures;
 }
 
@@ -597,8 +907,8 @@ int run_w8_case(DevicePackedWeight& parent, std::int32_t tokens, std::int32_t in
         kQueryRows, kKeyRows, kValueRows, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
 
-    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
-                                      snapshot_base, q, k, v, z_output, workspace, nullptr);
+ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, Tensor{}, initial,
+                                       snapshot_base, q, k, v, z_output, workspace, nullptr);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -676,8 +986,8 @@ int run_w8() {
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace) {
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, workspace, nullptr);
+ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, Tensor{}, valid, initial,
+                                               snapshot_base, q, k, v, z, workspace, nullptr);
         });
     failures += parent.verify_preserved("batched W8 parent weight");
     return failures;
@@ -725,8 +1035,8 @@ int run_nvfp4_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearP
         QType::NVFP4, kRows, kHidden, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
-    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
-                                      snapshot_base, q, k, v, z_output, policy, workspace, nullptr);
+ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, Tensor{}, initial,
+                                       snapshot_base, q, k, v, z_output, policy, workspace, nullptr);
     cuda_synchronize();
 
     const std::size_t initial_base = static_cast<std::size_t>(initial_slot) * 3 * kChannels;
@@ -815,9 +1125,9 @@ int run_nvfp4() {
         [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
             const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
             Tensor& z, WorkspaceArena& workspace) {
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                              snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
-                                              workspace, nullptr);
+ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, Tensor{}, valid, initial,
+                                               snapshot_base, q, k, v, z, ops::LinearPolicy::AllowA4,
+                                               workspace, nullptr);
         });
     failures += parent.verify_preserved("batched NVFP4 parent weight");
     return failures;
@@ -869,13 +1179,14 @@ int run_fp8_case(DevicePackedWeight& parent, std::int32_t tokens, ops::LinearPol
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, 1, tokens, tokens);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
-    if (convenience) {
-        ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
-                                          snapshot_base, q, k, v, z_output, workspace, nullptr);
+if (convenience) {
+        ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, Tensor{},
+                                           initial, snapshot_base, q, k, v, z_output, workspace,
+                                           nullptr);
     } else {
-        ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, initial,
-                                          snapshot_base, q, k, v, z_output, policy, workspace,
-                                          nullptr);
+        ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{}, Tensor{},
+                                           initial, snapshot_base, q, k, v, z_output, policy,
+                                           workspace, nullptr);
     }
     cuda_synchronize();
 
@@ -974,9 +1285,9 @@ int run_fp8() {
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid, initial,
-                                                  snapshot_base, q, k, v, z,
-                                                  ops::LinearPolicy::AllowA8, workspace, nullptr);
+ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, Tensor{}, valid, initial,
+                                                   snapshot_base, q, k, v, z,
+                                                   ops::LinearPolicy::AllowA8, workspace, nullptr);
             });
     };
     failures += run_batched(4, 2, {4, 2}, 937U);
@@ -1045,6 +1356,7 @@ int main() {
         ++failures;
     }
     failures += run_q4_q5();
+    failures += run_q4_q5_i8();
     failures += run_w8();
     failures += run_nvfp4();
     failures += run_fp8();

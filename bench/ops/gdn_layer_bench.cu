@@ -315,7 +315,7 @@ Result run_case(Resources& resources, ninfer::DeviceBuffer& flush, cudaStream_t 
         }
         if (options.route == "fused") {
             ops::gdn_input_proj_conv_snapshot(
-                hidden, resources.input_weight.weight, conv_weight, conv_states, Tensor{},
+                hidden, resources.input_weight.weight, conv_weight, conv_states, Tensor{}, Tensor{},
                 initial_slot, snapshot_base_slot, q, k, v, z, resources.workspace, s);
         } else {
             ops::gdn_input_proj(hidden, resources.input_weight.weight, qkv, z, s);

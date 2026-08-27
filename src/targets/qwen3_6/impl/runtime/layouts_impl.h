@@ -4,6 +4,7 @@
 #include "targets/qwen3_6/impl/runtime/vision_context.h"
 #include "targets/qwen3_6/impl/runtime/workspace_recipe.h"
 
+#include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/gdn_gating_proj.h"
@@ -17,7 +18,10 @@
 #include "ninfer/ops/swa.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <iomanip>
 #include <initializer_list>
+#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -129,8 +133,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              .value_heads    = TextConfig::gdn_value_heads,
                              .value_head_dim = TextConfig::gdn_value_head_dim,
                              .key_head_dim   = TextConfig::gdn_key_head_dim,
-                             .slot_count     = linear_state_slots,
-                             .conv_dtype     = DType::BF16,
+.slot_count     = linear_state_slots,
+                              // The Q4/Q5 groupwise-int payloads store the GDN conv window as I8
+                              // codes with one sticky FP16 scale per 128-channel group and slot
+                              // (element = code * scale), cutting the persistent conv footprint
+                              // in half; the other packages and the NVFP4 payloads keep BF16.
+                              .conv_dtype     = Variant::linear_attention_conv_dtype(
+                                  plan.weights_profile),
                              // RTX 5060 Ti 16 GB path: store the Qwen3.8 27B GDN recurrent
                              // state as I8 codes with one FP16 scale per (value_head, dv row)
                              // (element = code * scale). Computation stays in FP32 inside the
@@ -138,22 +147,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                              // persistent recurrent footprint from ~72 MiB (BF16) to ~36.6 MiB
                              // plus a ~0.6 MiB scale plane, which is the difference between a
                              // ~2300 and ~3300 token context ceiling at 16 GB.
-                             .recurrent_dtype = DType::I8,
-                         },
-                 });
-    if (plan.speculative_backend != SpeculativeBackend::None) {
-        out.replay_records = plan_gdn_replay_records(
-            builder, GdnReplayRecordSpec{
-                         .layers          = TextConfig::gdn_layers(),
-                         .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
-                         .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
-                         .conv_channels   = TextConfig::convolution_dim,
-                         .qk_heads        = TextConfig::gdn_key_heads,
-                         .value_heads     = TextConfig::gdn_value_heads,
-                         .key_dim         = TextConfig::gdn_key_head_dim,
-                         .value_dim       = TextConfig::gdn_value_head_dim,
-                     });
-    }
+.recurrent_dtype = DType::I8,
+                          },
+                  });
     if constexpr (Variant::supports_dflash) {
         if (plan.features.dflash()) {
             DFlashPersistentLayout& dflash = out.dflash.emplace();
@@ -525,9 +521,38 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                         TextConfig::token_domain, drafts, drafts, batch, batch);
                 const std::size_t proposal = dflash_proposal_capacity(verify, batch);
                 out.dflash_round           = std::max({out.dflash_round, finish(target), accept,
-                                                       dflash_context_capacity(aggregate, true), proposal});
+                                                        dflash_context_capacity(aggregate, true), proposal});
             }
         }
+    }
+
+    if (plan.speculative_backend != SpeculativeBackend::None) {
+        // The ReplaySSM record pool is round-scoped: its target pass writes it and the replay fold
+        // of the next round boundary reads it, with no other round pass touching the bytes in
+        // between. It therefore shares the workspace arena. The record planes are placed at a
+        // fixed base past the speculative round region's scratch peak, so every round pass
+        // (whose allocations stay within that peak) is disjoint from a live record, and the base
+        // is stable across CUDA Graph replays.
+        std::size_t& round_region =
+            plan.speculative_backend == SpeculativeBackend::Mtp ? out.mtp_round
+                                                                : out.dflash_round;
+        LayoutBuilder record_builder;
+        out.replay_records = plan_gdn_replay_records(
+            record_builder, GdnReplayRecordSpec{
+                                .layers          = TextConfig::gdn_layers(),
+                                .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                                .width           = static_cast<std::int32_t>(plan.draft_window + 1U),
+                                .conv_channels   = TextConfig::convolution_dim,
+                                .qk_heads        = TextConfig::gdn_key_heads,
+                                .value_heads     = TextConfig::gdn_value_heads,
+                                .key_dim         = TextConfig::gdn_key_head_dim,
+                                .value_dim       = TextConfig::gdn_value_head_dim,
+                            });
+        if (round_region % 256 != 0) {
+            throw std::logic_error("speculative round region peak is not record-aligned");
+        }
+        out.replay_records_base = round_region;
+        round_region += out.replay_records->payload_bytes();
     }
 
     if (plan.features.vision) {
@@ -609,8 +634,100 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     }
 }
 
+// Off-by-default byte-level breakdown of a sequence plan's persistent and transient
+// reservations, for VRAM accounting. Enable with NINFER_MEM_BREAKDOWN=1. Every value is read
+// straight off the checked layout, so the table is exact (no estimates).
+bool mem_breakdown_enabled() noexcept {
+    static const bool enabled = std::getenv("NINFER_MEM_BREAKDOWN") != nullptr;
+    return enabled;
+}
+
+std::size_t sum_layout_regions(const std::vector<LayoutRegion>& regions) {
+    std::size_t total = 0;
+    for (const auto& r : regions) { total += r.bytes; }
+    return total;
+}
+
+void dump_memory_breakdown(const SequencePlanImpl& impl) {
+    if (!mem_breakdown_enabled()) { return; }
+    const auto& p   = impl.persistent;
+    const auto& lin = p.decoder.linear_attention;
+    const auto& rnd = p.round;
+
+    std::size_t round_bytes = rnd.token.region.bytes + rnd.pos.region.bytes +
+                              rnd.rope_pos.region.bytes + rnd.rope_delta.region.bytes +
+                              rnd.logits.region.bytes + rnd.text_kv_table_row.region.bytes +
+                              rnd.backend_kv_table_row.region.bytes;
+    if (rnd.ordinary) {
+        round_bytes += rnd.ordinary->ingress.bytes + rnd.ordinary->egress.bytes +
+                       rnd.ordinary->logits.region.bytes + rnd.ordinary->hidden.region.bytes;
+    }
+    if (rnd.mtp) {
+        round_bytes += rnd.mtp->position.region.bytes + rnd.mtp->ar_hidden.region.bytes +
+                       rnd.mtp->draft_tokens.region.bytes + rnd.mtp->target_input_ids.region.bytes +
+                       rnd.mtp->target_positions.region.bytes;
+    }
+    if (rnd.mtp_decode) {
+        const auto& m = *rnd.mtp_decode;
+        round_bytes += m.ingress.bytes + m.egress.bytes + m.verify_ids.region.bytes +
+                       m.target_positions.region.bytes + m.target_argmax.region.bytes +
+                       m.target_logits.region.bytes + m.target_hidden.region.bytes +
+                       m.target_continuation_hidden.region.bytes + m.proposal_logits.region.bytes +
+                       m.alignment_ids.region.bytes + m.alignment_hidden.region.bytes +
+                       m.ar_hidden.region.bytes + m.next_hidden.region.bytes +
+                       m.ar_positions.region.bytes + m.ar_rope_positions.region.bytes +
+                       m.ar_valid_columns.region.bytes;
+    }
+
+    const std::size_t text_kv_payload = p.decoder.text_kv.payload_bytes();
+    const std::size_t text_kv_meta    = p.decoder.text_kv.pool.metadata_bytes();
+    const std::size_t mtp_kv_payload  = p.decoder.mtp_kv ? p.decoder.mtp_kv->payload_bytes() : 0;
+    const std::size_t mtp_kv_meta     = p.decoder.mtp_kv ? p.decoder.mtp_kv->pool.metadata_bytes() : 0;
+
+    auto line = [](const char* label, std::size_t bytes) {
+        std::cerr << "  " << std::left << std::setw(36) << label << std::right << bytes
+                  << " B  (" << (bytes / 1048576.0) << " MiB)\n";
+    };
+    const char* kv_name =
+        impl.kv_dtype == DType::I4 ? "int4" : (impl.kv_dtype == DType::I8 ? "int8" : "bf16");
+    std::cerr << "[mem-breakdown] cap=" << impl.capacity << " pages=" << impl.main_page_groups
+              << " chunk=" << impl.prefill_chunk << " kv=" << kv_name << " mtp="
+              << (impl.features.mtp() ? 1 : 0) << " prefix_reuse="
+              << (impl.persistent_prefix_reuse ? 1 : 0) << " concurrency=" << impl.max_concurrency
+              << "\n";
+    line("persistent.text_kv.payload", text_kv_payload);
+    line("persistent.text_kv.metadata", text_kv_meta);
+    line("persistent.mtp_kv.payload", mtp_kv_payload);
+    line("persistent.mtp_kv.metadata", mtp_kv_meta);
+    line("persistent.gdn.conv", sum_layout_regions(lin.conv));
+    line("persistent.gdn.conv_scale", sum_layout_regions(lin.conv_scale));
+    line("persistent.gdn.recurrent", sum_layout_regions(lin.recurrent));
+    line("persistent.gdn.recurrent_scale", sum_layout_regions(lin.recurrent_scale));
+    line("persistent.round", round_bytes);
+    line("persistent.prefill_hidden", p.prefill_hidden.region.bytes);
+    line("persistent.token_counts", p.token_counts.region.bytes);
+    line("persistent.sampling_config", p.sampling_config.region.bytes);
+    line("persistent.tail_hidden", p.tail_hidden.region.bytes);
+    line("persistent.rewrite_checkpoint_hidden", p.rewrite_checkpoint_hidden.region.bytes);
+    line("persistent.TOTAL", p.bytes);
+    line("workspace.text_prefill", impl.workspace.text_prefill);
+    line("workspace.ordinary_round", impl.workspace.ordinary_round);
+    line("workspace.mtp_prefill", impl.workspace.mtp_prefill);
+    line("workspace.mtp_round", impl.workspace.mtp_round);
+    if (impl.workspace.replay_records) {
+        std::cerr << "  " << std::left << std::setw(36) << "workspace.replay_records" << std::right
+                  << impl.workspace.replay_records->payload_bytes() << " B @base "
+                  << impl.workspace.replay_records_base << "\n";
+    }
+    line("workspace.TOTAL(capacity)", impl.workspace.capacity);
+    line("request_transient", impl.request_transient_capacity_bytes);
+    line("graph_allowance", impl.graph_allowance_bytes);
+    line("device_reservation", impl.device_reservation_bytes);
+    std::cerr << "\n";
+}
+
 std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlanningInputs& inputs,
-                                                           std::uint32_t main_page_groups) {
+                                                            std::uint32_t main_page_groups) {
     if (main_page_groups == 0) {
         throw std::invalid_argument("Main KV physical page count must be positive");
     }
@@ -648,15 +765,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             impl->graph_allowance_bytes = checked_mul(12ULL * kMiB, impl->max_concurrency,
                                                       "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
-            // RTX 5060 Ti 16 GB path: the MTP3 graph allocation observed at
-            // 1024–1792 contexts is ~2 MiB per batch, so the historical
-            // 12 MiB allowance is over-budget.  Keep a 4 MiB headroom to
-            // accommodate the (verify_window + 1) * 4-byte alignment pad
-            // and the (token_domain) * 4-byte I32 token counter plus the
-            // output_rows * 2-byte BF16 logits tensor; that fits well under
-            // 4 MiB on the measured MTP3 path.  This unlocks 8 MiB of
-            // persistent-room headroom per batch, which is what makes
-            // context > 2048 viable.
+            // RTX 5060 Ti 16 GB path: the historical 12 MiB allowance is over-budget. The
+            // measured cost is the lazy module code loads of the reachable T-templated kernel
+            // instantiations: 2,097,152 B loaded by the startup decode warmup (T = 1 + draft
+            // window) and 2,097,152 B loaded by the first prefill (chunk-sized T). Long-context
+            // decode and later prefills load nothing further, and cudaGraphInstantiate itself
+            // consumes ~0 B (measured with cudaMemGetInfo across startup, prefill, and decode).
             const auto profiles = mtp_graph_profiles(impl->capacity, impl->draft_window);
             const std::size_t per_batch_allowance = graph_topology_allowance(
                 profiles,
@@ -691,11 +805,16 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         }
     }
 
+    // Each of the three regions is a single cudaMalloc, and the driver charges the next 2 MiB
+    // multiple of the requested size; reserve the charged size, not the requested size.
     impl->device_reservation_bytes = checked_add(
         checked_add(
-            checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
-            impl->request_transient_capacity_bytes, "request transient reservation"),
+            checked_add(device_allocation_bytes(impl->persistent.bytes),
+                        device_allocation_bytes(impl->workspace.capacity), "sequence memory plan"),
+            device_allocation_bytes(impl->request_transient_capacity_bytes),
+            "request transient reservation"),
         impl->graph_allowance_bytes, "sequence graph allowance");
+    dump_memory_breakdown(*impl);
     return impl;
 }
 
@@ -713,7 +832,10 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .prefill_chunk       = std::min(options.prefill_chunk, options.max_context),
         .draft_window        = options.speculative.draft_tokens,
         .speculative_backend = options.speculative.backend,
-        .kv_dtype       = options.kv_cache == KvCacheStorage::BFloat16 ? DType::BF16 : DType::I8,
+        .kv_dtype = options.kv_cache == KvCacheStorage::BFloat16
+                     ? DType::BF16
+                     : (options.kv_cache == KvCacheStorage::Int4Group64 ? DType::I4
+                                                                        : DType::I8),
         .kv_quant_group = options.kv_cache == KvCacheStorage::BFloat16 ? 0 : qwen3_6::kKvQuantGroup,
         .proposal_head  = options.speculative.proposal_head,
         .features       = qwen3_6::startup_features(options),
@@ -740,13 +862,24 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
           .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
           .bytes_per_additional_main_page_group = 0,
     };
-    if (minimum_pages < maximum_pages) {
-        auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);
-        if (adjacent->device_reservation_bytes <= planner->minimum->device_reservation_bytes) {
-            throw std::logic_error("Qwen3.6 sequence layout has a nonpositive KV capacity stride");
+    // The physical reservation is strictly increasing but not affine in page count: the driver
+    // rounds each arena allocation up to 2 MiB and the rounding offset varies with page count.
+    // Record the exact reservation at every reachable page count so capacity resolution never
+    // misses the rounding delta.
+    auto& exact = planner->curve.exact_reservations;
+    exact.reserve(1U + static_cast<std::size_t>(maximum_pages - minimum_pages));
+    exact.push_back(planner->minimum->device_reservation_bytes);
+    for (std::uint32_t candidate_pages = minimum_pages + 1U; candidate_pages <= maximum_pages;
+         ++candidate_pages) {
+        auto candidate = build_sequence_candidate(inputs, candidate_pages);
+        if (candidate->device_reservation_bytes <= exact.back()) {
+            throw std::logic_error(
+                "Qwen3.6 sequence layout is not strictly increasing in Main KV page capacity");
         }
-        planner->curve.bytes_per_additional_main_page_group =
-            adjacent->device_reservation_bytes - planner->minimum->device_reservation_bytes;
+        exact.push_back(candidate->device_reservation_bytes);
+    }
+    if (minimum_pages < maximum_pages) {
+        planner->curve.bytes_per_additional_main_page_group = exact[1] - exact[0];
     }
     return planner;
 }

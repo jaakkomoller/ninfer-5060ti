@@ -126,6 +126,18 @@ __device__ __forceinline__ int gqa_small_t_tc_swz32(int row, int col) {
     return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
 }
 
+// Store one int8 code into a d-contiguous-as-b16 swizzled tile so the same
+// gqa_small_t_tc_swz / ldmatrix path that serves bf16 tiles serves the int8 tile.
+// A b16 lane holds two packed int8 (d even = low byte, d odd = high byte). Used by both the INT8
+// and INT4 partial kernels for the shared Q8 query tile (and, for INT8, the K codes).
+__device__ __forceinline__ void gqa_small_t_i8_store_swz(std::int8_t* tile, int row, int d,
+                                                         int d_b16_stride, std::int8_t code) {
+    const int c   = d >> 1;
+    const int lo  = d & 1;
+    const int off = (row * d_b16_stride + gqa_small_t_tc_swz(row, c)) * 2 + lo;
+    tile[off]     = code;
+}
+
 // Signed int8 QK MMA, k=32 contraction. A = 16x32 s8 (4 regs/thread, 4 s8 each),
 // B = 8x32 s8 col-major (2 regs/thread), D = 16x8 s32 (4 regs/thread). The A/B
 // register byte layout is identical to the m16n8k16 bf16 fragments loaded by

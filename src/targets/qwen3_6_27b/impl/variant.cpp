@@ -228,9 +228,10 @@ void Variant::gdn_input_projection(const Tensor& hidden, const GdnProjectionWeig
 
 void Variant::gdn_input_projection_snapshot(
     const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
-    Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slot,
-    const Tensor& snapshot_base_slot, Tensor& query, Tensor& key, Tensor& value,
-    Tensor& output_gate, qwen3_6::TextPhase, WorkspaceArena& workspace, cudaStream_t stream) {
+    Tensor& conv_states, const Tensor& conv_scale, const Tensor& valid_columns,
+    const Tensor& initial_slot, const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
+    Tensor& value, Tensor& output_gate, qwen3_6::TextPhase, WorkspaceArena& workspace,
+    cudaStream_t stream) {
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_snapshot_workspace_bytes(hidden, weights));
     WorkspaceArena leaf_workspace(storage);
@@ -238,23 +239,25 @@ void Variant::gdn_input_projection_snapshot(
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_snapshot(hidden, split->query_key, split->value_z, conv_weight,
-                                          conv_states, valid_columns, initial_slot,
+                                          conv_states, conv_scale, valid_columns, initial_slot,
                                           snapshot_base_slot, query, key, value, output_gate_view,
                                           leaf_workspace, stream);
         return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
-    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, valid_columns,
-                                      initial_slot, snapshot_base_slot, query, key, value,
-                                      output_gate_view, text_policy(fused), leaf_workspace, stream);
+    ops::gdn_input_proj_conv_snapshot(hidden, fused, conv_weight, conv_states, conv_scale,
+                                      valid_columns, initial_slot, snapshot_base_slot, query,
+                                      key, value, output_gate_view, text_policy(fused),
+                                      leaf_workspace, stream);
 }
 
 void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProjectionWeights& weights,
                                           const Tensor& conv_weight, const Tensor& conv_states,
-                                          const Tensor& valid_columns, const Tensor& initial_slots,
-                                          Tensor& conv_record, Tensor& query, Tensor& key,
-                                          Tensor& value, Tensor& output_gate, qwen3_6::TextPhase,
+                                          const Tensor& conv_scale, const Tensor& valid_columns,
+                                          const Tensor& initial_slots, Tensor& conv_record,
+                                          Tensor& query, Tensor& key, Tensor& value,
+                                          Tensor& output_gate, qwen3_6::TextPhase,
                                           WorkspaceArena& workspace, cudaStream_t stream) {
     auto workspace_scope     = workspace.scope();
     const DeviceSpan storage = workspace.alloc_bytes(gdn_record_workspace_bytes(hidden, weights));
@@ -263,16 +266,16 @@ void Variant::gdn_input_projection_record(const Tensor& hidden, const GdnProject
     if (const auto* split =
             std::get_if<SplitGdnInputProjectionPayload>(&weights.input_projection)) {
         ops::gdn_input_proj_conv_record(hidden, split->query_key, split->value_z, conv_weight,
-                                        conv_states, valid_columns, initial_slots, conv_record,
-                                        query, key, value, output_gate_view, leaf_workspace,
-                                        stream);
+                                        conv_states, conv_scale, valid_columns, initial_slots,
+                                        conv_record, query, key, value, output_gate_view,
+                                        leaf_workspace, stream);
         return;
     }
     const Weight& fused =
         std::get<FusedGdnInputProjectionPayload>(weights.input_projection).query_key_value_z;
-    ops::gdn_input_proj_conv_record(hidden, fused, conv_weight, conv_states, valid_columns,
-                                    initial_slots, conv_record, query, key, value, output_gate_view,
-                                    text_policy(fused), leaf_workspace, stream);
+    ops::gdn_input_proj_conv_record(hidden, fused, conv_weight, conv_states, conv_scale,
+                                    valid_columns, initial_slots, conv_record, query, key, value,
+                                    output_gate_view, text_policy(fused), leaf_workspace, stream);
 }
 
 void Variant::gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,

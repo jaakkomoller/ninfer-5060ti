@@ -42,4 +42,15 @@ __device__ __forceinline__ __half2 half2_from_bits(std::uint32_t bits) {
     return load_vec<__half2>(&bits);
 }
 
+// Signed I8 quantization for Linear Attention persistent state:
+// code = clamp(RNE(x / scale), -127, 127), code = 0 when scale is zero. The element is
+// represented as code * scale; the caller derives the scale as RNE_FP16(max_abs / 127).
+__device__ __forceinline__ std::int8_t i8_quantize(float x, float scale) {
+    if (scale == 0.0f) { return 0; }
+    int code = __float2int_rn(x / scale);
+    if (code > 127) { code = 127; }
+    if (code < -127) { code = -127; }
+    return static_cast<std::int8_t>(code);
+}
+
 } // namespace ninfer::ops

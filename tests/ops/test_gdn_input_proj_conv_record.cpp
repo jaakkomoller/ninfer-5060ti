@@ -2,6 +2,7 @@
 
 #include "ops/input_projection_test_common.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -235,7 +236,7 @@ int run_q4_q5() {
 
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
-                         std::uint32_t seed) {
+                          std::uint32_t seed) {
         const std::size_t snapshot_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                 kQueryRows, kKeyRows, kValueRows, batch, width, width);
@@ -244,21 +245,21 @@ int run_q4_q5() {
         return run_case(
             "Q4/Q5 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
             kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
-            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
-                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_snapshot(x, qk.view(), value_z.view(), conv, state,
-                                                  valid_columns, initial, snapshot_base, q, k, v, z,
-                                                  workspace, nullptr);
-            },
-            [&](const Tensor& x, const Tensor& conv, const Tensor& state,
-                const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv, state,
-                                                valid_columns, initial, record, q, k, v, z,
-                                                workspace, nullptr);
-            },
-            seed);
+[&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
+                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                 Tensor& z, WorkspaceArena& workspace) {
+                 ops::gdn_input_proj_conv_snapshot(
+                     x, qk.view(), value_z.view(), conv, state, Tensor{}, valid_columns, initial,
+                     snapshot_base, q, k, v, z, workspace, nullptr);
+             },
+             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
+                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
+                 Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
+                 ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv, state,
+                                                 Tensor{}, valid_columns, initial, record, q, k, v,
+                                                 z, workspace, nullptr);
+             },
+             seed);
     };
     failures += run(2, 1, {}, 1411U);
     failures += run(4, 1, {3}, 1421U);
@@ -267,6 +268,244 @@ int run_q4_q5() {
     failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1451U);
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
+    return failures;
+}
+
+// ===== I8 conv state form (two-parent Q4/Q5 record) ==============================
+// conv_states is a read-only I8 code plane plus a sticky FP16 scale per (128-channel group,
+// slot): the convolution dequantizes history exactly (code * scale), the record column keeps
+// the raw BF16 projected value, and the source codes and scale are bit-exact unchanged.
+// The same A16 route profile qualifies the Q4/Q5 conv output, z, and record against the
+// complete FP64 oracle.
+
+std::uint16_t f32_to_fp16_rne(float f) { return __half_as_ushort(__float2half_rn(f)); }
+
+float fp16_bits_to_f32(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+
+struct I8InitialWindow {
+    std::vector<std::int8_t> codes;        // tap-major [3, C]
+    std::vector<std::uint16_t> scale_bits; // [C/128]
+    std::vector<float> decoded;            // exact dequantization, tap-major [3, C]
+};
+
+// The sticky slot scale is derived from the stored window, so the initial window sits at the
+// projected values' magnitude (the patterned projections here reach ~9).
+I8InitialWindow make_i8_initial(std::int32_t channels, std::uint32_t seed) {
+    const std::size_t slot_stride = static_cast<std::size_t>(channels) * 3;
+    std::vector<float> logical(slot_stride);
+    fill_uniform(logical, seed, -12.0F, 12.0F);
+    round_to_bf16(logical);
+
+    I8InitialWindow result;
+    result.codes.assign(slot_stride, 0);
+    const std::int32_t groups = channels / 128;
+    result.scale_bits.assign(static_cast<std::size_t>(groups), 0U);
+    result.decoded.assign(slot_stride, 0.0F);
+    for (std::int32_t g = 0; g < groups; ++g) {
+        const std::int32_t c_begin = g * 128;
+        double max_abs             = 0.0;
+        for (std::int32_t c = c_begin; c < c_begin + 128; ++c) {
+            for (std::int32_t s = 0; s < 3; ++s) {
+                max_abs = std::max(
+                    max_abs, static_cast<double>(std::fabs(
+                                 logical[static_cast<std::size_t>(s) * channels + c])));
+            }
+        }
+        const std::uint16_t scale_bits = f32_to_fp16_rne(static_cast<float>(max_abs / 127.0));
+        const float scale              = fp16_bits_to_f32(scale_bits);
+        result.scale_bits[static_cast<std::size_t>(g)] = scale_bits;
+        for (std::int32_t c = c_begin; c < c_begin + 128; ++c) {
+            for (std::int32_t s = 0; s < 3; ++s) {
+                const std::size_t index = static_cast<std::size_t>(s) * channels + c;
+                const float quotient    = (scale == 0.0F) ? 0.0F
+                                                          : static_cast<float>(logical[index] /
+                                                                               scale);
+                double code             = std::nearbyint(static_cast<double>(quotient));
+                if (code > 127.0) { code = 127.0; }
+                if (code < -127.0) { code = -127.0; }
+                result.codes[index]     = static_cast<std::int8_t>(code);
+                result.decoded[index]   = static_cast<float>(result.codes[index]) * scale;
+            }
+        }
+    }
+    return result;
+}
+
+int run_q4_q5_i8_record_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
+                             std::int32_t width, std::uint32_t seed) {
+    constexpr std::int32_t kHidden      = 5120;
+    constexpr std::int32_t kValueRows   = 6144;
+    constexpr std::int32_t kZRows       = 6144;
+    constexpr std::int32_t kChannels    = 10240;
+    constexpr std::int32_t kGroups      = kChannels / 128;
+    constexpr std::int32_t kSlots       = 2;
+    constexpr std::int32_t kInitialSlot = 1;
+    constexpr ReductionCriterion kA16Tolerance{3.15e-3, 4.0e-3, 3.2e-3};
+    const std::size_t slot_stride       = static_cast<std::size_t>(kChannels) * 3;
+
+    const std::vector<float> activation = make_bf16_activation(kHidden, width, seed);
+    const std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+    std::vector<float> conv_weight(static_cast<std::size_t>(kChannels) * 4);
+    fill_uniform(conv_weight, seed + 1U, -0.02F, 0.02F);
+    round_to_bf16(conv_weight);
+    const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+    const I8InitialWindow initial = make_i8_initial(kChannels, seed + 2U);
+
+    std::vector<std::int8_t> codes(slot_stride * kSlots, 0x7e);
+    std::vector<std::uint16_t> scale_bits(static_cast<std::size_t>(kGroups) * kSlots, 0x0001U);
+    for (std::int32_t s = 0; s < 3; ++s) {
+        std::copy(initial.codes.begin() + s * kChannels, initial.codes.begin() + (s + 1) * kChannels,
+                  codes.begin() + static_cast<std::ptrdiff_t>(kInitialSlot) * slot_stride +
+                      s * kChannels);
+    }
+    // The scale plane is slot-major: slot s owns the contiguous [groups] block
+    // [s * groups, (s + 1) * groups), element (group, slot) at slot * groups + group.
+    for (std::int32_t g = 0; g < kGroups; ++g) {
+        scale_bits[static_cast<std::size_t>(kInitialSlot) * kGroups + g] =
+            initial.scale_bits[static_cast<std::size_t>(g)];
+    }
+    const std::vector<std::int32_t> initial_value{kInitialSlot};
+
+    DeviceBuffer device_x           = to_device(activation_bits);
+    DeviceBuffer device_conv_weight = to_device(conv_weight_bits);
+    DeviceBuffer device_codes(codes.size());
+    DeviceBuffer device_scale(scale_bits.size() * sizeof(std::uint16_t));
+    DeviceBuffer device_initial = to_device(initial_value);
+    device_codes.copy_from_host(codes.data(), codes.size());
+    device_scale.copy_from_host(scale_bits.data(), device_scale.bytes);
+    GuardedBf16Tensor query(kQueryRows, width);
+    GuardedBf16Tensor key(kKeyRows, width);
+    GuardedBf16Tensor value(kValueRows, width);
+    GuardedBf16Tensor z(kZRows, width);
+    GuardedBf16Tensor conv_record(kChannels, width);
+
+    Tensor x(device_x.p, DType::BF16, {kHidden, width});
+    Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
+    Tensor conv_state(device_codes.p, DType::I8, {kChannels, 3, kSlots});
+    Tensor conv_scale(device_scale.p, DType::FP16, {kGroups, 1, kSlots});
+    Tensor initial_tensor(device_initial.p, DType::I32, {1});
+    Tensor q        = query.tensor();
+    Tensor k        = key.tensor();
+    Tensor v        = value.tensor();
+    Tensor z_output = z.tensor();
+    Tensor record_view = conv_record.tensor();
+    const std::size_t workspace_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
+        kQueryRows, kKeyRows, kValueRows, 1, width, width);
+    WorkspaceArena workspace(std::max<std::size_t>(1, workspace_bytes));
+
+    ops::gdn_input_proj_conv_record(x, query_key.view(), value_z_weight.view(), conv, conv_state,
+                                    conv_scale, Tensor{}, initial_tensor, record_view, q, k, v,
+                                    z_output, workspace, nullptr);
+    cuda_synchronize();
+
+    const std::string suffix = " Q4/Q5 I8 T=" + std::to_string(width);
+    int failures             = 0;
+    const auto project = [&](std::int32_t global_row, std::int32_t token) {
+        const float* token_activation =
+            activation.data() + static_cast<std::size_t>(token) * kHidden;
+        if (global_row < kQueryRows + kKeyRows) {
+            return quantized_weight::dot_fp64(query_key.host, global_row, token_activation,
+                                              kHidden);
+        }
+        return quantized_weight::dot_fp64(
+            value_z_weight.host, global_row - kQueryRows - kKeyRows, token_activation, kHidden);
+    };
+
+    const std::int32_t sample_count = width <= 4 ? 32 : 7;
+    const std::vector<std::int32_t> query_rows = sampled_rows(kQueryRows, sample_count);
+    const std::vector<std::int32_t> key_rows   = sampled_rows(kKeyRows, sample_count);
+    const std::vector<std::int32_t> value_rows = sampled_rows(kValueRows, sample_count);
+    std::vector<double> ref_query, ref_key, ref_value;
+    const auto run_row = [&](std::int32_t global_row, std::vector<double>& output) {
+        double state0       = initial.decoded[global_row];
+        double state1       = initial.decoded[static_cast<std::size_t>(kChannels) + global_row];
+        double state2       = initial.decoded[2ULL * kChannels + global_row];
+        const double w0     = conv_weight[global_row];
+        const double w1     = conv_weight[static_cast<std::size_t>(kChannels) + global_row];
+        const double w2     = conv_weight[2ULL * kChannels + global_row];
+        const double w3     = conv_weight[3ULL * kChannels + global_row];
+        for (std::int32_t token = 0; token < width; ++token) {
+            const double projected = project(global_row, token);
+            output.push_back(
+                silu_fp64(w0 * state0 + w1 * state1 + w2 * state2 + w3 * projected));
+            state0  = state1;
+            state1  = state2;
+            state2  = projected;
+        }
+    };
+    for (const std::int32_t row : query_rows) { run_row(row, ref_query); }
+    for (const std::int32_t row : key_rows) { run_row(kQueryRows + row, ref_key); }
+    for (const std::int32_t row : value_rows) {
+        run_row(kQueryRows + kKeyRows + row, ref_value);
+    }
+    failures += compare("record I8 query" + suffix,
+                        gather_rows(query.values(), kQueryRows, 0, kQueryRows, width,
+                                    sample_count),
+                        ref_query, kA16Tolerance);
+    failures += compare("record I8 key" + suffix,
+                        gather_rows(key.values(), kKeyRows, 0, kKeyRows, width, sample_count),
+                        ref_key, kA16Tolerance);
+    failures += compare("record I8 value" + suffix,
+                        gather_rows(value.values(), kValueRows, 0, kValueRows, width,
+                                    sample_count),
+                        ref_value, kA16Tolerance);
+    failures += z.verify_guards("record I8 z" + suffix);
+    failures += z.verify_fully_written("record I8 z" + suffix);
+    failures += compare("record I8 z" + suffix,
+                        gather_rows(z.values(), kZRows, 0, kZRows, width, sample_count),
+                        projection_oracle(value_z_weight.host, kValueRows, kZRows, activation,
+                                          kHidden, width, sample_count),
+                        kA16Tolerance);
+    // The record column keeps the raw BF16 projected value.
+    failures += conv_record.verify_guards("record I8 conv record" + suffix);
+    failures += conv_record.verify_fully_written("record I8 conv record" + suffix);
+    failures += compare(
+        "record I8 conv record" + suffix,
+        gather_rows(conv_record.values(), kChannels, kQueryRows + kKeyRows, kValueRows, width,
+                    sample_count),
+        projection_oracle(value_z_weight.host, 0, kValueRows, activation, kHidden, width,
+                          sample_count),
+        kA16Tolerance);
+
+    // The source state plane is read-only: codes and sticky scale are bit-exact unchanged.
+    const std::vector<std::int8_t> codes_after =
+        from_device<std::int8_t>(device_codes, codes.size());
+    const std::vector<std::uint16_t> scale_after =
+        from_device<std::uint16_t>(device_scale, scale_bits.size());
+    if (codes_after != codes) {
+        std::cerr << "record I8" << suffix << ": source conv codes were modified\n";
+        ++failures;
+    }
+    if (scale_after != scale_bits) {
+        std::cerr << "record I8" << suffix << ": source conv scale plane was modified\n";
+        ++failures;
+    }
+    failures += verify_preserved("record I8 x" + suffix, device_x, activation_bits);
+    failures += verify_preserved("record I8 conv weight" + suffix, device_conv_weight,
+                                 conv_weight_bits);
+    failures += verify_preserved("record I8 initial slot" + suffix, device_initial,
+                                 initial_value);
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << "record I8" << suffix << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    return failures;
+}
+
+int run_q4_q5_i8_record() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 1701U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 1703U));
+    int failures = 0;
+    // Fused Small-T record routes plus the T=4 composed MTP verify route.
+    for (const std::int32_t width : {2, 3, 4, 6}) {
+        failures += run_q4_q5_i8_record_case(query_key, value_z_weight, width,
+                                             1711U + static_cast<std::uint32_t>(width));
+    }
+    failures += query_key.verify_preserved("I8 Q4 record qk weight");
+    failures += value_z_weight.verify_preserved("I8 Q5 record value/z weight");
     return failures;
 }
 
@@ -291,15 +530,16 @@ int run_w8() {
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid_columns,
-                                                  initial, snapshot_base, q, k, v, z, workspace,
-                                                  nullptr);
+ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, Tensor{}, valid_columns,
+                                                   initial, snapshot_base, q, k, v, z, workspace,
+                                                   nullptr);
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
                 Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
-                                                initial, record, q, k, v, z, workspace, nullptr);
+                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, Tensor{},
+                                                valid_columns, initial, record, q, k, v, z,
+                                                workspace, nullptr);
             },
             seed);
     };
@@ -337,16 +577,16 @@ int run_nvfp4() {
             [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
                 Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, valid_columns,
-                                                  initial, snapshot_base, q, k, v, z, policy,
-                                                  workspace, nullptr);
+ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, state, Tensor{}, valid_columns,
+                                                   initial, snapshot_base, q, k, v, z, policy,
+                                                   workspace, nullptr);
             },
             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
                 Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
-                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, valid_columns,
-                                                initial, record, q, k, v, z, policy, workspace,
-                                                nullptr);
+                ops::gdn_input_proj_conv_record(x, parent.view(), conv, state, Tensor{},
+                                                valid_columns, initial, record, q, k, v, z, policy,
+                                                workspace, nullptr);
             },
             seed);
     };
@@ -411,7 +651,7 @@ int run_fp8_oracle_case(DevicePackedWeight& parent, std::int32_t width, std::int
         QType::FP8_E4M3FN_ROW_BF16S, kRows, kHidden, policy, batch, width, width);
     WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
-    ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, state, valid, initial,
+    ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, state, Tensor{}, valid, initial,
                                     record_view, query_view, key_view, value_view, z_view, policy,
                                     workspace, nullptr);
     cuda_synchronize();
@@ -564,6 +804,7 @@ int main() {
         ++failures;
     }
     failures += run_q4_q5();
+    failures += run_q4_q5_i8_record();
     failures += run_w8();
     failures += run_nvfp4();
     failures += run_fp8();

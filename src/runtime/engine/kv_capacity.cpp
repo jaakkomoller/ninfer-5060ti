@@ -30,6 +30,21 @@ void validate_curve(const SequenceCapacityCurve& curve) {
         curve.bytes_per_additional_main_page_group == 0) {
         throw std::invalid_argument("expandable sequence capacity curve has zero byte stride");
     }
+    const auto& exact = curve.exact_reservations;
+    if (exact.empty()) { return; }
+    const std::size_t span =
+        static_cast<std::size_t>(curve.maximum_main_page_groups - curve.minimum_main_page_groups + 1);
+    if (exact.size() != span) {
+        throw std::invalid_argument("exact sequence capacity reservations must span the whole curve");
+    }
+    if (exact.front() != curve.minimum_device_reservation_bytes) {
+        throw std::invalid_argument("exact sequence capacity reservations must start at the minimum");
+    }
+    for (std::size_t i = 1; i < exact.size(); ++i) {
+        if (exact[i] <= exact[i - 1]) {
+            throw std::invalid_argument("exact sequence capacity reservations must increase per page");
+        }
+    }
 }
 
 std::uint32_t explicit_page_groups(const KvCapacityPolicy& policy,
@@ -55,6 +70,7 @@ std::size_t SequenceCapacityCurve::reservation_bytes(std::uint32_t main_page_gro
     }
     const std::size_t additional =
         static_cast<std::size_t>(main_page_groups - minimum_main_page_groups);
+    if (!exact_reservations.empty()) { return exact_reservations[additional]; }
     return checked_add(minimum_device_reservation_bytes,
                        checked_mul(additional, bytes_per_additional_main_page_group,
                                    "sequence capacity increment overflows size_t"),
@@ -105,13 +121,33 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
                 std::to_string(available_runtime_bytes) + " bytes are available after weights");
         }
         if (curve.minimum_main_page_groups < curve.maximum_main_page_groups) {
-            const std::size_t additional =
-                (capacity_budget - curve.minimum_device_reservation_bytes) /
-                curve.bytes_per_additional_main_page_group;
-            const std::uint64_t candidate =
-                static_cast<std::uint64_t>(curve.minimum_main_page_groups) + additional;
-            pages = static_cast<std::uint32_t>(
-                std::min<std::uint64_t>(candidate, curve.maximum_main_page_groups));
+            if (!curve.exact_reservations.empty()) {
+                // The exact reservation is strictly increasing but not affine, so search it
+                // directly instead of inverting the affine stride.
+                std::uint32_t lo   = curve.minimum_main_page_groups;
+                std::uint32_t hi   = curve.maximum_main_page_groups;
+                std::uint32_t best = curve.minimum_main_page_groups;
+                while (lo <= hi) {
+                    const std::uint32_t mid = lo + (hi - lo) / 2U;
+                    if (curve.reservation_bytes(mid) <= capacity_budget) {
+                        best = mid;
+                        lo   = mid + 1U;
+                    } else if (mid > lo) {
+                        hi = mid - 1U;
+                    } else {
+                        break;
+                    }
+                }
+                pages = best;
+            } else {
+                const std::size_t additional =
+                    (capacity_budget - curve.minimum_device_reservation_bytes) /
+                    curve.bytes_per_additional_main_page_group;
+                const std::uint64_t candidate =
+                    static_cast<std::uint64_t>(curve.minimum_main_page_groups) + additional;
+                pages = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(candidate, curve.maximum_main_page_groups));
+            }
         }
         break;
     default:

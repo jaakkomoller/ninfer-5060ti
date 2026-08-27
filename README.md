@@ -144,23 +144,32 @@ Committed decode throughput across concurrent request waves with MTP3 (draft win
 
 **Qwen3.8-27B (`groupwise-int`) Single-Request MTP3 on RTX 5060 Ti**
 
-The 15.17 GiB `q4mtp` artifact runs with INT8 KV, a 64-token prefill chunk, and MTP3. The GDN
-recurrent state is stored INT8 with a per-(head, dv-row) FP16 scale, which halves the resident GDN
-state pool (~78 MiB → ~41 MiB) and lifts the context ceiling on this card:
+The 15.17 GiB `q4mtp` artifact runs with INT8 or INT4 KV, a 64-token prefill chunk, and MTP3. The
+GDN recurrent state is stored INT8 with a per-(head, dv-row) FP16 scale, which halves the resident
+GDN state pool (~78 MiB → ~41 MiB). The Paged KV cache can additionally be stored as INT4 with one
+FP16 scale per 64-element group (`--kv-dtype int4`), which cuts the per-layer KV page in half
+(135,168 B → 69,632 B) and lifts the context ceiling on this card:
 
-| Flags | Max ctx | Prefill tok/s | Decode tok/s MTP3 | Decode tok/s MTP0 | MTP acceptance | Note |
-|---|---:|---:|---:|---:|---:|---|
-| defaults (prefix reuse) | 2,048 | 266.0 | 45.1 | 24.6 | 62.0% (2.85 tok/round) | 171 prompt, 192 gen |
-| `--no-prefix-reuse` | 3,200 | 278.2 | 45.1 | 24.6 | 62.0% (2.85 tok/round) | 171 prompt, 192 gen |
+| Flags | KV | Max ctx | Prefill tok/s | Decode tok/s MTP3 | Decode tok/s MTP0 | MTP acceptance | Note |
+|---|---|---:|---:|---:|---:|---:|---|
+| defaults (prefix reuse) | int8 | 2,048 | 266.0 | 45.1 | 24.6 | 62.0% (2.85 tok/round) | 171 prompt, 192 gen |
+| `--no-prefix-reuse` | int8 | 3,200 | 278.2 | 45.1 | 24.6 | 62.0% (2.85 tok/round) | 171 prompt, 192 gen |
+| `--no-prefix-reuse` | int4 | 6,016 | 100.6 | 41.1 | 24.6 | 53.8% (2.60 tok/round) | 25 prompt, 256 gen |
 
 Prefix reuse holds a second copy of the GDN snapshot pool, so it caps the default-flags context at
-2,048 tokens. MTP3 greedy output matches the MTP0 baseline up to a single near-tie token flip in
-192 generated tokens (0 fallback steps); CUDA Graph memory uses 2.00 MiB of the 4.00 MiB allowance.
+2,048 tokens. INT4 KV is the largest single lever: a 4,096-token context — infeasible with INT8 KV
+(28.9 MiB over) — now fits with 39 MiB of planned slack, and the ceiling reaches 6,016 tokens
+(6,080/6,144/8,192 are rejected before upload). On the same 25-prompt/256-gen workload, INT4
+matches INT8 in decode (MTP3 41.1 vs 40.4 tok/s; MTP0 24.6 = 24.6 tok/s), has on-par MTP acceptance
+(53.8% vs 52.5%, 0 fallback steps), and greedy output is content-identical to the INT8 path
+(sub-token paraphrase drift only). MTP3 greedy output matches the MTP0 baseline up to a single
+near-tie token flip in 192 generated tokens (0 fallback steps); CUDA Graph memory uses 2.00 MiB of
+the 4.00 MiB allowance.
 These are single-run measurements on a 40-SM consumer card. Reproduction:
 
 ```
 build/apps/ninfer out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer \
-  --prompt <text> --max-context 3200 --kv-dtype int8 --prefill-chunk 64 \
+  --prompt <text> --max-context 4096 --kv-dtype int4 --prefill-chunk 64 \
   --no-prefix-reuse --no-thinking --greedy --spec mtp --draft-tokens 3
 ```
 

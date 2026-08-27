@@ -13,22 +13,33 @@ namespace ninfer::ops {
  *   ideal[c,t] = SiLU(sum_{j=0..3} weight[c,j] * u[c,t-3+j]).
  *
  * `x` and `out` are contiguous BF16 [C,T], `weight` is contiguous BF16 [C,4], and a state is
- * contiguous BF16 [C,3] ordered oldest to newest. The oracle evaluates `ideal` naively in FP64 from
- * the represented inputs. The BF16 output is promoted and compared directly with that result;
- * output storage rounding belongs to the Op's numerical criterion, not the oracle. Kernel
- * accumulator and staging precision are implementation choices. Input, weight, output, and state
- * storage do not overlap except for the explicitly allowed exact alias between state input and
- * state output. No caller workspace is used. T may be any positive value.
+ * contiguous [C,3] ordered oldest to newest. The state is either BF16 (conv_state_scale empty)
+ * or I8 codes with one contiguous FP16 conv_state_scale per 128-channel group [C/128], element
+ * = code * scale. I8 computation loads history as code * scale in FP32; the republished trailing
+ * window is re-quantized with a fresh per-group scale using the recurrent I8 policy:
+ * scale = RNE_FP16(max |window| / 127), code = clamp(RNE(x / scale), -127, 127), code = 0 when
+ * scale is zero. The oracle evaluates `ideal` naively in FP64 from the represented inputs
+ * (decoding I8 history as code * scale with the exact stored FP16 scale). The BF16 output is
+ * promoted and compared directly with that result; output storage rounding belongs to the Op's
+ * numerical criterion, not the oracle. Kernel accumulator and staging precision are
+ * implementation choices. Input, weight, output, and state storage do not overlap except for the
+ * explicitly allowed exact alias between state input and state output. No caller workspace is
+ * used. T may be any positive value.
  */
 
 // Reads conv_state as the initial window and replaces it with the final three values after x.
-void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
-                        cudaStream_t stream);
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state,
+                        const Tensor& conv_state_scale, Tensor& out, cudaStream_t stream);
 
 // Distinct-state form. conv_state_in and conv_state_out may be disjoint or exactly the same
 // storage; conv_state_out receives the trailing width-3 window of concat(conv_state_in,x).
+// conv_state_scale is the scale plane of conv_state_in; it is rewritten with the scale of the
+// published window. The I8 form is registered for the exactly-aliasing case only: the fresh
+// scale is written into conv_state_scale, so distinct I8 storage would leave the output
+// window's scale unwritten and the entry throws.
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                        Tensor& conv_state_out, Tensor& out, cudaStream_t stream);
+                        Tensor& conv_state_out, const Tensor& conv_state_scale, Tensor& out,
+                        cudaStream_t stream);
 
 /**
  * Snapshot form for B independent sequences. `x` and `out` are contiguous BF16 [C,W,B],

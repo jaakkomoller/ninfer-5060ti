@@ -132,10 +132,20 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   overwriting another row's initial slot, and may overlap a row's own initial slot with its
  *   destination after that initial history has been loaded. Other slots are unchanged. Newly
  *   projected convolution channels remain private to the call while published snapshots are BF16.
+ *
+ *   conv_states is either BF16 (conv_scale empty) or I8 codes (conv_scale the contiguous FP16
+ *   [C/128, 1, Slots] plane, one scale per 128-channel group and slot, element = code * scale;
+ *   the linear storage is slot-major, so slot s owns the contiguous [C/128] block
+ *   [s*(C/128), (s+1)*(C/128)) and element (group, slot) is at slot*(C/128) + group).
+ *   The I8 form is registered for the two-parent Q4/Q5 form only: the convolution reads history
+ *   as code * scale in FP32, shifts stored codes verbatim, and quantizes only the incoming value
+ *   under the slot's group scale (code = clamp(RNE(x/scale), -127, 127), 0 when the scale is
+ *   zero); published snapshot slots copy the group scale of their source slot.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
                                   const Weight& value_z_weight, const Tensor& conv_weight,
-                                  Tensor& conv_states, const Tensor& valid_columns,
+                                  Tensor& conv_states, const Tensor& conv_scale,
+                                  const Tensor& valid_columns,
                                   const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
@@ -155,6 +165,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
+                                  const Tensor& conv_scale,
                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, LinearPolicy policy, WorkspaceArena& ws,
@@ -162,10 +173,11 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Applies the A16-only single-parent form. FP8 accepts every positive W for dense B=1; the batched
- * domain is B=2..8 and W=1..16.
+ * domain is B=2..8 and W=1..16. conv_states must be BF16 with an empty conv_scale.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
+                                  const Tensor& conv_scale,
                                   const Tensor& valid_columns, const Tensor& initial_state_slots,
                                   const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
                                   Tensor& value, Tensor& z, WorkspaceArena& ws,
@@ -200,16 +212,23 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
  * and value are zero in each row's invalid tail; z is projected for every physical column.
  *
  * The execution domain is B=1..8 and T=2..16. valid_columns is empty for dense input or device
- * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only BF16 [C,3,S]
+ * I32 [B], with each caller-supplied extent in [1,T]. conv_states is a read-only [C,3,S]
  * state-pool view, and initial_state_slots contains absolute slots in [0,S). Source state is not
  * modified. Only the valid prefix of conv_record is semantically defined.
  *
  * The two-parent form registers Q4 q/k [4096,5120] and the Q5 value/z parent [12288,5120]. All
  * tensor operands, outputs, conv_record, source state, and live workspace must be disjoint.
+ *
+ *   conv_states is either BF16 (conv_scale empty) or I8 codes (conv_scale the contiguous FP16
+ *   [C/128, 1, S] plane, slot-major: slot s owns the contiguous [C/128] block, element (group,
+ *   slot) at slot*(C/128) + group); the I8 form is registered for the two-parent Q4/Q5 form
+ *   only. conv_states is read-only: the convolution dequantizes history as code * scale but
+ *   never writes state.
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
                                 const Weight& value_z_weight, const Tensor& conv_weight,
-                                const Tensor& conv_states, const Tensor& valid_columns,
+                                const Tensor& conv_states, const Tensor& conv_scale,
+                                const Tensor& valid_columns,
                                 const Tensor& initial_state_slots, Tensor& conv_record,
                                 Tensor& query, Tensor& key, Tensor& value, Tensor& z,
                                 WorkspaceArena& workspace, cudaStream_t stream);
@@ -224,16 +243,19 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& qk_weight,
  */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,
-                                const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                const Tensor& conv_scale, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, LinearPolicy policy, WorkspaceArena& workspace,
                                 cudaStream_t stream);
 
-/** Applies the A16-only single-parent record-producing form. */
+/** Applies the A16-only single-parent record-producing form. conv_states must be BF16 with an
+ * empty conv_scale. */
 void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z_weight,
                                 const Tensor& conv_weight, const Tensor& conv_states,
-                                const Tensor& valid_columns, const Tensor& initial_state_slots,
-                                Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+                                const Tensor& conv_scale, const Tensor& valid_columns,
+                                const Tensor& initial_state_slots, Tensor& conv_record,
+                                Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops

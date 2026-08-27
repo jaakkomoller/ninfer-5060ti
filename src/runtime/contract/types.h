@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace ninfer::runtime {
 
@@ -85,15 +86,21 @@ struct RoundBudget {
     std::uint32_t generated_tokens_remaining = 0;
 };
 
-// Target-produced affine reservation curve for one Main KV physical-capacity axis. The byte
-// values come from complete target physical layout plans, not from a model geometry formula in
-// the common runtime.
+// Target-produced reservation curve for one Main KV physical-capacity axis. The byte values
+// come from complete target physical layout plans, not from a model geometry formula in the
+// common runtime.
 struct SequenceCapacityCurve {
     std::uint32_t main_page_tokens                   = 0;
     std::uint32_t minimum_main_page_groups           = 0;
     std::uint32_t maximum_main_page_groups           = 0;
     std::size_t minimum_device_reservation_bytes     = 0;
     std::size_t bytes_per_additional_main_page_group = 0;
+    // Exact per-page reservation for targets whose physical reservation is not affine in page
+    // count (the driver rounds each arena allocation up to 2 MiB and the rounding offset varies
+    // with page count). Entry i is the complete reservation for minimum_main_page_groups + i
+    // pages and must be strictly increasing. Empty means the reservation is exactly affine in
+    // the fields above.
+    std::vector<std::size_t> exact_reservations;
 
     [[nodiscard]] std::size_t reservation_bytes(std::uint32_t main_page_groups) const;
     [[nodiscard]] std::uint32_t resolved_tokens(std::uint32_t main_page_groups) const;

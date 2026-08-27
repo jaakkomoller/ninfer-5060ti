@@ -35,6 +35,13 @@ struct Variant {
     static constexpr bool supports_dflash                      = DFlashConfig::supported;
     static constexpr std::int32_t draft_head_rows              = 131072;
 
+    // The 35B-A3B single-parent W8/NVFP4 conv kernels read the conv window as BF16, so the
+    // persistent conv storage stays BF16 for every registered identity.
+    [[nodiscard]] static constexpr DType linear_attention_conv_dtype(WeightsProfile profile) {
+        (void)profile;
+        return DType::BF16;
+    }
+
     [[nodiscard]] static std::vector<GraphExecutionProfile>
     ordinary_graph_profiles(std::uint32_t capacity);
     [[nodiscard]] static std::vector<GraphExecutionProfile>
@@ -67,15 +74,17 @@ struct Variant {
     static void
     gdn_input_projection_snapshot(const Tensor& hidden, const GdnProjectionWeights& weights,
                                   const Tensor& conv_weight, Tensor& conv_states,
-                                  const Tensor& valid_columns, const Tensor& initial_slot,
-                                  const Tensor& snapshot_base_slot, Tensor& query, Tensor& key,
-                                  Tensor& value, Tensor& output_gate, qwen3_6::TextPhase phase,
-                                  WorkspaceArena& workspace, cudaStream_t stream);
+                                  const Tensor& conv_scale, const Tensor& valid_columns,
+                                  const Tensor& initial_slot, const Tensor& snapshot_base_slot,
+                                  Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
+                                  qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+                                  cudaStream_t stream);
     static void gdn_input_projection_record(
         const Tensor& hidden, const GdnProjectionWeights& weights, const Tensor& conv_weight,
-        const Tensor& conv_states, const Tensor& valid_columns, const Tensor& initial_slots,
-        Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value, Tensor& output_gate,
-        qwen3_6::TextPhase phase, WorkspaceArena& workspace, cudaStream_t stream);
+        const Tensor& conv_states, const Tensor& conv_scale, const Tensor& valid_columns,
+        const Tensor& initial_slots, Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
+        Tensor& output_gate, qwen3_6::TextPhase phase, WorkspaceArena& workspace,
+        cudaStream_t stream);
     static void gdn_output_projection(const Tensor& hidden, const Weight& weight, Tensor& residual,
                                       qwen3_6::TextPhase phase, WorkspaceArena& workspace,
                                       cudaStream_t stream);

@@ -530,4 +530,141 @@ __global__ void causal_conv1d_batched_snapshot_smallt_kernel(
     }
 }
 
+// ===== I8 conv state form ======================================================
+// conv_state is I8 [C,3] codes with one FP16 scale per kCausalConvScaleGroup
+// (128) consecutive channels: element = code * scale. Computation stays in FP32:
+// history taps load as code * scale. After consuming the T input columns the new
+// trailing window is published by causal_conv1d_i8_state_kernel with a fresh
+// per-group scale, matching the recurrent I8 policy:
+//   scale = RNE_FP16(max |window| / 127), code = clamp(RNE(x / scale), -127, 127),
+//   code = 0 when scale == 0.
+// Window values whose sequence position is below 3 (only for T < 3) decode from
+// the previous I8 window (code * old scale) before the group scale is rewritten.
+
+inline constexpr int kCausalConvScaleGroup = 128;
+
+__global__ void causal_conv1d_i8_sequence_kernel(const __nv_bfloat16* x,
+                                                 const __nv_bfloat16* weight,
+                                                 const std::int8_t* conv_state,
+                                                 const __half* conv_scale, __nv_bfloat16* out,
+                                                 std::int32_t C, std::int32_t T) {
+    const std::int64_t c64 = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t C64 = static_cast<std::int64_t>(C);
+    if (c64 >= C64) { return; }
+
+    const std::int32_t group      = static_cast<std::int32_t>(c64) / kCausalConvScaleGroup;
+    const float scale             = __half2float(conv_scale[group]);
+    const float s0                = static_cast<float>(conv_state[c64]) * scale;
+    const float s1                = static_cast<float>(conv_state[C64 + c64]) * scale;
+    const float s2                = static_cast<float>(conv_state[2 * C64 + c64]) * scale;
+    const float w0                = __bfloat162float(weight[c64]);
+    const float w1                = __bfloat162float(weight[C64 + c64]);
+    const float w2                = __bfloat162float(weight[2 * C64 + c64]);
+    const float w3                = __bfloat162float(weight[3 * C64 + c64]);
+
+    float h0 = s0, h1 = s1, h2 = s2;
+    for (std::int32_t t = 0; t < T; ++t) {
+        const std::int64_t out_idx = static_cast<std::int64_t>(t) * C64 + c64;
+        const float x0             = __bfloat162float(x[out_idx]);
+
+        float acc = 0.0f;
+        acc += w0 * h0;
+        acc += w1 * h1;
+        acc += w2 * h2;
+        acc += w3 * x0;
+
+        out[out_idx] = __float2bfloat16_rn(silu(acc));
+        h0           = h1;
+        h1           = h2;
+        h2           = x0;
+    }
+}
+
+__global__ void causal_conv1d_i8_prefill_kernel(const __nv_bfloat16* x,
+                                                const __nv_bfloat16* weight,
+                                                const std::int8_t* conv_state,
+                                                const __half* conv_scale, __nv_bfloat16* out,
+                                                std::int32_t C, std::int32_t T) {
+    const std::int64_t C64      = static_cast<std::int64_t>(C);
+    const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
+    const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
+    const std::int32_t t        = static_cast<std::int32_t>(block / c_blocks);
+    const std::int64_t c64      = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x +
+                                  threadIdx.x;
+    if (t >= T || c64 >= C64) { return; }
+
+    const std::int32_t group = static_cast<std::int32_t>(c64) / kCausalConvScaleGroup;
+    const float scale        = __half2float(conv_scale[group]);
+
+    const auto history = [&](std::int32_t tap) {
+        return static_cast<float>(conv_state[static_cast<std::int64_t>(tap) * C64 + c64]) * scale;
+    };
+    const float x0 = (t >= 3) ? __bfloat162float(x[static_cast<std::int64_t>(t - 3) * C64 + c64])
+                              : history(t);
+    const float x1 = (t >= 2) ? __bfloat162float(x[static_cast<std::int64_t>(t - 2) * C64 + c64])
+                              : history(t + 1);
+    const float x2 = (t >= 1) ? __bfloat162float(x[static_cast<std::int64_t>(t - 1) * C64 + c64])
+                              : history(t + 2);
+    const float x3 = __bfloat162float(x[static_cast<std::int64_t>(t) * C64 + c64]);
+
+    const std::int32_t c = static_cast<std::int32_t>(c64);
+    float acc            = 0.0f;
+    acc += __bfloat162float(weight[c]) * x0;
+    acc += __bfloat162float(weight[C64 + c]) * x1;
+    acc += __bfloat162float(weight[2 * C64 + c]) * x2;
+    acc += __bfloat162float(weight[3 * C64 + c]) * x3;
+    out[static_cast<std::int64_t>(t) * C64 + c64] = __float2bfloat16_rn(silu(acc));
+}
+
+// Publishes the trailing width-3 window of concat(conv_state_in, x) into
+// conv_state_out with a fresh per-group scale. conv_state_in and conv_state_out
+// may alias or be disjoint. One block of kCausalConvScaleGroup threads owns one
+// 128-channel group.
+__global__ void causal_conv1d_i8_state_kernel(const __nv_bfloat16* x, const std::int8_t* state_in,
+                                              std::int8_t* state_out, __half* conv_scale,
+                                              std::int32_t C, std::int32_t T) {
+    __shared__ float warp_max[kCausalConvScaleGroup / 32];
+
+    const std::int32_t group = static_cast<std::int32_t>(blockIdx.x);
+    const std::int32_t lane  = static_cast<std::int32_t>(threadIdx.x);
+    const std::int32_t c     = group * kCausalConvScaleGroup + lane;
+    const std::int64_t C64   = static_cast<std::int64_t>(C);
+
+    // Read the old group scale before any thread rewrites it.
+    const float old_scale = __half2float(conv_scale[group]);
+
+    float value[3];
+    float local_max = 0.0f;
+    #pragma unroll
+    for (int s = 0; s < 3; ++s) {
+        const std::int32_t pos = T + s;
+        if (pos < 3) {
+            value[s] = static_cast<float>(state_in[static_cast<std::int64_t>(pos) * C64 + c]) *
+                       old_scale;
+        } else {
+            value[s] = __bfloat162float(x[static_cast<std::int64_t>(pos - 3) * C64 + c]);
+        }
+        local_max = fmaxf(local_max, fabsf(value[s]));
+    }
+
+    float m = local_max;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, offset));
+    }
+    if ((lane & 31) == 0) { warp_max[lane / 32] = m; }
+    __syncthreads();
+    const float max_abs =
+        fmaxf(fmaxf(warp_max[0], warp_max[1]), fmaxf(warp_max[2], warp_max[3]));
+
+    const __half scale16 = __float2half_rn(max_abs / 127.0f);
+    const float scale    = __half2float(scale16);
+
+    #pragma unroll
+    for (int s = 0; s < 3; ++s) {
+        state_out[static_cast<std::int64_t>(s) * C64 + c] = i8_quantize(value[s], scale);
+    }
+    if (lane == 0) { conv_scale[group] = scale16; }
+}
+
 } // namespace ninfer::ops

@@ -9,6 +9,19 @@
 
 namespace ninfer {
 
+// The CUDA driver rounds every cudaMalloc up to a multiple of 2 MiB. Measured on the product
+// hardware (RTX 5060 Ti, CUDA 13.1) for single allocations of 11 MiB to 600 MiB: the charged
+// size is always the next 2 MiB multiple of the requested size. Memory reservations for a
+// single allocation must use the charged size, not the requested size.
+inline constexpr std::size_t kDriverAllocationGranularity = 2ULL * 1024ULL * 1024ULL;
+
+// Device memory the driver charges for one cudaMalloc of `bytes`.
+inline std::size_t device_allocation_bytes(std::size_t bytes) noexcept {
+    if (bytes == 0) { return 0; }
+    const std::size_t g = kDriverAllocationGranularity;
+    return (bytes + g - 1) / g * g;
+}
+
 struct DeviceSpan {
     void* data        = nullptr;
     std::size_t bytes = 0;

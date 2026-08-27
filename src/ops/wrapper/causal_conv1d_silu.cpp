@@ -89,10 +89,12 @@ void require_selector_shape(const Tensor& selector, std::int32_t batch, const ch
 }
 
 std::int64_t validate_common(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
-                             const Tensor& out) {
-    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 || conv_state.dtype != DType::BF16 ||
+                              const Tensor& out) {
+    if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
+        (conv_state.dtype != DType::BF16 && conv_state.dtype != DType::I8) ||
         out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_state/out must be BF16");
+        throw std::invalid_argument("causal_conv1d: x/weight/out must be BF16 and conv_state "
+                                    "must be BF16 or I8");
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
@@ -105,6 +107,28 @@ std::int64_t validate_common(const Tensor& x, const Tensor& weight, const Tensor
     require_state_shape(conv_state, x.ne[0]);
     require_out_shape(x, out);
     return n;
+}
+
+// conv_state_scale is empty (null data) for BF16 states and a contiguous FP16 [C/128]
+// per-128-channel-group plane for I8 states.
+void require_state_scale(const Tensor& state, const Tensor& scale, std::int32_t C) {
+    const bool empty = scale.data == nullptr;
+    if (state.dtype == DType::BF16) {
+        if (!empty) {
+            throw std::invalid_argument("causal_conv1d: BF16 conv_state takes no scale");
+        }
+        return;
+    }
+    if (state.dtype != DType::I8) {
+        throw std::invalid_argument("causal_conv1d: conv_state must be BF16 or I8");
+    }
+    if (empty) {
+        throw std::invalid_argument("causal_conv1d: I8 conv_state requires an FP16 scale");
+    }
+    if (scale.dtype != DType::FP16 || !scale.is_contiguous() || C % 128 != 0 ||
+        scale.ne[0] != C / 128 || scale.ne[1] != 1 || scale.ne[2] != 1 || scale.ne[3] != 1) {
+        throw std::invalid_argument("causal_conv1d: I8 conv_scale must have shape [C/128]");
+    }
 }
 
 void require_non_empty_accessible(const Tensor& x, const Tensor& weight, const Tensor& conv_state,
@@ -129,14 +153,40 @@ void require_metadata_accessible(const Tensor& metadata, const char* label) {
     }
 }
 
+void dispatch_state(const Tensor& x, const Tensor& weight, const Tensor& state_in,
+                    Tensor& state_out, const Tensor& scale, Tensor& out, cudaStream_t stream) {
+    if (state_in.dtype == DType::I8) {
+        detail::causal_conv1d_i8_launch(x, weight, state_in, state_out, scale, out, stream);
+        return;
+    }
+    if (x.ne[1] == 1) {
+        detail::causal_conv1d_decode_launch(x, weight, state_in, state_out, out, stream);
+    } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
+        detail::causal_conv1d_smallt_launch(x, weight, state_in, state_out, out, stream);
+    } else if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
+        detail::causal_conv1d_sequence_launch(x, weight, state_in, state_out, out, stream);
+    } else {
+        detail::causal_conv1d_prefill_launch(x, weight, state_in, state_out, out, stream);
+    }
+}
+
 } // namespace
 
 void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
-                        Tensor& conv_state_out, Tensor& out, cudaStream_t stream) {
+                        Tensor& conv_state_out, const Tensor& conv_state_scale, Tensor& out,
+                        cudaStream_t stream) {
     if (x.dtype != DType::BF16 || weight.dtype != DType::BF16 ||
-        conv_state_in.dtype != DType::BF16 || conv_state_out.dtype != DType::BF16 ||
+        conv_state_in.dtype != conv_state_out.dtype ||
+        (conv_state_in.dtype != DType::BF16 && conv_state_in.dtype != DType::I8) ||
         out.dtype != DType::BF16) {
-        throw std::invalid_argument("causal_conv1d: x/weight/conv_state/out must be BF16");
+        throw std::invalid_argument(
+            "causal_conv1d: x/weight/out must be BF16 and conv_state in/out must share a "
+            "BF16 or I8 dtype");
+    }
+    if (conv_state_in.dtype == DType::I8 && conv_state_in.data != conv_state_out.data) {
+        throw std::invalid_argument(
+            "causal_conv1d: the I8 conv state form is registered for the in-place distinct "
+            "entry (conv_state_in == conv_state_out) only");
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");
@@ -157,33 +207,18 @@ void causal_conv1d_silu(const Tensor& x, const Tensor& weight, const Tensor& con
         throw std::invalid_argument(
             "causal_conv1d: conv_state_out must be contiguous and non-null");
     }
-    if (x.ne[1] == 1) {
-        detail::causal_conv1d_decode_launch(x, weight, conv_state_in, conv_state_out, out, stream);
-    } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
-        detail::causal_conv1d_smallt_launch(x, weight, conv_state_in, conv_state_out, out, stream);
-    } else if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
-        detail::causal_conv1d_sequence_launch(x, weight, conv_state_in, conv_state_out, out,
-                                              stream);
-    } else {
-        detail::causal_conv1d_prefill_launch(x, weight, conv_state_in, conv_state_out, out, stream);
-    }
+    require_state_scale(conv_state_in, conv_state_scale, x.ne[0]);
+    dispatch_state(x, weight, conv_state_in, conv_state_out, conv_state_scale, out, stream);
 }
 
-void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state, Tensor& out,
-                        cudaStream_t stream) {
+void causal_conv1d_silu(const Tensor& x, const Tensor& weight, Tensor& conv_state,
+                        const Tensor& conv_state_scale, Tensor& out, cudaStream_t stream) {
     const std::int64_t n = validate_common(x, weight, conv_state, out);
     if (n == 0) { return; }
 
     require_non_empty_accessible(x, weight, conv_state, out);
-    if (x.ne[1] == 1) {
-        detail::causal_conv1d_decode_launch(x, weight, conv_state, conv_state, out, stream);
-    } else if (x.ne[1] <= detail::kCausalConvParallelMaxTokens) {
-        detail::causal_conv1d_smallt_launch(x, weight, conv_state, conv_state, out, stream);
-    } else if (x.ne[1] <= detail::kCausalConvSequenceMaxTokens) {
-        detail::causal_conv1d_sequence_launch(x, weight, conv_state, conv_state, out, stream);
-    } else {
-        detail::causal_conv1d_prefill_launch(x, weight, conv_state, conv_state, out, stream);
-    }
+    require_state_scale(conv_state, conv_state_scale, x.ne[0]);
+    dispatch_state(x, weight, conv_state, conv_state, conv_state_scale, out, stream);
 }
 
 void causal_conv1d_silu_snapshot(const Tensor& x, const Tensor& weight, Tensor& conv_states,

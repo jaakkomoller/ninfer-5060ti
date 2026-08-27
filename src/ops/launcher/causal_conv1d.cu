@@ -243,4 +243,42 @@ void causal_conv1d_snapshot_launch(const Tensor& x, const Tensor& weight, Tensor
     CUDA_CHECK(cudaGetLastError());
 }
 
+void causal_conv1d_i8_launch(const Tensor& x, const Tensor& weight, const Tensor& conv_state_in,
+                             Tensor& conv_state_out, const Tensor& conv_scale, Tensor& out,
+                             cudaStream_t stream) {
+    const std::int32_t C = x.ne[0];
+    const std::int32_t T = x.ne[1];
+    const auto* x_bf16       = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* weight_bf16  = static_cast<const __nv_bfloat16*>(weight.data);
+    const auto* codes_in     = static_cast<const std::int8_t*>(conv_state_in.data);
+    auto* codes_out          = static_cast<std::int8_t*>(conv_state_out.data);
+    const auto* scale        = static_cast<const __half*>(conv_scale.data);
+    auto* out_bf16           = static_cast<__nv_bfloat16*>(out.data);
+    auto* scale_write        = static_cast<__half*>(conv_scale.data);
+
+    if (T <= kCausalConvSequenceMaxTokens) {
+        constexpr int kBlock = 32;
+        causal_conv1d_i8_sequence_kernel<<<grid_for(C, kBlock, "I8 sequence"), kBlock, 0,
+                                           stream>>>(x_bf16, weight_bf16, codes_in, scale, out_bf16,
+                                                     C, T);
+    } else {
+        constexpr int kBlock = 256;
+        causal_conv1d_i8_prefill_kernel<<<prefill_output_grid_for(C, T, kBlock), kBlock, 0,
+                                          stream>>>(x_bf16, weight_bf16, codes_in, scale, out_bf16,
+                                                    C, T);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // One block per kCausalConvScaleGroup-channel scale group; the block index is the group index.
+    constexpr int kGroupThreads = 128;
+    const std::int64_t groups = C / kCausalConvScaleGroup;
+    if (C % kCausalConvScaleGroup != 0 || groups > std::numeric_limits<int>::max()) {
+        throw std::invalid_argument("causal_conv1d: I8 state requires C % 128 == 0");
+    }
+    const int group_grid = static_cast<int>(groups);
+    causal_conv1d_i8_state_kernel<<<group_grid, kGroupThreads, 0, stream>>>(
+        x_bf16, codes_in, codes_out, scale_write, C, T);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

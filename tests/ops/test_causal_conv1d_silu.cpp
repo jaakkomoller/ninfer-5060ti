@@ -1,11 +1,14 @@
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
+
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -191,11 +194,11 @@ int ordinary_case(std::int32_t C, std::int32_t T, StateCall call, std::uint32_t 
     Tensor tout(output.data(), DType::BF16, {C, T});
 
     if (call == StateCall::InPlaceEntry) {
-        ops::causal_conv1d_silu(tx, tw, ts_in, tout, nullptr);
+        ops::causal_conv1d_silu(tx, tw, ts_in, Tensor{}, tout, nullptr);
     } else if (call == StateCall::DistinctEntry) {
-        ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout, nullptr);
+        ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, Tensor{}, tout, nullptr);
     } else {
-        ops::causal_conv1d_silu(tx, tw, ts_in, ts_in, tout, nullptr);
+        ops::causal_conv1d_silu(tx, tw, ts_in, ts_in, Tensor{}, tout, nullptr);
     }
     cuda_synchronize();
 
@@ -265,7 +268,7 @@ int continuation_slot_case(std::int32_t C, std::int32_t T, std::int32_t slots,
     Tensor ts_in(selected_device, DType::BF16, {C, 3});
     Tensor ts_out(state.data(), DType::BF16, {C, 3});
     Tensor tout(output.data(), DType::BF16, {C, T});
-    ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, tout, nullptr);
+    ops::causal_conv1d_silu(tx, tw, ts_in, ts_out, Tensor{}, tout, nullptr);
     cuda_synchronize();
 
     const std::string tag = "causal_conv1d_silu continuation C=" + std::to_string(C) +
@@ -464,6 +467,187 @@ int batched_snapshot_case(std::int32_t C, std::int32_t width,
     return failures;
 }
 
+// ===== I8 conv state form =====================================================
+// The public state input is I8 [C,3] codes plus one FP16 scale per 128-channel
+// group; the element decode (code * scale) is exact in FP32. The conv output uses
+// the same complete FP64 oracle over the decoded window, and the published window
+// is checked bit-exactly against the reference quantization:
+//   scale16 = RNE_FP16(RNE_FP32(max |window| / 127)),
+//   code    = clamp(RNE(x / scale), -127, 127), 0 when scale == 0.
+
+constexpr std::int32_t kI8ScaleGroup = 128;
+
+std::uint16_t f32_to_fp16_rne(float f) { return __half_as_ushort(__float2half_rn(f)); }
+
+float fp16_rne_to_f32(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+
+std::int8_t i8_reference_code(float value, float scale) {
+    if (scale == 0.0F) { return 0; }
+    // The kernel divides in FP32 and rounds to int RNE; both inputs are exact FP32 values, so
+    // emulating the division in FP64 and rounding RNE reproduces it exactly.
+    const float quotient = static_cast<float>(value / scale);
+    double code          = std::nearbyint(static_cast<double>(quotient));
+    if (code > 127.0) { code = 127.0; }
+    if (code < -127.0) { code = -127.0; }
+    return static_cast<std::int8_t>(code);
+}
+
+struct I8Window {
+    std::vector<std::int8_t> codes;        // tap-major [3, C]
+    std::vector<std::uint16_t> scale_bits; // [C / kI8ScaleGroup]
+};
+
+// Reference quantization of an exactly FP32-representable window.
+I8Window quantize_i8_window(const std::vector<float>& window, std::int32_t C) {
+    I8Window result;
+    result.codes.assign(static_cast<std::size_t>(C) * 3U, 0);
+    const std::int32_t groups = C / kI8ScaleGroup;
+    result.scale_bits.assign(static_cast<std::size_t>(groups), 0xffffU);
+    for (std::int32_t g = 0; g < groups; ++g) {
+        const std::int32_t c_begin = g * kI8ScaleGroup;
+        double max_abs             = 0.0;
+        for (std::int32_t c = c_begin; c < c_begin + kI8ScaleGroup; ++c) {
+            for (std::int32_t s = 0; s < 3; ++s) {
+                max_abs = std::max(max_abs, static_cast<double>(std::fabs(
+                                                window[static_cast<std::size_t>(s) * C + c])));
+            }
+        }
+        const std::uint16_t scale_bits = f32_to_fp16_rne(static_cast<float>(max_abs / 127.0));
+        const float scale              = fp16_rne_to_f32(scale_bits);
+        result.scale_bits[static_cast<std::size_t>(g)] = scale_bits;
+        for (std::int32_t c = c_begin; c < c_begin + kI8ScaleGroup; ++c) {
+            for (std::int32_t s = 0; s < 3; ++s) {
+                result.codes[static_cast<std::size_t>(s) * C + c] = i8_reference_code(
+                    window[static_cast<std::size_t>(s) * C + c], scale);
+            }
+        }
+    }
+    return result;
+}
+
+struct I8CaseInput {
+    LogicalInput logical;
+    I8Window initial;
+    std::vector<float> decoded;
+};
+
+// The state enters as the consistent (codes, scale) pair of a logical window; the conv oracle
+// decodes that pair exactly, which is the Op's public state input.
+I8CaseInput make_i8_input(std::int32_t C, std::int32_t T, std::uint32_t seed) {
+    I8CaseInput input;
+    input.logical       = make_input(C, T, seed);
+    const std::vector<float> logical_state = make_state(C, seed + 2U);
+    input.initial                          = quantize_i8_window(logical_state, C);
+    input.decoded.assign(static_cast<std::size_t>(C) * 3U, 0.0F);
+    for (std::int32_t s = 0; s < 3; ++s) {
+        for (std::int32_t c = 0; c < C; ++c) {
+            input.decoded[static_cast<std::size_t>(s) * C + c] =
+                static_cast<float>(input.initial.codes[static_cast<std::size_t>(s) * C + c]) *
+                fp16_rne_to_f32(
+                    input.initial.scale_bits[static_cast<std::size_t>(c / kI8ScaleGroup)]);
+        }
+    }
+    return input;
+}
+
+int i8_ordinary_case(std::int32_t C, std::int32_t T, std::uint32_t seed) {
+    const I8CaseInput input = make_i8_input(C, T, seed);
+    const OracleResult oracle =
+        causal_conv_oracle(input.logical.x, input.logical.weight, input.decoded, C, T, false);
+    const I8Window expected_final = quantize_i8_window(oracle.final_state, C);
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.logical.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.logical.weight);
+
+    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer codes(input.initial.codes.size());
+    GuardedDeviceBuffer scale(input.initial.scale_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+    x.copy_from_host(x_bits.data(), x.bytes());
+    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    codes.copy_from_host(input.initial.codes.data(), codes.bytes());
+    scale.copy_from_host(input.initial.scale_bits.data(), scale.bytes());
+    output.fill(kOutputPoison);
+
+    Tensor tx(x.data(), DType::BF16, {C, T});
+    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tstate(codes.data(), DType::I8, {C, 3});
+    Tensor tscale(scale.data(), DType::FP16, {C / kI8ScaleGroup, 1, 1, 1});
+    Tensor tout(output.data(), DType::BF16, {C, T});
+
+    const std::string tag = "causal_conv1d_silu I8 C=" + std::to_string(C) +
+                            " T=" + std::to_string(T);
+    int failures = 0;
+
+    const auto verify_round = [&](const std::string& entry) {
+        failures += verify_output(tag + " " + entry + " output",
+                                  from_device_bf16(output.data(), x_bits.size()), oracle.output);
+        failures += verify_exact(
+            (tag + " " + entry + " final codes").c_str(),
+            from_device<std::int8_t>(codes.data(), input.initial.codes.size()),
+            expected_final.codes);
+        failures += verify_exact(
+            (tag + " " + entry + " final scale").c_str(),
+            from_device<std::uint16_t>(scale.data(), input.initial.scale_bits.size()),
+            expected_final.scale_bits);
+        failures += verify_bits(tag + " " + entry + " x preserved", x.data(), x_bits);
+        failures += verify_bits(tag + " " + entry + " weight preserved", weight.data(), weight_bits);
+        failures += verify_buffer_guards(tag + " " + entry + " x", x);
+        failures += verify_buffer_guards(tag + " " + entry + " weight", weight);
+        failures += verify_buffer_guards(tag + " " + entry + " codes", codes);
+        failures += verify_buffer_guards(tag + " " + entry + " scale", scale);
+        failures += verify_buffer_guards(tag + " " + entry + " output", output);
+    };
+
+    ops::causal_conv1d_silu(tx, tw, tstate, tscale, tout, nullptr);
+    cuda_synchronize();
+    verify_round("in-place");
+
+    // Restore the initial state and qualify the exact-alias distinct entry.
+    codes.copy_from_host(input.initial.codes.data(), codes.bytes());
+    scale.copy_from_host(input.initial.scale_bits.data(), scale.bytes());
+    output.fill(kOutputPoison);
+    ops::causal_conv1d_silu(tx, tw, tstate, tstate, tscale, tout, nullptr);
+    cuda_synchronize();
+    verify_round("exact-alias");
+    return failures;
+}
+
+// The I8 form is registered for the exactly-aliasing state entry only; a distinct I8
+// destination would leave the output window's scale unwritten, so the entry throws.
+int i8_distinct_throw_case(std::int32_t C, std::int32_t T, std::uint32_t seed) {
+    const I8CaseInput input = make_i8_input(C, T, seed);
+    const std::vector<std::uint16_t> x_bits      = bf16_bits(input.logical.x);
+    const std::vector<std::uint16_t> weight_bits = bf16_bits(input.logical.weight);
+    GuardedDeviceBuffer x(x_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer weight(weight_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer codes(input.initial.codes.size());
+    GuardedDeviceBuffer scale(input.initial.scale_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer codes_out(input.initial.codes.size());
+    GuardedDeviceBuffer output(x_bits.size() * sizeof(std::uint16_t));
+    x.copy_from_host(x_bits.data(), x.bytes());
+    weight.copy_from_host(weight_bits.data(), weight.bytes());
+    codes.copy_from_host(input.initial.codes.data(), codes.bytes());
+    scale.copy_from_host(input.initial.scale_bits.data(), scale.bytes());
+    codes_out.fill(0x5a);
+
+    Tensor tx(x.data(), DType::BF16, {C, T});
+    Tensor tw(weight.data(), DType::BF16, {C, 4});
+    Tensor tstate(codes.data(), DType::I8, {C, 3});
+    Tensor tstate_out(codes_out.data(), DType::I8, {C, 3});
+    Tensor tscale(scale.data(), DType::FP16, {C / kI8ScaleGroup, 1, 1, 1});
+    Tensor tout(output.data(), DType::BF16, {C, T});
+    int failures = 0;
+    try {
+        ops::causal_conv1d_silu(tx, tw, tstate, tstate_out, tscale, tout, nullptr);
+        std::cerr << "causal_conv1d_silu I8 C=" << C << " T=" << T
+                  << ": distinct entry did not throw\n";
+        ++failures;
+    } catch (const std::exception&) {
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -510,6 +694,15 @@ int main() {
     // Row 0 reads slot 15 and overwrites it only after the final valid column. This is the
     // production same-row alias pattern; row 1 remains fully disjoint.
     failures += batched_snapshot_case(kQwen35Channels, 16, {15, 33}, {0, 16}, {16, 7}, 34, 5016U);
+
+    // I8 conv state form at the 27B channel extent: T=1/2 exercise the dequantized old taps in
+    // the published window, T=3 the boundary, T=7/64 the sequence route, and T=65/257 the
+    // prefill route. Codes and group scales are checked bit-exactly.
+    for (const std::int32_t T : {1, 2, 3, 7, 64, 65, 257}) {
+        failures += i8_ordinary_case(kQwen27Channels, T, 6000U + static_cast<std::uint32_t>(T));
+    }
+    failures += i8_distinct_throw_case(kQwen27Channels, 1, 6101U);
+    failures += i8_distinct_throw_case(kQwen27Channels, 100, 6100U);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " causal_conv1d_silu\n";
     return failures == 0 ? 0 : 1;

@@ -206,16 +206,17 @@ void validate_fold_states(const GdnReplayRecords& records,
     const auto& record        = records.spec;
     const auto& state         = states.spec;
     const bool recurrent_i8   = state.recurrent_dtype == DType::I8;
+    const bool conv_i8        = state.conv_dtype == DType::I8;
     if (state.layers != static_cast<std::uint32_t>(record.layers) ||
         state.conv_channels != record.conv_channels || state.conv_width != 3 ||
         state.value_heads != record.value_heads || state.value_head_dim != kStateDim ||
         state.key_head_dim != kStateDim || state.slot_count <= 0 ||
-        state.conv_dtype != DType::BF16 ||
+        (state.conv_dtype != DType::BF16 && state.conv_dtype != DType::I8) ||
         (state.recurrent_dtype != DType::FP32 && state.recurrent_dtype != DType::BF16 &&
          state.recurrent_dtype != DType::I8)) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
-    require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
+    require_tensor(states.conv_layer0, state.conv_dtype, {record.conv_channels, 3, state.slot_count},
                    256, kOp, "conv state layer 0");
     require_tensor(states.recurrent_layer0, state.recurrent_dtype,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
@@ -232,10 +233,20 @@ void validate_fold_states(const GdnReplayRecords& records,
         throw std::invalid_argument(std::string(kOp) +
                                     ": recurrent scale must be empty for a non-I8 state");
     }
+    if (conv_i8) {
+        require_tensor(states.conv_scale_layer0, DType::FP16,
+                       {state.conv_channels / kLinearAttentionConvScaleGroup, 1,
+                        state.slot_count},
+                       256, kOp, "conv scale state layer 0");
+    } else if (states.conv_scale_layer0.data != nullptr) {
+        throw std::invalid_argument(std::string(kOp) +
+                                    ": conv scale must be empty for a non-I8 conv");
+    }
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
         states.recurrent_layer_stride_bytes % recurrent_elem_bytes != 0 ||
         (recurrent_i8 && states.recurrent_scale_layer_stride_bytes < states.recurrent_scale_layer0.bytes()) ||
+        (conv_i8 && states.conv_scale_layer_stride_bytes < states.conv_scale_layer0.bytes()) ||
         static_cast<std::uint64_t>(states.conv_layer_stride_bytes) < states.conv_layer0.bytes() ||
         static_cast<std::uint64_t>(states.recurrent_layer_stride_bytes) <
             states.recurrent_layer0.bytes()) {
@@ -251,6 +262,10 @@ void validate_fold_states(const GdnReplayRecords& records,
             (void)layer_range(states.recurrent_scale_layer0,
                               states.recurrent_scale_layer_stride_bytes, layer,
                               "gdn_replay_fold recurrent scale state");
+        }
+        if (conv_i8) {
+            (void)layer_range(states.conv_scale_layer0, states.conv_scale_layer_stride_bytes, layer,
+                              "gdn_replay_fold conv scale state");
         }
     }
     std::int32_t conv_layer      = 0;
@@ -280,6 +295,7 @@ void validate_fold_states(const GdnReplayRecords& records,
 void require_records_disjoint_from_states(const GdnReplayRecords& records,
                                            LinearAttentionStateAllLayersView states) {
     const bool recurrent_i8 = states.spec.recurrent_dtype == DType::I8;
+    const bool conv_i8        = states.spec.conv_dtype == DType::I8;
     const std::array<MemoryRange, 4> record_ranges{
         tensor_range(records.conv, "gdn_replay_fold conv records"),
         tensor_range(records.key, "gdn_replay_fold key records"),
@@ -303,6 +319,15 @@ void require_records_disjoint_from_states(const GdnReplayRecords& records,
                 if (overlaps(record, scale)) {
                     throw std::invalid_argument(
                         "gdn_replay_fold: records overlap recurrent scale storage");
+                }
+            }
+            if (conv_i8) {
+                const MemoryRange conv_scale =
+                    layer_range(states.conv_scale_layer0, states.conv_scale_layer_stride_bytes,
+                                layer, "gdn_replay_fold conv scale state");
+                if (overlaps(record, conv_scale)) {
+                    throw std::invalid_argument(
+                        "gdn_replay_fold: records overlap conv scale storage");
                 }
             }
         }

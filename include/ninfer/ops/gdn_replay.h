@@ -30,6 +30,13 @@ struct GdnReplayFoldRow {
  * order, writes the final FP32 recurrent state, and sets convolution history to
  * tail_3(old_history || conv_record[0:commit_columns]).
  *
+ * When the state's conv storage is I8, the convolution history holds one signed I8 code per
+ * window value plus the FP16 scale plane (one scale per 128-channel group, carried by the
+ * all-layer view). The scale plane is slot-major: slot s owns the contiguous [groups] block and
+ * element (group, slot) is at slot*groups + group. The scale is sticky across folds: existing
+ * codes shift verbatim and only the incoming record values are quantized under the slot's group
+ * scale. A BF16 conv state requires the conv scale plane to be empty.
+ *
  * The Op admits the two registered all-layer geometries only, owns no workspace or metadata
  * allocation, and does not read query or generate token output. The four record planes are
  * read-only, disjoint, and do not overlap either state region.

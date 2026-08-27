@@ -1,23 +1,20 @@
 #pragma once
 
-// ninfer::ops - split-KV GQA small-T attention, int8 KV-cache partial kernel.
-// Historical design: docs/archive/optimization-era/2026-07-08-gqa-decode-int8-kernel-redesign.md.
+// ninfer::ops - split-KV GQA small-T attention, int4 KV-cache partial kernel.
 //
-//   * QK runs on native m16n8k32.s8 tensor cores. Q is quantized on-chip to int8
-//     per (row, 64-group); K stays int8 in the cache and is read straight into
-//     smem (no dequant). The int32 MMA output is rescaled per 64-group by
-//     qs[row,g]*ks[key,g]. This halves the QK MMA count vs bf16 and removes the
-//     entire K dequant.
-//   * PV stays bf16 (V is quantized per key, so its scale cannot be factored out
-//     of a key-contracted int8 accumulation): V int8 is staged, dequanted once to
-//     a bf16 tile, then the existing bf16 PV MMA runs. V is still read from DRAM
-//     as int8, so the bandwidth win is kept.
-//   * All keys (history AND the current/diagonal tokens) are read from the
-//     quantized cache; the fused append writes the new tokens first and a
-//     __syncthreads orders the in-block readback. No from_new special-casing.
+// INT4-G64 mirrors the INT8 kernel (gqa_attention_decode_i8.cuh) with packed 4-bit codes:
+//   * QK still runs on native m16n8k32.s8 Tensor Cores. Q is quantized on-chip to int8 per
+//     (row, 64-group) exactly as INT8. K arrives packed two signed 4-bit codes per byte; it is
+//     staged via cp.async into a packed arena, unpacked to a sign-extended int8 tile (the same
+//     swizzled layout the s8 MMA reads), then the s8 QK MMA + per-64-group rescale run unchanged.
+//   * PV stays bf16. V packed codes are staged via cp.async, dequantized (unpack + scale) once to
+//     a bf16 tile, and the existing bf16 PV MMA runs. V is read from DRAM as packed bytes, so the
+//     halved-bandwidth win is kept.
+//   * All keys (history AND the current/diagonal tokens) are read from the quantized cache; the
+//     fused append writes the new packed tokens first and a __syncthreads orders the readback.
 //
-// Standalone from the bf16 kernel; shared scaffolding (layout constants, ldmatrix
-// helpers, the s8/bf16 MMA helpers, the reducer) lives in gqa_attention_decode.cuh.
+// The smem arena is the same 4*Bc*D as INT8: k_packed (Bc*D/2) + k_i8 (Bc*D) + v_packed (Bc*D/2)
+// + v_bf16 (2*Bc*D). DRAM traffic for K and V is halved relative to INT8.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -30,22 +27,16 @@
 
 namespace ninfer::ops {
 
-// Decode-specialized producer/consumer kernel for T=1..6. One producer warp per
-// m16 row tile computes QK + online softmax, while all CTA warps partition the
-// tile's 256-wide PV output. This keeps each thread's PV accumulator at 16, 32,
-// or 64 floats instead of 128 and uses otherwise-idle warps for useful output
-// work.
-//
-// Q has a dedicated shared tile so producers can reload one 64-dimension group
-// at a time. K/V codes and scales are staged asynchronously; non-producer warps
-// dequantize V while producers execute QK. After both consume the code tile, the
-// next K/V tile is prefetched into the same arena while the current PV runs.
+// Decode-specialized producer/consumer kernel for T=1..6 with a packed INT4 KV cache. One producer
+// warp per m16 row tile computes QK + online softmax; all CTA warps partition the tile's 256-wide
+// PV output. Packed K is unpacked to int8 by every warp before the producer's QK; non-producer
+// warps dequantize packed V to bf16 while the producer executes QK.
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
           bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
-    void gqa_attention_decode_i8_tiled_kernel(
-        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, std::int8_t* cache_k_i8,
-        std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
+    void gqa_attention_decode_i4_tiled_kernel(
+        const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, unsigned char* cache_k,
+        unsigned char* cache_v, __half* cache_k_scale, __half* cache_v_scale,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float scale,
@@ -65,12 +56,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
-    // The GQA Op's 262144-key maximum envelope spans at most 49 pages in one 27B split.
-    constexpr int PageIds         = 64;
-    constexpr int ProducerThreads = RowTiles * 32;
-    constexpr int VLoaderThreads  = Threads - ProducerThreads;
-    constexpr float Log2E         = 1.4426950408889634074f;
-    constexpr unsigned FullMask   = 0xffffffffu;
+    constexpr int PageIds              = 64;
+    constexpr int ProducerThreads      = RowTiles * 32;
+    constexpr int VLoaderThreads       = Threads - ProducerThreads;
+    constexpr float Log2E              = 1.4426950408889634074f;
+    constexpr unsigned FullMask        = 0xffffffffu;
 
     static_assert(TokenTile >= 1 && TokenTile <= 6);
     static_assert(Bc == 32 || Bc == 64);
@@ -79,21 +69,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(PVNtPerWarp == 2 || PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
     static_assert(QKKs == Groups * GroupKc);
 
-    // Keep Q in a compact dedicated tile so the producer can reload one
-    // 64-dimension group at a time instead of carrying all eight fragments in
-    // registers across the whole kernel. The main arena holds K i8, V i8, and
-    // V bf16 during the key loop.
+    // Q keeps a dedicated int8 tile (Q8 compute profile, identical to INT8). The main arena holds
+    // packed K, unpacked int8 K, packed V, and dequantized bf16 V during the key loop.
     __shared__ __align__(16) std::int8_t q_s[Br * D];
     __shared__ __align__(16) std::int8_t static_r_s[DynamicArena ? 16 : 4 * Bc * D];
     extern __shared__ __align__(16) std::int8_t dynamic_r_s[];
-    std::int8_t* r_s      = DynamicArena ? dynamic_r_s : static_r_s;
-    std::int8_t* q_i8     = q_s;
-    float* q_scale_tmp    = reinterpret_cast<float*>(r_s);
-    std::int8_t* k_i8     = r_s;
-    __nv_bfloat16* q_b16  = reinterpret_cast<__nv_bfloat16*>(q_i8);
-    __nv_bfloat16* k_b16  = reinterpret_cast<__nv_bfloat16*>(k_i8);
-    std::int8_t* v_i8     = r_s + Bc * D;
-    __nv_bfloat16* v_bf16 = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * D);
+    std::int8_t* r_s       = DynamicArena ? dynamic_r_s : static_r_s;
+    unsigned char* k_packed = reinterpret_cast<unsigned char*>(r_s);
+    std::int8_t* k_i8       = r_s + Bc * DB16;
+    unsigned char* v_packed = reinterpret_cast<unsigned char*>(r_s + Bc * DB16 + Bc * D);
+    __nv_bfloat16* v_bf16   = reinterpret_cast<__nv_bfloat16*>(r_s + 2 * Bc * D);
+    std::int8_t* q_i8       = q_s;
+    float* q_scale_tmp      = reinterpret_cast<float*>(r_s);
+    __nv_bfloat16* q_b16    = reinterpret_cast<__nv_bfloat16*>(q_i8);
+    __nv_bfloat16* k_b16    = reinterpret_cast<__nv_bfloat16*>(k_i8);
     __shared__ __align__(16) __nv_bfloat16 p_s[Br * Bc];
     __shared__ float alpha_s[Br];
     __shared__ __align__(16) __half k_scale_s[Bc * Groups];
@@ -193,7 +182,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     }
 
     if constexpr (CacheInput::writes_cache) {
-        // The owning split quantizes each current row before its cache tile is consumed.
+        // The owning split quantizes each current row to packed INT4 before its cache tile is
+        // consumed. Each lane owns two adjacent dimensions (d even, d+1 odd) so its two codes pack
+        // into one byte.
         for (int pair = warp; pair < valid_tokens * Groups; pair += Wc) {
             const int token    = pair / Groups;
             const int grp      = pair - token * Groups;
@@ -201,8 +192,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if (position < split_start || position >= split_end) { continue; }
             int physical_page       = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
             const int page_offset   = position & kPagedKVPageMask;
-            const int d0            = grp * kGqaKvQuantGroup + lane;
-            const int d1            = d0 + 32;
+            const int d0            = grp * kGqaKvQuantGroup + 2 * lane;
+            const int d1            = d0 + 1;
             const std::int64_t src0 = gqa_kv_new_index<Geometry>(kv_head, d0, token);
             const std::int64_t src1 = gqa_kv_new_index<Geometry>(kv_head, d1, token);
             const float kv0         = __bfloat162float(input.k[src0]);
@@ -213,21 +204,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             float vamax             = fmaxf(fabsf(vv0), fabsf(vv1));
             kamax                   = warp_max(kamax, FullMask);
             vamax                   = warp_max(vamax, FullMask);
-            const __half ksh        = __float2half_rn(kamax > 0.0f ? kamax / 127.0f : 0.0f);
-            const __half vsh        = __float2half_rn(vamax > 0.0f ? vamax / 127.0f : 0.0f);
+            const __half ksh        = __float2half_rn(kamax > 0.0f ? kamax / 7.0f : 0.0f);
+            const __half vsh        = __float2half_rn(vamax > 0.0f ? vamax / 7.0f : 0.0f);
             const float ks          = __half2float(ksh);
             const float vs          = __half2float(vsh);
             const float k_inv       = ks > 0.0f ? 1.0f / ks : 0.0f;
             const float v_inv       = vs > 0.0f ? 1.0f / vs : 0.0f;
             physical_page           = __shfl_sync(FullMask, physical_page, 0);
-            cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                gqa_kv_quant_code(kv0, k_inv);
-            cache_k_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                gqa_kv_quant_code(kv1, k_inv);
-            cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d0, page_offset)] =
-                gqa_kv_quant_code(vv0, v_inv);
-            cache_v_i8[gqa_kv_quant_code_index<Geometry>(physical_page, kv_head, d1, page_offset)] =
-                gqa_kv_quant_code(vv1, v_inv);
+            const std::int64_t code_byte =
+                gqa_kv_quant_code_index_i4<Geometry>(physical_page, kv_head, d0, page_offset);
+            cache_k[code_byte] =
+                gqa_kv_pack_i4(gqa_kv_quant_code_i4(kv0, k_inv), gqa_kv_quant_code_i4(kv1, k_inv));
+            cache_v[code_byte] =
+                gqa_kv_pack_i4(gqa_kv_quant_code_i4(vv0, v_inv), gqa_kv_quant_code_i4(vv1, v_inv));
             if (lane == 0) {
                 const std::int64_t so =
                     gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, grp, page_offset);
@@ -300,7 +289,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F;
     float l0 = 0.0f, l1 = 0.0f;
 
-    auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+    // Stream one 64-key tile of packed K/V codes and scales into the staging arena. Packed bytes
+    // are half the width of INT8, so each 16-dimension chunk is an 8-byte cp.async.
+    auto issue_kv_packed = [&](int tile_k0, int physical_page) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
@@ -320,30 +311,42 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
             if (key >= split_start && key < split_end) {
-                const std::int64_t off = gqa_kv_quant_code_index<Geometry>(
+                const std::int64_t off = gqa_kv_quant_code_index_i4<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
-                std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
-                ninfer::ops::cp_async<16>(dst, &cache_k_i8[off]);
-                ninfer::ops::cp_async<16>(&v_i8[key_l * D + d], &cache_v_i8[off]);
+                ninfer::ops::cp_async<8>(&k_packed[key_l * DB16 + dc * 8], &cache_k[off]);
+                ninfer::ops::cp_async<8>(&v_packed[key_l * DB16 + dc * 8], &cache_v[off]);
             } else {
-                std::int8_t* dst = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
-                store_vec(dst, make_int4(0, 0, 0, 0));
-                store_vec(&v_i8[key_l * D + d], make_int4(0, 0, 0, 0));
+                store_vec(&k_packed[key_l * DB16 + dc * 8], make_int2(0, 0));
+                store_vec(&v_packed[key_l * DB16 + dc * 8], make_int2(0, 0));
             }
         }
         ninfer::ops::cp_commit();
     };
 
+    // Unpack one staged tile of packed K (8 packed bytes -> 16 sign-extended int8) into the
+    // swizzled s8 MMA tile. Runs on every warp before the producer's QK reads k_i8.
+    auto unpack_k_packed = [&]() {
+        for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
+            const int key_l = chunk / (D / 16);
+            const int dc    = chunk - key_l * (D / 16);
+            const unsigned char* src = &k_packed[key_l * DB16 + dc * 8];
+            std::int8_t* dst         = &k_i8[key_l * D + gqa_small_t_tc_swz(key_l, dc * 8) * 2];
+            store_vec(dst, gqa_kv_unpack_i4x16_from(src));
+        }
+    };
+
     int physical_page = physical_pages_s[0];
-    issue_kv_tile(first_tile, physical_page);
+    issue_kv_packed(first_tile, physical_page);
     ninfer::ops::cp_wait<0>();
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
 
-        // One warp per row tile produces P and alpha while the remaining warps
-        // stream/dequant V.
+        unpack_k_packed();
+        __syncthreads();
+
+        // One warp per row tile produces P and alpha while the remaining warps dequantize packed V.
         if (warp < RowTiles) {
             const int producer_row_base = warp * 16;
             __nv_bfloat16* p_sw         = &p_s[producer_row_base * Bc];
@@ -491,7 +494,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
                     vs = __shfl_sync(FullMask, vs, grp * 8);
-                    store_vec(dst, gqa_kv_dequant_i8x8_from(&v_i8[key_l * D + d], vs));
+                    store_vec(dst, gqa_kv_dequant_i4x8_from(&v_packed[key_l * DB16 + d / 2], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));
                 }
@@ -505,7 +508,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             if ((next_k0 & kPagedKVPageMask) == 0) {
                 physical_page = physical_pages_s[(next_k0 >> kPagedKVPageShift) - first_page];
             }
-            issue_kv_tile(next_k0, physical_page);
+            issue_kv_packed(next_k0, physical_page);
         }
 
         const int consumer_tile     = warp % RowTiles;

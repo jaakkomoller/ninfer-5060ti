@@ -858,6 +858,14 @@ Tensor TextContext::gdn_state_scale_layer(std::uint32_t layer) const {
     return state_.recurrent_is_i8() ? state_.recurrent_scale_layer(layer) : Tensor{};
 }
 
+Tensor TextContext::gdn_conv_scale_slot(std::uint32_t layer, std::int32_t slot) const {
+    return state_.conv_is_i8() ? state_.conv_scale_slot(layer, slot) : Tensor{};
+}
+
+Tensor TextContext::gdn_conv_scale_layer(std::uint32_t layer) const {
+    return state_.conv_is_i8() ? state_.conv_scale_layer(layer) : Tensor{};
+}
+
 void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -896,14 +904,16 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
             }
             GdnReplayRecordLayer records = replay_records_->layer(gidx, active_sequence_batch_);
             Variant::gdn_input_projection_record(projection_input, *w.projection, *w.conv1d,
-                                                 conv_states, valid, *active_linear_state_slots_,
-                                                 records.conv, query_output, key_output,
-                                                 value_output, gate_output, ph, work_, s);
+                                                 conv_states, gdn_conv_scale_layer(gidx), valid,
+                                                 *active_linear_state_slots_, records.conv,
+                                                 query_output, key_output, value_output,
+                                                 gate_output, ph, work_, s);
         } else {
             Variant::gdn_input_projection_snapshot(
-                projection_input, *w.projection, *w.conv1d, conv_states, valid,
-                *active_linear_state_slots_, *active_linear_state_slots_, query_output, key_output,
-                value_output, gate_output, ph, work_, s);
+                projection_input, *w.projection, *w.conv1d, conv_states,
+                gdn_conv_scale_layer(gidx), valid, *active_linear_state_slots_,
+                *active_linear_state_slots_, query_output, key_output, value_output, gate_output,
+                ph, work_, s);
         }
     } else {
         const auto conv = workspace_recipe::gdn_prefill_conv<TextConfig>(work_, T);
@@ -912,7 +922,8 @@ void TextContext::gdn_mix(const GdnLayerW& w, Tensor& x, int gidx, Phase ph) {
         Tensor qkv_c = conv.convolved;
         Tensor conv_state =
             state_.conv_slot(static_cast<std::uint32_t>(gidx), linear_state_current_slot_);
-        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state, qkv_c, s);
+        ops::causal_conv1d_silu(qkv, *w.conv1d, conv_state, conv_state,
+                             gdn_conv_scale_slot(gidx, linear_state_current_slot_), qkv_c, s);
         ops::extract_bf16_columns(qkv_c, 0, qc, s);
         ops::extract_bf16_columns(qkv_c, kCfg.key_dim, kc, s);
         ops::extract_bf16_columns(qkv_c, 2 * kCfg.key_dim, vc, s);

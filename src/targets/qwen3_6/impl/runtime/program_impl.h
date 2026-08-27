@@ -222,8 +222,13 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
     }
     const DeviceSpan backing = persistent.alloc_bytes(plan.persistent.bytes, 256);
     decoder = std::make_unique<qwen3_6::DecoderState>(backing, plan.persistent.decoder);
-    if (plan.persistent.replay_records) {
-        replay_records.emplace(backing, *plan.persistent.replay_records);
+    if (plan.workspace.replay_records) {
+        const auto& record_layout = *plan.workspace.replay_records;
+        auto* record_base =
+            static_cast<std::uint8_t*>(workspace_storage.base()) +
+            plan.workspace.replay_records_base;
+        replay_records.emplace(DeviceSpan{record_base, record_layout.payload_bytes()},
+                               record_layout);
     }
     if (replay_records.has_value() != (speculative_backend != SpeculativeBackend::None)) {
         throw std::logic_error("ReplaySSM records do not match the sequence plan");
@@ -1360,6 +1365,11 @@ void ProgramImplCore::prepare_graphs() {
     for (Tensor& tensor : decoder->linear_attention.conv) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
+    if (decoder->linear_attention.conv_is_i8()) {
+        for (Tensor& tensor : decoder->linear_attention.conv_scale) {
+            CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
+        }
+    }
     for (Tensor& tensor : decoder->linear_attention.recurrent) {
         CUDA_CHECK(cudaMemsetAsync(tensor.data, 0, tensor.bytes(), device.stream));
     }
@@ -2212,7 +2222,10 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.device      = device.device;
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
-    out.kv_cache = kv_dtype == DType::BF16 ? KvCacheStorage::BFloat16 : KvCacheStorage::Int8Group64;
+    out.kv_cache = kv_dtype == DType::BF16
+                   ? KvCacheStorage::BFloat16
+                   : (kv_dtype == DType::I4 ? KvCacheStorage::Int4Group64
+                                            : KvCacheStorage::Int8Group64);
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

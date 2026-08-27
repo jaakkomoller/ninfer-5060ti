@@ -424,12 +424,12 @@ public:
         Tensor convolution_weight = conv_weight();
         if (form == Form::Record) {
             ops::gdn_input_proj_conv_record(x, qk_.weight, value_z_.weight, convolution_weight,
-                                            conv_states, valid_columns, initial, conv_record, query,
-                                            key, value, z, workspace, stream);
+                                            conv_states, Tensor{}, valid_columns, initial,
+                                            conv_record, query, key, value, z, workspace, stream);
         } else {
             ops::gdn_input_proj_conv_snapshot(x, qk_.weight, value_z_.weight, convolution_weight,
-                                              conv_states, valid_columns, initial, snapshot_base,
-                                              query, key, value, z, workspace, stream);
+                                              conv_states, Tensor{}, valid_columns, initial,
+                                              snapshot_base, query, key, value, z, workspace, stream);
         }
     }
 
@@ -483,12 +483,12 @@ public:
         Tensor convolution_weight = conv_weight();
         if (form == Form::Record) {
             ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, policy_, workspace, stream);
+                                            Tensor{}, valid_columns, initial, conv_record, query,
+                                            key, value, z, policy_, workspace, stream);
         } else {
             ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
-                                              valid_columns, initial, snapshot_base, query, key,
-                                              value, z, policy_, workspace, stream);
+                                              Tensor{}, valid_columns, initial, snapshot_base, query,
+                                              key, value, z, policy_, workspace, stream);
         }
     }
 
@@ -544,12 +544,12 @@ public:
         Tensor convolution_weight = conv_weight();
         if (form == Form::Record) {
             ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, policy_, workspace, stream);
+                                            Tensor{}, valid_columns, initial, conv_record, query,
+                                            key, value, z, policy_, workspace, stream);
         } else {
             ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
-                                              valid_columns, initial, snapshot_base, query, key,
-                                              value, z, policy_, workspace, stream);
+                                              Tensor{}, valid_columns, initial, snapshot_base, query,
+                                              key, value, z, policy_, workspace, stream);
         }
     }
 
@@ -599,12 +599,12 @@ public:
         Tensor convolution_weight = conv_weight();
         if (form == Form::Record) {
             ops::gdn_input_proj_conv_record(x, parent_.weight, convolution_weight, conv_states,
-                                            valid_columns, initial, conv_record, query, key, value,
-                                            z, workspace, stream);
+                                            Tensor{}, valid_columns, initial, conv_record, query,
+                                            key, value, z, workspace, stream);
         } else {
             ops::gdn_input_proj_conv_snapshot(x, parent_.weight, convolution_weight, conv_states,
-                                              valid_columns, initial, snapshot_base, query, key,
-                                              value, z, workspace, stream);
+                                              Tensor{}, valid_columns, initial, snapshot_base,
+                                              query, key, value, z, workspace, stream);
         }
     }
 

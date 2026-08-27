@@ -40,6 +40,14 @@ constexpr ReductionCriterion kAttentionInt8Criterion{
     /*gross_relative_to_max_reference*/ 2.2e-3,
 };
 
+// INT4-G64: same Q8 x s8 QK profile as INT8, but the packed 4-bit K/V codes add a coarser
+// dequant error, so the envelope is looser than INT8.
+constexpr ReductionCriterion kAttentionInt4Criterion{
+    /*relative_l2*/ 4.8e-3,
+    /*gross_absolute*/ 1.5e-3,
+    /*gross_relative_to_max_reference*/ 3.4e-3,
+};
+
 struct Geometry {
     const char* name;
     std::int32_t q_heads;
@@ -349,6 +357,57 @@ void encode_group(const std::vector<float>& source, std::size_t source_base,
     }
 }
 
+// INT4-G64 encoding: same per-64-group structure as INT8, but the scale divides by 7 and codes
+// clamp to [-8, 7]. Per-dimension signed codes are stored one per slot (the device packs two per
+// byte); the oracle decodes code * scale in FP32.
+void encode_group_i4(const std::vector<float>& source, std::size_t source_base,
+                     std::vector<std::int8_t>& codes, std::size_t code_base,
+                     std::vector<std::uint16_t>& scales, std::size_t scale_offset) {
+    float absmax = 0.0f;
+    for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+        absmax = std::max(absmax, std::abs(source[source_base + static_cast<std::size_t>(i)]));
+    }
+
+    const float unrounded_scale    = absmax / 7.0f;
+    const std::uint16_t scale_bits = f32_to_f16_bits(unrounded_scale);
+    const float stored_scale       = f16_bits_to_f32(scale_bits);
+    const float inverse_scale      = stored_scale == 0.0f ? 0.0f : 1.0f / stored_scale;
+    scales[scale_offset]           = scale_bits;
+    for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+        std::int32_t code = 0;
+        if (stored_scale != 0.0f) {
+            const float scaled = source[source_base + static_cast<std::size_t>(i)] * inverse_scale;
+            code               = std::clamp(round_even_to_i32(scaled), -8, 7);
+        }
+        codes[code_base + static_cast<std::size_t>(i)] = static_cast<std::int8_t>(code);
+    }
+}
+
+// Pack per-dimension signed 4-bit codes (leading kHeadDim, values -8..7) into packed bytes
+// (leading kHeadDim/2): low nibble = even dimension, high nibble = odd dimension.
+std::vector<std::uint8_t> pack_i4_logical(const std::vector<std::int8_t>& per_dim) {
+    std::vector<std::uint8_t> packed(per_dim.size() / 2);
+    for (std::size_t i = 0; i < per_dim.size(); i += 2) {
+        const std::uint8_t even = static_cast<std::uint8_t>(per_dim[i]) & 0x0Fu;
+        const std::uint8_t odd  = static_cast<std::uint8_t>(per_dim[i + 1]) & 0x0Fu;
+        packed[i / 2]           = static_cast<std::uint8_t>((odd << 4) | even);
+    }
+    return packed;
+}
+
+// Unpack packed bytes (leading kHeadDim/2) into per-dimension signed 4-bit codes (leading
+// kHeadDim), sign-extending each nibble.
+std::vector<std::int8_t> unpack_i4_logical(const std::vector<std::uint8_t>& packed) {
+    std::vector<std::int8_t> per_dim(packed.size() * 2);
+    for (std::size_t j = 0; j < packed.size(); ++j) {
+        const int even = (static_cast<int>(packed[j] & 0x0Fu) ^ 8) - 8;
+        const int odd  = (static_cast<int>(packed[j] >> 4) ^ 8) - 8;
+        per_dim[2 * j]     = static_cast<std::int8_t>(even);
+        per_dim[2 * j + 1] = static_cast<std::int8_t>(odd);
+    }
+    return per_dim;
+}
+
 HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_context,
                      std::uint32_t seed) {
     const std::int32_t logical_capacity = align_up_page(max_context);
@@ -375,8 +434,13 @@ HostCache make_cache(const Geometry& geometry, DType dtype, std::int32_t max_con
                 const std::size_t code = cache_index(geometry, logical_capacity, head, position, d);
                 const std::size_t scale =
                     scale_index(geometry, logical_capacity, head, position, group);
-                encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
-                encode_group(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
+                if (dtype == DType::I4) {
+                    encode_group_i4(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
+                    encode_group_i4(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
+                } else {
+                    encode_group(logical_k, code, cache.k_i8, code, cache.k_scale, scale);
+                    encode_group(logical_v, code, cache.v_i8, code, cache.v_scale, scale);
+                }
             }
         }
     }
@@ -407,8 +471,13 @@ void append_cache(HostCache& cache, const std::vector<float>& k, const std::vect
                     cache_index(geometry, cache.logical_capacity, head, position, d);
                 const std::size_t scale =
                     scale_index(geometry, cache.logical_capacity, head, position, group);
-                encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
-                encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
+                if (cache.dtype == DType::I4) {
+                    encode_group_i4(k, source, cache.k_i8, target, cache.k_scale, scale);
+                    encode_group_i4(v, source, cache.v_i8, target, cache.v_scale, scale);
+                } else {
+                    encode_group(k, source, cache.k_i8, target, cache.k_scale, scale);
+                    encode_group(v, source, cache.v_i8, target, cache.v_scale, scale);
+                }
             }
         }
     }
@@ -494,7 +563,8 @@ public:
           logical_pages_(logical_capacity_ / kPagedKVPageSize),
           physical_pages_(physical_page_count(logical_pages_, mapping)),
           block_table_host_(make_block_table(logical_pages_, mapping)),
-          code_elements_(static_cast<std::size_t>(kHeadDim) * kPagedKVPageSize *
+          code_leading_(dtype_ == DType::I4 ? kHeadDim / 2 : kHeadDim),
+          code_elements_(static_cast<std::size_t>(code_leading_) * kPagedKVPageSize *
                          geometry_.kv_heads * physical_pages_),
           scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
@@ -502,8 +572,12 @@ public:
              (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
           v_(code_elements_ *
              (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
-          k_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
-          v_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
+          k_scale_(dtype_ == DType::I8 || dtype_ == DType::I4 ? scale_elements_ *
+                                                                   sizeof(std::uint16_t)
+                                                               : 1),
+          v_scale_(dtype_ == DType::I8 || dtype_ == DType::I4 ? scale_elements_ *
+                                                                   sizeof(std::uint16_t)
+                                                               : 1),
           block_table_(block_table_host_.size() * sizeof(std::int32_t)) {
         block_table_.copy_from_host(block_table_host_.data(),
                                     block_table_host_.size() * sizeof(std::int32_t));
@@ -516,6 +590,25 @@ public:
                               block_table_host_, physical_pages_);
             k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::uint16_t));
             v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::uint16_t));
+        } else if (dtype_ == DType::I4) {
+            const auto k_packed_logical = pack_i4_logical(cache.k_i8);
+            const auto v_packed_logical = pack_i4_logical(cache.v_i8);
+            const auto k_physical =
+                scatter_paged(k_packed_logical, kHeadDim / 2, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto v_physical =
+                scatter_paged(v_packed_logical, kHeadDim / 2, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto ks_physical =
+                scatter_paged(cache.k_scale, kQuantGroups, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            const auto vs_physical =
+                scatter_paged(cache.v_scale, kQuantGroups, geometry_, logical_capacity_,
+                              block_table_host_, physical_pages_);
+            k_.copy_from_host(k_physical.data(), k_physical.size() * sizeof(std::uint8_t));
+            v_.copy_from_host(v_physical.data(), v_physical.size() * sizeof(std::uint8_t));
+            k_scale_.copy_from_host(ks_physical.data(), ks_physical.size() * sizeof(std::uint16_t));
+            v_scale_.copy_from_host(vs_physical.data(), vs_physical.size() * sizeof(std::uint16_t));
         } else {
             const auto k_physical =
                 scatter_paged(cache.k_i8, kHeadDim, geometry_, logical_capacity_, block_table_host_,
@@ -537,16 +630,19 @@ public:
     }
 
     PagedKVLayerView view() {
+        const DType plane_dtype    = dtype_ == DType::I4 ? DType::U8 : dtype_;
         PagedKVLayerView result;
-        result.k_pages      = Tensor(k_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.v_pages      = Tensor(v_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+        result.k_pages      = Tensor(k_.data(), plane_dtype,
+                                     {code_leading_, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
+        result.v_pages      = Tensor(v_.data(), plane_dtype,
+                                     {code_leading_, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
         result.block_table  = Tensor(block_table_.data(), DType::I32, {logical_pages_});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
         result.dtype        = dtype_;
-        if (dtype_ == DType::I8) {
+        if (dtype_ == DType::I8 || dtype_ == DType::I4) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
                        {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
@@ -573,15 +669,30 @@ public:
         };
     }
 
-    HostCache snapshot() const {
+HostCache snapshot() const {
         HostCache cache{geometry_, dtype_, max_context_, logical_capacity_};
         if (dtype_ == DType::BF16) {
             const auto k_physical = copy_from_guarded<std::uint16_t>(k_, code_elements_);
             const auto v_physical = copy_from_guarded<std::uint16_t>(v_, code_elements_);
             cache.k_bf16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+                                                                 logical_capacity_, block_table_host_);
             cache.v_bf16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+                                                                 logical_capacity_, block_table_host_);
+        } else if (dtype_ == DType::I4) {
+            const auto k_physical  = copy_from_guarded<std::uint8_t>(k_, code_elements_);
+            const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, code_elements_);
+            const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_);
+            const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_);
+            const auto k_packed    = gather_paged<std::uint8_t>(k_physical, kHeadDim / 2, geometry_,
+                                                                 logical_capacity_, block_table_host_);
+            const auto v_packed    = gather_paged<std::uint8_t>(v_physical, kHeadDim / 2, geometry_,
+                                                                 logical_capacity_, block_table_host_);
+            cache.k_i8             = unpack_i4_logical(k_packed);
+            cache.v_i8             = unpack_i4_logical(v_packed);
+            cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
+                                                        logical_capacity_, block_table_host_);
+            cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
+                                                        logical_capacity_, block_table_host_);
         } else {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, code_elements_);
             const auto v_physical  = copy_from_guarded<std::int8_t>(v_, code_elements_);
@@ -603,7 +714,7 @@ public:
         int failures = 0;
         failures += k_.verify_guards((label + " cache-k").c_str());
         failures += v_.verify_guards((label + " cache-v").c_str());
-        if (dtype_ == DType::I8) {
+        if (dtype_ == DType::I8 || dtype_ == DType::I4) {
             failures += k_scale_.verify_guards((label + " cache-k-scale").c_str());
             failures += v_scale_.verify_guards((label + " cache-v-scale").c_str());
         }
@@ -623,6 +734,7 @@ private:
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
     std::vector<std::int32_t> block_table_host_;
+    std::int32_t code_leading_;
     std::size_t code_elements_;
     std::size_t scale_elements_;
     GuardedDeviceBuffer k_;
@@ -642,7 +754,8 @@ public:
                               ? 2 * static_cast<std::int32_t>(rows_) * logical_pages_ + 1
                               : static_cast<std::int32_t>(rows_) * logical_pages_),
           block_tables_host_(rows_ * static_cast<std::size_t>(logical_pages_)),
-          code_elements_(static_cast<std::size_t>(kHeadDim) * kPagedKVPageSize *
+          code_leading_(dtype_ == DType::I4 ? kHeadDim / 2 : kHeadDim),
+          code_elements_(static_cast<std::size_t>(code_leading_) * kPagedKVPageSize *
                          geometry_.kv_heads * physical_pages_),
           scale_elements_(static_cast<std::size_t>(kQuantGroups) * kPagedKVPageSize *
                           geometry_.kv_heads * physical_pages_),
@@ -650,8 +763,12 @@ public:
              (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
           v_(code_elements_ *
              (dtype_ == DType::BF16 ? sizeof(std::uint16_t) : sizeof(std::int8_t))),
-          k_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
-          v_scale_(dtype_ == DType::I8 ? scale_elements_ * sizeof(std::uint16_t) : 1),
+          k_scale_(dtype_ == DType::I8 || dtype_ == DType::I4 ? scale_elements_ *
+                                                                   sizeof(std::uint16_t)
+                                                               : 1),
+          v_scale_(dtype_ == DType::I8 || dtype_ == DType::I4 ? scale_elements_ *
+                                                                   sizeof(std::uint16_t)
+                                                               : 1),
           block_tables_(block_tables_host_.size() * sizeof(std::int32_t)) {
         for (std::size_t row = 0; row < rows_; ++row) {
             const HostCache& cache = rows[row];
@@ -673,17 +790,20 @@ public:
     }
 
     PagedKVBatchLayerView view() {
+        const DType plane_dtype    = dtype_ == DType::I4 ? DType::U8 : dtype_;
         PagedKVBatchLayerView result;
-        result.k_pages      = Tensor(k_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
-        result.v_pages      = Tensor(v_.data(), dtype_,
-                                     {kHeadDim, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
+        result.k_pages      = Tensor(k_.data(), plane_dtype,
+                                     {code_leading_, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
+        result.v_pages      = Tensor(v_.data(), plane_dtype,
+                                     {code_leading_, kPagedKVPageSize, geometry_.kv_heads,
+                                      physical_pages_});
         result.block_tables = Tensor(block_tables_.data(), DType::I32,
                                      {logical_pages_, static_cast<std::int32_t>(rows_)});
         result.num_kv_heads = geometry_.kv_heads;
         result.head_dim     = kHeadDim;
         result.dtype        = dtype_;
-        if (dtype_ == DType::I8) {
+        if (dtype_ == DType::I8 || dtype_ == DType::I4) {
             result.k_scale_pages =
                 Tensor(k_scale_.data(), DType::FP16,
                        {kQuantGroups, kPagedKVPageSize, geometry_.kv_heads, physical_pages_});
@@ -711,6 +831,36 @@ public:
             failures +=
                 verify_exact((label + " cache-v").c_str(),
                              copy_from_guarded<std::uint16_t>(v_, code_elements_), expected_v);
+        } else if (dtype_ == DType::I4) {
+            std::vector<std::uint8_t> expected_k(code_elements_, 0);
+            std::vector<std::uint8_t> expected_v(code_elements_, 0);
+            std::vector<std::uint16_t> expected_ks(scale_elements_, 0);
+            std::vector<std::uint16_t> expected_vs(scale_elements_, 0);
+            for (std::size_t row = 0; row < rows_; ++row) {
+                const std::span<const std::int32_t> table = row_table(row);
+                const auto k_packed = pack_i4_logical(expected[row].k_i8);
+                const auto v_packed = pack_i4_logical(expected[row].v_i8);
+                scatter_paged_into(k_packed, kHeadDim / 2, geometry_, logical_capacity_, table,
+                                   expected_k);
+                scatter_paged_into(v_packed, kHeadDim / 2, geometry_, logical_capacity_, table,
+                                   expected_v);
+                scatter_paged_into(expected[row].k_scale, kQuantGroups, geometry_,
+                                   logical_capacity_, table, expected_ks);
+                scatter_paged_into(expected[row].v_scale, kQuantGroups, geometry_,
+                                   logical_capacity_, table, expected_vs);
+            }
+            failures +=
+                verify_exact((label + " cache-k-code").c_str(),
+                             copy_from_guarded<std::uint8_t>(k_, code_elements_), expected_k);
+            failures +=
+                verify_exact((label + " cache-v-code").c_str(),
+                             copy_from_guarded<std::uint8_t>(v_, code_elements_), expected_v);
+            failures += verify_exact((label + " cache-k-scale").c_str(),
+                                     copy_from_guarded<std::uint16_t>(k_scale_, scale_elements_),
+                                     expected_ks);
+            failures += verify_exact((label + " cache-v-scale").c_str(),
+                                     copy_from_guarded<std::uint16_t>(v_scale_, scale_elements_),
+                                     expected_vs);
         } else {
             std::vector<std::int8_t> expected_k(code_elements_, 0);
             std::vector<std::int8_t> expected_v(code_elements_, 0);
@@ -746,7 +896,7 @@ public:
                          block_tables_host_);
         failures += k_.verify_guards((label + " cache-k guard").c_str());
         failures += v_.verify_guards((label + " cache-v guard").c_str());
-        if (dtype_ == DType::I8) {
+        if (dtype_ == DType::I8 || dtype_ == DType::I4) {
             failures += k_scale_.verify_guards((label + " cache-k-scale guard").c_str());
             failures += v_scale_.verify_guards((label + " cache-v-scale guard").c_str());
         }
@@ -779,6 +929,30 @@ private:
             v_.copy_from_host(physical_v.data(), physical_v.size() * sizeof(std::uint16_t));
             return;
         }
+        if (dtype_ == DType::I4) {
+            std::vector<std::uint8_t> physical_k(code_elements_, 0);
+            std::vector<std::uint8_t> physical_v(code_elements_, 0);
+            std::vector<std::uint16_t> physical_ks(scale_elements_, 0);
+            std::vector<std::uint16_t> physical_vs(scale_elements_, 0);
+            for (std::size_t row = 0; row < rows_; ++row) {
+                const std::span<const std::int32_t> table = row_table(row);
+                const auto k_packed = pack_i4_logical(rows[row].k_i8);
+                const auto v_packed = pack_i4_logical(rows[row].v_i8);
+                scatter_paged_into(k_packed, kHeadDim / 2, geometry_, logical_capacity_, table,
+                                   physical_k);
+                scatter_paged_into(v_packed, kHeadDim / 2, geometry_, logical_capacity_, table,
+                                   physical_v);
+                scatter_paged_into(rows[row].k_scale, kQuantGroups, geometry_,
+                                   logical_capacity_, table, physical_ks);
+                scatter_paged_into(rows[row].v_scale, kQuantGroups, geometry_,
+                                   logical_capacity_, table, physical_vs);
+            }
+            k_.copy_from_host(physical_k.data(), physical_k.size() * sizeof(std::uint8_t));
+            v_.copy_from_host(physical_v.data(), physical_v.size() * sizeof(std::uint8_t));
+            k_scale_.copy_from_host(physical_ks.data(), physical_ks.size() * sizeof(std::uint16_t));
+            v_scale_.copy_from_host(physical_vs.data(), physical_vs.size() * sizeof(std::uint16_t));
+            return;
+        }
         std::vector<std::int8_t> physical_k(code_elements_, 0);
         std::vector<std::int8_t> physical_v(code_elements_, 0);
         std::vector<std::uint16_t> physical_ks(scale_elements_, 0);
@@ -807,6 +981,7 @@ private:
     std::int32_t logical_pages_;
     std::int32_t physical_pages_;
     std::vector<std::int32_t> block_tables_host_;
+    std::int32_t code_leading_;
     std::size_t code_elements_;
     std::size_t scale_elements_;
     GuardedDeviceBuffer k_;
@@ -846,10 +1021,16 @@ int verify_positions(const std::string& label, const GuardedDeviceBuffer& device
     return failures;
 }
 
-const char* cache_name(DType dtype) { return dtype == DType::BF16 ? "bf16" : "int8-g64"; }
+const char* cache_name(DType dtype) {
+    if (dtype == DType::BF16) { return "bf16"; }
+    if (dtype == DType::I4) { return "int4-g64"; }
+    return "int8-g64";
+}
 
 ReductionCriterion attention_criterion(DType dtype) {
-    return dtype == DType::BF16 ? kAttentionBf16Criterion : kAttentionInt8Criterion;
+    if (dtype == DType::BF16) { return kAttentionBf16Criterion; }
+    if (dtype == DType::I4) { return kAttentionInt4Criterion; }
+    return kAttentionInt8Criterion;
 }
 
 int verify_attention(const std::string& label, const std::vector<double>& actual,
@@ -1268,12 +1449,22 @@ int run_batch_cases() {
                        {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented, 503u});
     failures += run_batch_case(kGeometries[1], DType::BF16,
                                {16, {49, 2041}, {16, 7}, {1, 0}, MappingPattern::Identity, 504u});
+    failures += run_batch_case(kGeometries[0], DType::I4,
+                               {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1}, MappingPattern::Fragmented,
+                                505u});
+    failures += run_batch_case(kGeometries[1], DType::I4,
+                               {1,
+                                {0, 31, 63, 127, 511, 1023, 2047, 4095},
+                                {1, 1, 1, 1, 1, 1, 1, 1},
+                                {7, 0, 5, 2, 6, 1, 4, 3},
+                                MappingPattern::Identity,
+                                506u});
     return failures;
 }
 
 int run_geometry(const Geometry& geometry) {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::BF16, DType::I8, DType::I4}) {
         for (const MappingPattern mapping :
              {MappingPattern::Identity, MappingPattern::Offset, MappingPattern::Fragmented}) {
             failures += run_append_case(geometry, dtype, mapping, 100u + geometry.q_heads);
@@ -1318,7 +1509,7 @@ int run_geometry(const Geometry& geometry) {
 
 int verify_workspace_capacity_contract() {
     int failures = 0;
-    for (const DType dtype : {DType::BF16, DType::I8}) {
+    for (const DType dtype : {DType::BF16, DType::I8, DType::I4}) {
         constexpr ops::GqaExecutionEnvelope envelope{1, 1025};
         const std::size_t interval =
             ops::gqa_attention_workspace_capacity_bytes(16, dtype, envelope, 1, 1, 17);

@@ -105,11 +105,11 @@ void run_prefill(const Options& options, bool distinct) {
     const double bytes = 4.0 * static_cast<double>(n) + 20.0 * options.channels;
     const Result r     = bench_loop(
         [&](cudaStream_t s) {
-            if (distinct) {
-                ops::causal_conv1d_silu(tx, tw, tin, tout_state, tout, s);
-            } else {
-                ops::causal_conv1d_silu(tx, tw, tin, tout, s);
-            }
+if (distinct) {
+                    ops::causal_conv1d_silu(tx, tw, tin, tout_state, Tensor{}, tout, s);
+                } else {
+                    ops::causal_conv1d_silu(tx, tw, tin, Tensor{}, tout, s);
+                }
         },
         bytes);
     const std::string tag =
@@ -132,7 +132,8 @@ void run_decode(const Options& options) {
 
     const double bytes = 24.0 * options.channels;
     const Result r =
-        bench_loop([&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, tout, s); }, bytes);
+        bench_loop([&](cudaStream_t s) { ops::causal_conv1d_silu(tx, tw, ts, Tensor{}, tout, s); },
+                   bytes);
     const std::string tag = shape_tag("decode", options.channels, 1);
     print_result(tag.c_str(), r);
     run_copy_baseline(bytes, "copy same-byte decode baseline");

@@ -9,6 +9,7 @@
 #include "ops/input_projection_test_common.h"
 #include "ops/op_tester.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -128,6 +129,24 @@ std::vector<std::int32_t> selected_slots(std::int32_t rows) {
     std::vector<std::int32_t> slots{10, 2, 8, 0, 6, 4, 9, 1};
     slots.resize(static_cast<std::size_t>(rows));
     return slots;
+}
+
+// I8 conv-state quantization reference, matching ops/common/math.cuh::i8_quantize:
+// scale = RNE_FP16(max_abs / 127), code = clamp(RNE(x / scale), -127, 127), 0 when
+// scale == 0. The FP32 quotient and integer rounding are emulated exactly: x86-64
+// float division is IEEE-correct and nearbyint on the float's exact double image
+// equals __float2int_rn under FE_TONEAREST.
+std::uint16_t f32_to_fp16_rne(float f) { return __half_as_ushort(__float2half_rn(f)); }
+
+float fp16_bits_to_f32(std::uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+
+std::int8_t i8_reference_code(float value, float scale) {
+    if (scale == 0.0F) { return 0; }
+    const float quotient = static_cast<float>(value / scale);
+    double code          = std::nearbyint(static_cast<double>(quotient));
+    if (code > 127.0) { code = 127.0; }
+    if (code < -127.0) { code = -127.0; }
+    return static_cast<std::int8_t>(code);
 }
 
 void fill_record_patterns(const FoldProfile& profile, std::int32_t width, std::int32_t rows,
@@ -912,6 +931,411 @@ int run_i8_case(const FoldProfile profile, std::int32_t width, std::int32_t rows
     return failures;
 }
 
+// I8 conv pool form: the conv history holds one signed I8 code per window value plus a
+// per-(128-channel group, slot) FP16 scale plane. The plane is slot-major (slot s owns the
+// contiguous [groups] block) and read-only: the fold shifts stored codes verbatim and
+// quantizes only the incoming record taps under the slot's group scale, so the post-fold
+// codes and the entire scale plane are checked exactly. The recurrent state stays BF16 and
+// is cross-checked against the local snapshot, as in run_case.
+int run_i8_conv_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
+                     const std::vector<std::int32_t>& commits, std::uint32_t seed) {
+    const std::vector<std::int32_t> slots = selected_slots(rows);
+    const std::int32_t slot_count         = rows == 1 ? 3 : 11;
+    const std::size_t recurrent_slot_elements =
+        static_cast<std::size_t>(kStateDim) * kStateDim * profile.value_heads;
+    const std::size_t recurrent_slot_bytes = recurrent_slot_elements * sizeof(float);
+    const std::size_t conv_slot_elements   = static_cast<std::size_t>(profile.conv_channels) * 3;
+    const std::size_t conv_slot_bytes      = conv_slot_elements * sizeof(std::int8_t);
+    const std::int32_t conv_scale_groups   = profile.conv_channels / 128;
+    const std::size_t conv_scale_slot_bytes = static_cast<std::size_t>(conv_scale_groups) * 2;
+
+    const GdnReplayRecordSpec record_spec{
+        .layers          = profile.layers,
+        .record_capacity = kRecordCapacity,
+        .width           = width,
+        .conv_channels   = profile.conv_channels,
+        .qk_heads        = kQkHeads,
+        .value_heads     = profile.value_heads,
+        .key_dim         = kStateDim,
+        .value_dim       = kStateDim,
+    };
+    LayoutBuilder record_builder;
+    const GdnReplayRecordLayout record_layout =
+        plan_gdn_replay_records(record_builder, record_spec);
+    const std::size_t record_bytes = record_builder.finish(256);
+    DeviceBuffer record_storage(record_bytes + 2 * kGuardBytes);
+    record_storage.fill(0xa5);
+    void* record_base = offset_pointer(record_storage.p, kGuardBytes);
+    cuda_check(cudaMemset(record_base, 0xff, record_bytes), "initialize replay records");
+    const GdnReplayRecords records({record_base, record_bytes}, record_layout);
+
+    std::vector<std::uint16_t> conv_records(records.conv.numel(), 0xffffU);
+    std::vector<std::uint16_t> key_records(records.key.numel(), 0xffffU);
+    std::vector<std::uint16_t> value_records(records.value.numel(), 0xffffU);
+    std::vector<std::uint32_t> gate_records(records.gate.numel(), 0xffffffffU);
+    fill_record_patterns(profile, width, rows, commits, seed, conv_records, key_records,
+                         value_records, gate_records);
+    cuda_check(cudaMemcpy(records.conv.data, conv_records.data(), records.conv.bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload conv records");
+    cuda_check(cudaMemcpy(records.key.data, key_records.data(), records.key.bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload key records");
+    cuda_check(cudaMemcpy(records.value.data, value_records.data(), records.value.bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload value records");
+    cuda_check(cudaMemcpy(records.gate.data, gate_records.data(), records.gate.bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload gate records");
+
+    LayoutBuilder state_builder;
+    const LinearAttentionStatePoolLayout state_layout = plan_linear_attention_state_pool(
+        state_builder, {.layers         = static_cast<std::uint32_t>(profile.layers),
+                        .conv_channels  = profile.conv_channels,
+                        .conv_width     = 3,
+                        .value_heads    = profile.value_heads,
+                        .value_head_dim = kStateDim,
+                        .key_head_dim   = kStateDim,
+                        .slot_count     = slot_count,
+                        .conv_dtype     = DType::I8});
+    const std::size_t state_bytes = state_builder.finish(256);
+    DeviceBuffer state_storage(state_bytes + 2 * kGuardBytes);
+    state_storage.fill(0xa5);
+    void* state_base = offset_pointer(state_storage.p, kGuardBytes);
+    cuda_check(cudaMemset(state_base, 0, state_bytes), "initialize all-layer state");
+    LinearAttentionStatePool state_pool({state_base, state_bytes}, state_layout);
+
+    // Initial conv codes + sticky per-group scale per selected (layer, row) slot, at the
+    // record magnitude so the sticky scale quantizes the incoming taps without clamping.
+    // The expected post-fold codes and the unchanged scale are staged for exact comparison.
+    DeviceBuffer expected_conv(static_cast<std::size_t>(profile.layers) * rows *
+                               (conv_slot_bytes + conv_scale_slot_bytes));
+    expected_conv.fill(0);
+    for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
+        for (std::int32_t row = 0; row < rows; ++row) {
+            const std::int32_t slot     = slots[static_cast<std::size_t>(row)];
+            std::vector<std::uint16_t> logical(conv_slot_elements);
+            for (std::int32_t history = 0; history < 3; ++history) {
+                for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
+                    logical[static_cast<std::size_t>(history) * profile.conv_channels + channel] =
+                        bf16_pattern(seed + 400009U + layer * 223U + row * 41U + history * 13U +
+                                         channel,
+                                     0.05F);
+                }
+            }
+            std::vector<std::int8_t> codes(conv_slot_elements);
+            std::vector<std::uint16_t> scale_bits(conv_scale_groups);
+            for (std::int32_t group = 0; group < conv_scale_groups; ++group) {
+                const std::int32_t c_begin = group * 128;
+                float max_abs              = 0.0F;
+                for (std::int32_t channel = c_begin; channel < c_begin + 128; ++channel) {
+                    for (std::int32_t history = 0; history < 3; ++history) {
+                        max_abs = std::max(
+                            max_abs,
+                            std::fabs(bf16_to_f32(logical[static_cast<std::size_t>(history) *
+                                                            profile.conv_channels +
+                                                        channel])));
+                    }
+                }
+                scale_bits[static_cast<std::size_t>(group)] =
+                    f32_to_fp16_rne(max_abs / 127.0F);
+                const float scale = fp16_bits_to_f32(scale_bits[static_cast<std::size_t>(group)]);
+                for (std::int32_t channel = c_begin; channel < c_begin + 128; ++channel) {
+                    for (std::int32_t history = 0; history < 3; ++history) {
+                        codes[static_cast<std::size_t>(history) * profile.conv_channels +
+                              channel] = i8_reference_code(
+                            bf16_to_f32(logical[static_cast<std::size_t>(history) *
+                                                  profile.conv_channels +
+                                              channel]),
+                            scale);
+                    }
+                }
+            }
+            const Tensor destination =
+                state_pool.conv_slot(static_cast<std::uint32_t>(layer), slot);
+            cuda_check(cudaMemcpy(destination.data, codes.data(), conv_slot_bytes,
+                                  cudaMemcpyHostToDevice),
+                       "upload initial conv codes");
+            const Tensor destination_scale =
+                state_pool.conv_scale_slot(static_cast<std::uint32_t>(layer), slot);
+            cuda_check(cudaMemcpy(destination_scale.data, scale_bits.data(),
+                                  conv_scale_slot_bytes, cudaMemcpyHostToDevice),
+                       "upload initial conv scale");
+
+            std::vector<std::int8_t> expected = codes;
+            const std::int32_t commit = commits[static_cast<std::size_t>(row)];
+            if (commit > 0) {
+                const std::int64_t record_outer =
+                    static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+                for (std::int32_t channel = 0; channel < profile.conv_channels; ++channel) {
+                    const float scale = fp16_bits_to_f32(
+                        scale_bits[static_cast<std::size_t>(channel / 128)]);
+                    const auto record_value = [&](std::int32_t token) {
+                        return i8_reference_code(
+                            bf16_to_f32(conv_records[static_cast<std::size_t>(
+                                            (record_outer * width + token) *
+                                            profile.conv_channels) +
+                                         channel]),
+                            scale);
+                    };
+                    if (commit == 1) {
+                        expected[channel] =
+                            codes[static_cast<std::size_t>(profile.conv_channels) + channel];
+                        expected[static_cast<std::size_t>(profile.conv_channels) + channel] =
+                            codes[2ULL * profile.conv_channels + channel];
+                        expected[2ULL * profile.conv_channels + channel] = record_value(0);
+                    } else if (commit == 2) {
+                        expected[channel] = codes[2ULL * profile.conv_channels + channel];
+                        expected[static_cast<std::size_t>(profile.conv_channels) + channel] =
+                            record_value(0);
+                        expected[2ULL * profile.conv_channels + channel] = record_value(1);
+                    } else {
+                        expected[channel] = record_value(commit - 3);
+                        expected[static_cast<std::size_t>(profile.conv_channels) + channel] =
+                            record_value(commit - 2);
+                        expected[2ULL * profile.conv_channels + channel] =
+                            record_value(commit - 1);
+                    }
+                }
+            }
+            void* expected_destination = offset_pointer(
+                expected_conv.p,
+                static_cast<std::size_t>(layer * rows + row) *
+                    (conv_slot_bytes + conv_scale_slot_bytes));
+            cuda_check(cudaMemcpy(expected_destination, expected.data(), conv_slot_bytes,
+                                  cudaMemcpyHostToDevice),
+                       "stage expected conv codes");
+            cuda_check(cudaMemcpy(offset_pointer(expected_destination, conv_slot_bytes),
+                                  scale_bits.data(), conv_scale_slot_bytes,
+                                  cudaMemcpyHostToDevice),
+                       "stage unchanged conv scale");
+        }
+    }
+
+    const std::size_t expected_recurrent_bytes =
+        static_cast<std::size_t>(profile.layers) * rows * recurrent_slot_bytes;
+    DeviceBuffer expected_recurrent(expected_recurrent_bytes);
+    expected_recurrent.fill(0);
+    DeviceBuffer local_snapshot_state(static_cast<std::size_t>(width + 1) * recurrent_slot_bytes);
+    local_snapshot_state.fill(0);
+    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * kQkHeads * width;
+    const std::size_t out_elements =
+        static_cast<std::size_t>(kStateDim) * profile.value_heads * width;
+    DeviceBuffer q(q_elements * sizeof(std::uint16_t));
+    DeviceBuffer out(out_elements * sizeof(std::uint16_t));
+    q.fill(0);
+    DeviceBuffer g_row(static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
+    DeviceBuffer beta_row(static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
+    DeviceBuffer valid_device(sizeof(std::int32_t));
+    DeviceBuffer initial_device(sizeof(std::int32_t));
+    DeviceBuffer base_device(sizeof(std::int32_t));
+    const std::int32_t local_initial_slot = width;
+    const std::int32_t local_base_slot    = 0;
+    initial_device.copy_from_host(&local_initial_slot, sizeof(local_initial_slot));
+    base_device.copy_from_host(&local_base_slot, sizeof(local_base_slot));
+
+    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, kQkHeads, width, 1});
+    Tensor local_states(local_snapshot_state.p, DType::FP32,
+                        {kStateDim, kStateDim, profile.value_heads, width + 1});
+    Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
+    Tensor initial_selector(initial_device.p, DType::I32, {1});
+    Tensor base_selector(base_device.p, DType::I32, {1});
+    constexpr float kScale = 1.0F / std::sqrt(128.0F);
+
+    for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
+        const GdnReplayRecordLayer layer_records = records.layer(layer, rows);
+        for (std::int32_t row = 0; row < rows; ++row) {
+            const float initial_value =
+                signed_pattern(seed + 500009U + layer * 227U + row * 43U, 0.01F);
+            const std::vector<float> initial_recurrent(recurrent_slot_elements, initial_value);
+            const Tensor actual_initial = state_pool.recurrent_slot(
+                static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
+            cuda_check(cudaMemcpy(actual_initial.data, initial_recurrent.data(),
+                                  recurrent_slot_bytes, cudaMemcpyHostToDevice),
+                       "upload initial recurrent state");
+            cuda_check(cudaMemcpy(offset_pointer(local_snapshot_state.p,
+                                                 static_cast<std::size_t>(local_initial_slot) *
+                                                     recurrent_slot_bytes),
+                                 initial_recurrent.data(), recurrent_slot_bytes,
+                                 cudaMemcpyHostToDevice),
+                       "upload local snapshot initial state");
+
+            const std::int32_t commit = commits[static_cast<std::size_t>(row)];
+            void* expected =
+                offset_pointer(expected_recurrent.p,
+                               static_cast<std::size_t>(layer * rows + row) *
+                                   recurrent_slot_bytes);
+            if (commit == 0) {
+                cuda_check(cudaMemcpy(expected, initial_recurrent.data(), recurrent_slot_bytes,
+                                      cudaMemcpyHostToDevice),
+                           "save unchanged recurrent state");
+                continue;
+            }
+            valid_device.copy_from_host(&commit, sizeof(commit));
+            std::vector<float> g_host(static_cast<std::size_t>(profile.value_heads) * width);
+            std::vector<float> beta_host(static_cast<std::size_t>(profile.value_heads) * width);
+            const std::int64_t record_outer =
+                static_cast<std::int64_t>(layer) * kRecordCapacity + row;
+            for (std::int32_t token = 0; token < width; ++token) {
+                for (std::int32_t head = 0; head < profile.value_heads; ++head) {
+                    const std::size_t source = static_cast<std::size_t>(
+                        ((record_outer * width + token) * profile.value_heads + head) * 2);
+                    const std::size_t destination =
+                        static_cast<std::size_t>(token) * profile.value_heads + head;
+                    g_host[destination]    = std::bit_cast<float>(gate_records[source]);
+                    beta_host[destination] = std::bit_cast<float>(gate_records[source + 1]);
+                }
+            }
+            g_row.copy_from_host(g_host.data(), g_row.bytes);
+            beta_row.copy_from_host(beta_host.data(), beta_row.bytes);
+            Tensor key   = layer_records.key.slice(3, row, 1);
+            Tensor value = layer_records.value.slice(3, row, 1);
+            Tensor g_tensor(g_row.p, DType::FP32, {profile.value_heads, width, 1});
+            Tensor beta_tensor(beta_row.p, DType::FP32, {profile.value_heads, width, 1});
+            Tensor valid(valid_device.p, DType::I32, {1});
+            ops::gated_delta_net_snapshot(q_tensor, key, value, g_tensor, beta_tensor, kScale, true,
+                                          local_states, Tensor{}, valid, initial_selector,
+                                          base_selector, output, nullptr);
+            const void* selected =
+                offset_pointer(local_snapshot_state.p,
+                               static_cast<std::size_t>(commit - 1) * recurrent_slot_bytes);
+            cuda_check(cudaMemcpyAsync(expected, selected, recurrent_slot_bytes,
+                                       cudaMemcpyDeviceToDevice, nullptr),
+                       "save snapshot recurrent state");
+        }
+    }
+
+    const std::vector<std::uint8_t> records_before =
+        from_device<std::uint8_t>(record_storage, record_storage.bytes);
+    std::vector<ops::GdnReplayFoldRow> fold_rows(static_cast<std::size_t>(rows));
+    for (std::int32_t row = 0; row < rows; ++row) {
+        fold_rows[static_cast<std::size_t>(row)] = {slots[static_cast<std::size_t>(row)],
+                                                    commits[static_cast<std::size_t>(row)]};
+    }
+    ops::gdn_replay_fold(records, state_pool.all_layers_view(), fold_rows, nullptr);
+    cuda_synchronize();
+
+    int failures             = 0;
+    const std::string suffix = " i8-conv L=" + std::to_string(profile.layers) +
+                               " Hv=" + std::to_string(profile.value_heads) +
+                               " T=" + std::to_string(width) + " B=" + std::to_string(rows);
+    std::vector<float> actual_recurrent(recurrent_slot_elements);
+    std::vector<float> expected_recurrent_host(recurrent_slot_elements);
+    std::vector<std::int8_t> actual_codes(conv_slot_elements);
+    std::vector<std::int8_t> expected_codes(conv_slot_elements);
+    std::vector<std::uint16_t> actual_scale(conv_scale_groups);
+    std::vector<std::uint16_t> expected_scale(conv_scale_groups);
+    for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
+        for (std::int32_t row = 0; row < rows; ++row) {
+            const Tensor actual_state = state_pool.recurrent_slot(
+                static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
+            cuda_check(cudaMemcpy(actual_recurrent.data(), actual_state.data,
+                                  recurrent_slot_bytes, cudaMemcpyDeviceToHost),
+                       "download folded recurrent state");
+            const void* expected_state =
+                offset_pointer(expected_recurrent.p,
+                               static_cast<std::size_t>(layer * rows + row) *
+                                   recurrent_slot_bytes);
+            cuda_check(cudaMemcpy(expected_recurrent_host.data(), expected_state,
+                                  recurrent_slot_bytes, cudaMemcpyDeviceToHost),
+                       "download expected recurrent state");
+            if (actual_recurrent != expected_recurrent_host) {
+                std::cerr << "i8-conv fold recurrent state differs from snapshot" << suffix
+                          << " layer=" << layer << " row=" << row << "\n";
+                return failures + 1;
+            }
+
+            const Tensor actual_history = state_pool.conv_slot(
+                static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
+            cuda_check(cudaMemcpy(actual_codes.data(), actual_history.data, conv_slot_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "download folded conv codes");
+            const Tensor actual_scale_view = state_pool.conv_scale_slot(
+                static_cast<std::uint32_t>(layer), slots[static_cast<std::size_t>(row)]);
+            cuda_check(cudaMemcpy(actual_scale.data(), actual_scale_view.data,
+                                  conv_scale_slot_bytes, cudaMemcpyDeviceToHost),
+                       "download folded conv scale");
+            const void* expected_destination = offset_pointer(
+                expected_conv.p,
+                static_cast<std::size_t>(layer * rows + row) *
+                    (conv_slot_bytes + conv_scale_slot_bytes));
+            cuda_check(cudaMemcpy(expected_codes.data(), expected_destination, conv_slot_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "download expected conv codes");
+            cuda_check(cudaMemcpy(expected_scale.data(), offset_pointer(expected_destination,
+                                                                        conv_slot_bytes),
+                                  conv_scale_slot_bytes, cudaMemcpyDeviceToHost),
+                       "download expected conv scale");
+            if (actual_codes != expected_codes) {
+                std::cerr << "i8-conv fold conv codes differ" << suffix << " layer=" << layer
+                          << " row=" << row << "\n";
+                return failures + 1;
+            }
+            if (actual_scale != expected_scale) {
+                std::cerr << "i8-conv fold modified the sticky conv scale plane" << suffix
+                          << " layer=" << layer << " row=" << row << "\n";
+                return failures + 1;
+            }
+        }
+    }
+
+    // Inactive slots keep zero codes and zero scale; records and outer guards are untouched.
+    std::vector<float> inactive_recurrent(recurrent_slot_elements);
+    std::vector<std::int8_t> inactive_codes(conv_slot_elements);
+    std::vector<std::uint16_t> inactive_scale(conv_scale_groups);
+    for (std::int32_t layer = 0; layer < profile.layers; ++layer) {
+        for (std::int32_t slot = 0; slot < slot_count; ++slot) {
+            if (std::find(slots.begin(), slots.end(), slot) != slots.end()) { continue; }
+            const Tensor recurrent =
+                state_pool.recurrent_slot(static_cast<std::uint32_t>(layer), slot);
+            cuda_check(cudaMemcpy(inactive_recurrent.data(), recurrent.data, recurrent_slot_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "download inactive recurrent state");
+            if (!std::all_of(inactive_recurrent.begin(), inactive_recurrent.end(),
+                             [](float value) { return value == 0.0F; })) {
+                std::cerr << "i8-conv fold modified inactive recurrent slot" << suffix
+                          << " layer=" << layer << " slot=" << slot << "\n";
+                return failures + 1;
+            }
+            const Tensor conv = state_pool.conv_slot(static_cast<std::uint32_t>(layer), slot);
+            cuda_check(cudaMemcpy(inactive_codes.data(), conv.data, conv_slot_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "download inactive conv codes");
+            const Tensor conv_scale =
+                state_pool.conv_scale_slot(static_cast<std::uint32_t>(layer), slot);
+            cuda_check(cudaMemcpy(inactive_scale.data(), conv_scale.data, conv_scale_slot_bytes,
+                                  cudaMemcpyDeviceToHost),
+                       "download inactive conv scale");
+            if (!std::all_of(inactive_codes.begin(), inactive_codes.end(),
+                             [](std::int8_t value) { return value == 0; }) ||
+                !std::all_of(inactive_scale.begin(), inactive_scale.end(),
+                             [](std::uint16_t value) { return value == 0; })) {
+                std::cerr << "i8-conv fold modified inactive conv slot" << suffix << " layer="
+                          << layer << " slot=" << slot << "\n";
+                return failures + 1;
+            }
+        }
+    }
+
+    const std::vector<std::uint8_t> records_after =
+        from_device<std::uint8_t>(record_storage, record_storage.bytes);
+    if (records_after != records_before) {
+        std::cerr << "i8-conv fold modified record storage" << suffix << "\n";
+        ++failures;
+    }
+    const std::vector<std::uint8_t> state_storage_after =
+        from_device<std::uint8_t>(state_storage, state_storage.bytes);
+    if (!std::all_of(state_storage_after.begin(),
+                     state_storage_after.begin() + static_cast<std::ptrdiff_t>(kGuardBytes),
+                     [](std::uint8_t byte) { return byte == 0xa5; }) ||
+        !std::all_of(state_storage_after.end() - static_cast<std::ptrdiff_t>(kGuardBytes),
+                     state_storage_after.end(), [](std::uint8_t byte) { return byte == 0xa5; })) {
+        std::cerr << "i8-conv fold modified state outer guard" << suffix << "\n";
+        ++failures;
+    }
+    return failures;
+}
+
 int run_record_fold_rounds() {
     using ninfer::test::input_projection::DevicePackedWeight;
     using ninfer::test::input_projection::make_bf16_activation;
@@ -1049,13 +1473,13 @@ int run_record_fold_rounds() {
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             GdnReplayRecordLayer layer_records = records.layer(layer, 1);
             Tensor& conv_states                = state_pool.conv[static_cast<std::size_t>(layer)];
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv_weight, conv_states, valid,
+            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv_weight, conv_states, Tensor{}, valid,
                                               initial_selector, snapshot_selector, snapshot_query,
                                               snapshot_key, snapshot_value, snapshot_z_tensor,
                                               snapshot_workspace, nullptr);
-            ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, conv_states, valid,
-                                            initial_selector, layer_records.conv, record_query,
-                                            record_key, record_value, record_z_tensor,
+            ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, conv_states, Tensor{},
+                                            valid, initial_selector, layer_records.conv,
+                                            record_query, record_key, record_value, record_z_tensor,
                                             record_workspace, nullptr);
 
             Tensor snapshot_q_view = snapshot_query.view({kStateDim, kQkHeads, kWidth, 1});
@@ -1284,13 +1708,13 @@ int run_i8_record_fold_rounds() {
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             GdnReplayRecordLayer layer_records = records.layer(layer, 1);
             Tensor& conv_states                = state_pool.conv[static_cast<std::size_t>(layer)];
-            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv_weight, conv_states, valid,
+            ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv_weight, conv_states, Tensor{}, valid,
                                               initial_selector, snapshot_selector, snapshot_query,
                                               snapshot_key, snapshot_value, snapshot_z_tensor,
                                               snapshot_workspace, nullptr);
-            ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, conv_states, valid,
-                                            initial_selector, layer_records.conv, record_query,
-                                            record_key, record_value, record_z_tensor,
+            ops::gdn_input_proj_conv_record(x, parent.view(), conv_weight, conv_states, Tensor{},
+                                            valid, initial_selector, layer_records.conv,
+                                            record_query, record_key, record_value, record_z_tensor,
                                             record_workspace, nullptr);
 
             Tensor snapshot_q_view = snapshot_query.view({kStateDim, kQkHeads, kWidth, 1});
@@ -1403,6 +1827,11 @@ int main() {
     failures += run_i8_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1891U);
     failures += run_i8_case({30, 32, 8192}, 2, 1, {2}, 1901U);
     failures += run_i8_case({30, 32, 8192}, 6, 2, {2, 5}, 1911U);
+    failures += run_i8_conv_case({48, 48, 10240}, 2, 1, {2}, 1921U);
+    failures += run_i8_conv_case({48, 48, 10240}, 3, 4, {0, 1, 2, 3}, 1931U);
+    failures += run_i8_conv_case({48, 48, 10240}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1941U);
+    failures += run_i8_conv_case({30, 32, 8192}, 2, 1, {2}, 1951U);
+    failures += run_i8_conv_case({30, 32, 8192}, 6, 2, {2, 5}, 1961U);
     failures += run_i8_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

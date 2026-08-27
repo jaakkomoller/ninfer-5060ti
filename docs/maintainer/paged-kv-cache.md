@@ -19,7 +19,7 @@ Op 的状态效果、kernel 寻址约束和性能准入条件。具体 allocator
 - active request 一旦 admission，其声明范围内的 prefill、decode 和 speculative temporary growth
   都有 completion capacity guarantee；
 - 一个 GPU execution unit 期间，page mappings 和 logical valid frontiers 保持稳定；
-- BF16、INT8-G64 以及 target 定义的其他固定 bytes-per-token layouts 使用同一管理语义；
+- BF16、INT8-G64、INT4-G64 以及 target 定义的其他固定 bytes-per-token layouts 使用同一管理语义；
 - common allocator 不理解 GQA、MHA、MLA、MTP 或 DFlash 等模型语义；
 - single-sequence prefill/cached consumers 和 batched ordinary/MTP/DFlash decode consumers 都直接消费
   paged KV，不要求任何 sequence 的 growing KV 物理连续；
@@ -270,8 +270,12 @@ Main Text/MTP   [D, P, Hkv, Nphysical]  [D/64, P, Hkv, Nphysical]
 DFlash Full     [D, P, Nphysical, Hkv]  not used
 ```
 
-Main Text/MTP 使用 contiguous page-major order。对 element bytes `E` 和第一维 extent `X`（K/V/code
-为 `D`，scale 为 `D/64`）：
+INT4-G64 code planes 使用与 K/V 相同的 page-major order，第一维 extent 为 `D/2`：每个 byte 保存两个
+signed 4-bit code（low nibble = even `d`，high nibble = odd `d`），storage dtype 为 U8；scale plane
+与 INT8-G64 完全相同（FP16，quant group `D/64`）。
+
+Main Text/MTP 使用 contiguous page-major order。对 element bytes `E` 和第一维 extent `X`（K/V 与
+INT8 code 为 `D`，INT4 code 为 `D/2`，scale 为 `D/64`）：
 
 ```text
 nb[0] = E
@@ -304,8 +308,8 @@ DFlash Full: K[d,h,p] = k_pages[d,o,g,h]
              V[d,h,p] = v_pages[d,o,g,h]
 ```
 
-INT8 code 使用同一公式；scale 把 `d` 换成 quant group `d/64`。K、V、code 和 scale 不保存各自的
-page pointer table，而是使用同一个 pool-local page-group ID `g`。
+INT8/INT4 code 使用同一公式（INT4 每 byte 两个 code）；scale 把 `d` 换成 quant group `d/64`。K、V、
+code 和 scale 不保存各自的 page pointer table，而是使用同一个 pool-local page-group ID `g`。
 
 Common allocator 接收已经确定的 closed plane order、bytes、strides 和 alignment，不从中推导 head、codec
 或 Attention 语义。Production wrapper 只接受其 route 对应的上述 closed stride formula。Kernel 在
@@ -362,6 +366,10 @@ BF16 bytes/token
 
 INT8-G64 bytes/token
     = 2(K,V) * L * H * D
+    + 2(K,V) * L * H * (D/64) * sizeof(FP16 scale)
+
+INT4-G64 bytes/token
+    = 2(K,V) * L * H * (D/2)
     + 2(K,V) * L * H * (D/64) * sizeof(FP16 scale)
 ```
 
@@ -600,12 +608,16 @@ blocks；其 Full pool 使用 §4.3 的 head-major page-run order。两者保留
 |---|---|---:|---:|---:|
 | 27B Main Text | BF16 | 65536 | 4.0000 MiB | 3.9375 MiB |
 | 27B Main Text | INT8-G64 | 33792 | 2.0625 MiB | 2.0303 MiB |
+| 27B Main Text | INT4-G64 | 17408 | 1.0625 MiB | 1.0469 MiB |
 | 35B-A3B Main Text | BF16 | 20480 | 1.2500 MiB | 1.2305 MiB |
 | 35B-A3B Main Text | INT8-G64 | 10560 | 0.6445 MiB | 0.6345 MiB |
+| 35B-A3B Main Text | INT4-G64 | 5440 | 0.3320 MiB | 0.3271 MiB |
 | 27B MTP | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 | 27B MTP | INT8-G64 | 2112 | 0.1289 MiB | 0.1269 MiB |
+| 27B MTP | INT4-G64 | 1088 | 0.0664 MiB | 0.0654 MiB |
 | 35B-A3B MTP | BF16 | 2048 | 0.1250 MiB | 0.1230 MiB |
 | 35B-A3B MTP | INT8-G64 | 1056 | 0.0645 MiB | 0.0634 MiB |
+| 35B-A3B MTP | INT4-G64 | 544 | 0.0332 MiB | 0.0327 MiB |
 | 35B-A3B DFlash Full | BF16 | 4096 | 0.2500 MiB | 0.2461 MiB |
 
 27B Main Text BF16 的 4 MiB page group 分布在全部 full-attention planes。单层单个 K 或 V plane
@@ -1065,7 +1077,7 @@ storage/view boundary。
 |---|---|---|
 | `gqa_attention` | writable `PagedKVBatchLayerView` + `table_rows[B]` | 为 `B` 条独立 sequences append valid K/V columns，并执行一次 ragged causal Attention |
 | `gqa_attention_cached` | read-only `PagedKVLayerView` | 只读已经 populated 的 paged cache |
-| `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy 或 INT8-G64 encode |
+| `gqa_kv_append` | writable `PagedKVLayerView` | 写入全部 supplied rows，BF16 copy、INT8-G64 encode 或 INT4-G64 encode |
 | `kv_cache_append_prefix` growing entry | writable `PagedKVBatchLayerView` + counts/table rows | 只写每行 device count 选择的 exact prefix |
 | `bidirectional_gqa_attention` | read-only `PagedKVBatchLayerView` + table rows | batched 读取 DFlash Full pool；query K/V 仍是 transient Tensor |
 | `kv_cache_append_prefix` cyclic entry | batched `CyclicKVCacheLayerView` + lane selectors | DFlash local fixed window，不属于 growing pool |
@@ -1111,7 +1123,8 @@ Wrapper 必须验证：
 - physical page count、head geometry、dtype 和 optional scale planes 一致；
 - single view 的 block table 是 contiguous I32 `[Nlogical]`；batch view 的 table matrix 是 contiguous
   I32 `[Nlogical,C]`，row selectors 是 contiguous I32 `[B]`；
-- BF16 cache 不携带 scale planes，INT8-G64 cache 的 scale shape 和 strides 完整；
+- BF16 cache 不携带 scale planes，INT8-G64/INT4-G64 cache 的 scale shape 和 strides 完整，INT4 code
+  plane 是 U8 且第一维 extent 为 `D/2`；
 - causal `max_visible_keys <= Nlogical*P`；
 - DFlash `max_context <= Nlogical*P`；
 - input/output Tensor domain 与当前 entry 的已注册 geometry 一致。
@@ -1140,8 +1153,8 @@ geometry 和 codec 编译期专用。Page/head bases 在 CTA 或 tile 粒度计�
 机械地留在每次 scalar/vector access 上。
 
 不得实现一个在 inner loop 中解释 arbitrary page size、arbitrary layout 或 cache-kind variant 的通用
-runtime accessor。可以共享 shift/mask、page-base calculation 和 INT8 codec 等窄 primitive，但 BF16、
-INT8、causal prefill、causal small-T 和 DFlash context 保留各自可独立优化的 kernel body。
+runtime accessor。可以共享 shift/mask、page-base calculation 和 INT8/INT4 codec 等窄 primitive，但
+BF16、INT8、INT4、causal prefill、causal small-T 和 DFlash context 保留各自可独立优化的 kernel body。
 
 ### 17.2 Causal small-T BF16
 
@@ -1184,6 +1197,10 @@ key block和dynamic shared-memory profile，但 split span必须以 page-compati
 Append/encode阶段应以至少 `(token, kv_head)` 为page-translation共享单位。四个64-d quant groups不能
 各自从global memory重复加载同一个 block-table entry。Codec公式和最终 code/scale bits不变。
 
+INT4-G64 decode/prefill 复用同一 translation 与 page-ID sharing：packed code plane 与 scale plane
+使用同一 page-group ID `g`；K/V stage 先把 packed bytes 提升到 shared memory 中的 s8/bf16 表示，
+QK 按 Q8×s8 执行并在 per-group rescale 时乘 FP16 scale，与 INT8 route 在 unpack 后 byte-identical。
+
 ### 17.4 Causal prefill and cached prompt route
 
 Prefill 保持现有两阶段效果：
@@ -1196,7 +1213,7 @@ fill current K/V rows into cache
 Fill kernel按每个 logical token选择 page。一个 execution unit可以从 page中间开始并跨任意数量pages；
 不要求 prefill chunk、retained frontier或positions[0] page-aligned。
 
-Attention key loop继续从logical position 0遍历到当前query可见上界。当前 BF16和INT8 prefill的
+Attention key loop继续从logical position 0遍历到当前query可见上界。当前 BF16、INT8 和 INT4 prefill的
 key tile均为64，因而一个完整key tile正好对应一个physical page：
 
 ```text
@@ -1290,7 +1307,7 @@ positions和represented cache values计算结果，不复制production page trav
 - rewrite-checkpoint restore 截断 fragmented mapping、释放 trailing pages 并从 exact checkpoint
   继续；
 - BF16 append bit-exact；
-- INT8-G64 code和FP16 scale bits与独立codec oracle一致；
+- INT8-G64 与 INT4-G64 的 code 和 FP16 scale bits 与独立 codec oracle 一致；
 - cached-only route不修改任意cache plane；
 - prefix append的count为0、page边界前后和full count；
 - rejected/provisional stale bytes不进入valid read domain；
@@ -1313,6 +1330,7 @@ positions和represented cache values计算结果，不复制production page trav
 |---|---:|
 | D256 BF16 | 64 KiB |
 | D256 INT8-G64 incl. scales | 33 KiB |
+| D256 INT4-G64 incl. scales | 17 KiB |
 | D128 BF16 | 32 KiB |
 
 因此page-table payload本身不是主要带宽成本。需要实测防止的是重复lookup、跨页vector load、TLB/cache
@@ -1336,7 +1354,7 @@ reference/candidate 成对交替测量，结合重复分布和绝对 latency；�
 
 性能证据覆盖实际 route，而不是所有参数的笛卡尔积：
 
-- 两个 exact target 的 BF16/INT8-G64 causal decode `B=1,2,4,8`、`T=1` 和代表性 verify small-T；
+- 两个 exact target 的 BF16/INT8-G64/INT4-G64 causal decode `B=1,2,4,8`、`T=1` 和代表性 verify small-T；
 - causal prefill/cached-only 的一个普通 chunk 和一个长 chunk，并包含 non-aligned prefix base；
 - standalone append 的 small-T 与一个 prefill-sized chunk；
 - DFlash full-context 的 `T=1` 和完整 proposal block，覆盖普通与长 context；
@@ -1419,8 +1437,9 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 - growing KV 使用 homogeneous pools、pool-local I32 page-group IDs 和 allocation-owned ordered mapping；
 - 全部 registered growing pools 的 page size 为 `P=64`；
 - Main Text/MTP 的 K/V 与 code planes 固定为 contiguous page-major `[D,P,Hkv,Nphysical]`，INT8-G64
-  scale planes 固定为 `[D/64,P,Hkv,Nphysical]`；DFlash Full K/V 固定为 contiguous head-major page-run
-  `[D,P,Nphysical,Hkv]`；
+  scale planes 固定为 `[D/64,P,Hkv,Nphysical]`，INT4-G64 code planes 固定为 U8
+  `[D/2,P,Hkv,Nphysical]`（2 codes/byte）且 scale planes 与 INT8-G64 相同；DFlash Full K/V 固定为
+  contiguous head-major page-run `[D,P,Nphysical,Hkv]`；
 - exact strides 由 §4.2 对每个 homogeneous pool 唯一确定；request 和 runtime mode 不选择 order；
 - K/V/code/scale 及同 pool layers 共享一个 page-group ID 和一份 per-sequence block table；
 - device tables 使用 startup-fixed `max_concurrency` rows；single-sequence Ops 消费一行
@@ -1432,7 +1451,7 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 
 以下内容属于 route-specific implementation profile，可以在不改变 storage contract 时测量和调整：
 
-- BF16/INT8 route 的 warps per CTA、split count、keys per split 和 32/64-key route interval；
+- BF16/INT8/INT4 route 的 warps per CTA、split count、keys per split 和 32/64-key route interval；
 - block-table entry 在 register/shared memory 中的广播方式；
 - append kernel 每个 CTA 处理的 tokens/heads；
 - allocator 优先选择连续 free IDs 的 heuristic；

@@ -3,6 +3,7 @@
 #include "artifact/binder.h"
 #include "artifact/materializer.h"
 #include "artifact/reader.h"
+#include "core/arena.h"
 #include "core/device.h"
 #include "runtime/engine/kv_capacity.h"
 
@@ -70,13 +71,16 @@ std::size_t runtime_bytes_after_planned_weights(std::uint64_t weight_bytes) {
     std::size_t free_bytes  = 0;
     std::size_t total_bytes = 0;
     CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
-    if (weight_bytes > free_bytes) {
+    // Weights materialize into one DeviceArena, so the driver charges the next 2 MiB multiple
+    // of the planned capacity.
+    const std::size_t device_weight_bytes = device_allocation_bytes(weight_bytes);
+    if (device_weight_bytes > free_bytes) {
         throw std::invalid_argument("model weights require " + std::to_string(weight_bytes) +
                                     " bytes of device memory, but only " +
                                     std::to_string(free_bytes) +
                                     " bytes are free before loading weights");
     }
-    return free_bytes - static_cast<std::size_t>(weight_bytes);
+    return free_bytes - device_weight_bytes;
 }
 
 std::size_t current_free_device_bytes() {
