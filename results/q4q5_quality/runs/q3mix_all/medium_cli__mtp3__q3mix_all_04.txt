@@ -1,0 +1,80 @@
+```bash
+#!/bin/bash
+
+# Find all .log files recursively, print path and line count,
+# exit non-zero if any file has more than 1000 lines.
+
+exit_code=0
+
+# Use find to locate all *.log files, then for each file, count lines
+# and check if it exceeds 1000 lines.
+while IFS= read -r -d '' file; do
+    line_count=$(wc -l < "$file")
+    echo "$file: $line_count"
+    if [ "$line_count" -gt 1000 ]; then
+        exit_code=1
+    fi
+done < <(find . -type f -name '*.log' -print0)
+
+exit $exit_code
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.19 GiB     0.000 s
+load        weights                    100.00%     13.19 GiB /      13.19 GiB     6.689 s
+load        engine construction            9.917 s
+load        artifact/materialize           9.011 s
+load        host to device                 6.689 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.20 GiB
+summary     weight H2D                13.19 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.329 s
+generate    decode                         3.798 s
+generate    total                          4.128 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             69
+summary     reused prompt tokens      0
+summary     generated tokens          165
+summary     model elapsed             4.127 s
+summary     prefill speed             209.75 tok/s
+summary     decode speed              43.18 tok/s
+summary     throughput (overall)      39.98 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.19 GiB / 13.19 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        2.16 GiB
+summary     free after startup        2.07 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.19 GiB
+  runtime fixed           77.73 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             2.07 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.28 GiB
+summary     mtp draft window          3
+summary     mtp rounds                50
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        150
+summary     mtp accepted tokens       116
+summary     mtp acceptance rate       77.33%
+summary     mtp acceptance length     3.32 tok/round
+summary     mtp accepted by pos       44,38,34

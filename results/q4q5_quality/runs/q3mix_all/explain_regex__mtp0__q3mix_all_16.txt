@@ -1,0 +1,86 @@
+### Plain English Explanation
+
+This regular expression matches a **URL** that points to a website with a specific domain name and one of three specific top-level domains: `.com`, `.org`, or `.io`.
+
+Here is the breakdown of what it allows:
+1.  **Protocol**: It optionally starts with `http://` or `https://`. If neither is present, it’s treated as a relative URL or just the domain.
+2.  **Subdomain**: It optionally includes `www.` before the main domain.
+3.  **Domain Name**: It requires a domain name consisting only of lowercase letters (`a-z`), digits (`0-9`), and hyphens (`-`). It does **not** allow uppercase letters, underscores, or other special characters in the domain part.
+4.  **Top-Level Domain (TLD)**: The domain must end with exactly `.com`, `.org`, or `.io`. Other TLDs like `.net`, `.edu`, or `.co.uk` will **not** match.
+5.  **Path**: There is an optional `/` after the domain, but **no path is allowed**. If you include any characters after the domain (like `/about` or `/products`), the match will fail.
+6.  **Query String**: Optionally, it can include a `?` followed by any characters (except `#`) as the query string.
+7.  **Fragment**: Optionally, it can include a `#` followed by any characters as the fragment (anchor).
+
+**Key Limitations:**
+- Only matches `.com`, `.org`, or `.io` domains.
+- Domain names must be lowercase alphanumeric with hyphens only.
+- No path segments are allowed (e.g., `example.com/page` will **not** match).
+- Uppercase letters in the domain are not allowed.
+
+---
+
+### Example Strings
+
+#### ✅ Matching String
+```
+https://my-site.org?query=123#section
+```
+**Why it matches:**
+- Starts with `https://` (optional, allowed).
+- No `www.` (optional, allowed).
+- Domain `my-site` uses only lowercase letters and a hyphen (valid).
+- TLD is `.org` (one of the allowed TLDs).
+- No path (allowed).
+- Query string `?query
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      12.98 GiB     0.000 s
+load        weights                    100.00%     12.98 GiB /      12.98 GiB     5.382 s
+load        engine construction            8.129 s
+load        artifact/materialize           7.394 s
+load        host to device                 5.382 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        12.99 GiB
+summary     weight H2D                12.98 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.362 s
+generate    decode                        21.431 s
+generate    total                         21.795 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             86
+summary     reused prompt tokens      0
+summary     generated tokens          500
+summary     model elapsed             21.793 s
+summary     prefill speed             237.73 tok/s
+summary     decode speed              23.28 tok/s
+summary     throughput (overall)      22.94 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          12.98 GiB / 12.98 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        2.37 GiB
+summary     free after startup        2.28 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 12.98 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             2.27 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.07 GiB

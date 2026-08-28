@@ -221,6 +221,8 @@ QType qtype_for(WeightFormat format) {
     switch (format) {
     case WeightFormat::BF16:
         return QType::BF16_CTRL;
+    case WeightFormat::Q3G64F16S:
+        return QType::Q3G64_F16S;
     case WeightFormat::Q4G64F16S:
         return QType::Q4G64_F16S;
     case WeightFormat::Q5G64F16S:

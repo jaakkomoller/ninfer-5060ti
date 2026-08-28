@@ -28,6 +28,7 @@ struct Tensor {
 };
 
 enum class QType : std::uint16_t {
+    Q3G64_F16S           = 9,
     Q4G64_F16S           = 0,
     Q5G64_F16S           = 1,
     Q6G64_F16S           = 2,

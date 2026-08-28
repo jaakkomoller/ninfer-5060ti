@@ -15,6 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 import time
+import types
 from typing import Mapping, Sequence
 
 import torch
@@ -70,7 +71,7 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def preflight_inventory() -> None:
+def preflight_inventory(inventory: types.ModuleType) -> None:
     if (
         len(inventory.RESOURCE_SPECS),
         len(inventory.TEXT_CORE_TENSOR_SPECS),
@@ -84,12 +85,14 @@ def preflight_inventory() -> None:
     recipe.validate_recipe_coverage()
 
 
-def build_object_plan(resources: Mapping[str, bytes]) -> ObjectPlan:
-    preflight_inventory()
+def build_object_plan(resources: Mapping[str, bytes], inventory: types.ModuleType) -> ObjectPlan:
+    preflight_inventory(inventory)
     return family_conversion.build_object_plan(inventory.OBJECT_SPECS, resources)
 
 
-def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
+def load_resources(
+    model_dir: str | Path, inventory: types.ModuleType
+) -> tuple[ResourcePayload, ...]:
     expected_names = tuple(OFFICIAL_RESOURCE_SHA256)
     spec_names = tuple(spec.name for spec in inventory.RESOURCE_SPECS)
     if spec_names != expected_names:
@@ -116,15 +119,17 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
     return resources
 
 
-def preflight_conversion(model_dir: str | Path) -> ConversionPreflight:
+def preflight_conversion(
+    model_dir: str | Path, inventory: types.ModuleType
+) -> ConversionPreflight:
     model = Path(model_dir)
     config = family_conversion.load_json(model / "config.json")
     config_summary = qwen3_6_convert.validate_config(config)
-    preflight_inventory()
+    preflight_inventory(inventory)
     source = recipe.preflight_sources(model)
-    resources = load_resources(model)
+    resources = load_resources(model, inventory)
     resource_map = {resource.name: resource.data for resource in resources}
-    object_plan = build_object_plan(resource_map)
+    object_plan = build_object_plan(resource_map, inventory)
     ranking = _repo_root() / draft_head.DEFAULT_RANKING
     draft = draft_head.compute_shortlist(ranking, model)
     return ConversionPreflight(
@@ -165,11 +170,13 @@ def build_conversion_report(
     final_bytes: int,
     device: torch.device,
     ranking_path: str | Path,
+    inventory: types.ModuleType,
+    recipe_id: str = RECIPE_ID,
 ) -> dict[str, object]:
     return family_conversion.build_conversion_report(
         identity=ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
         target_key=inventory.TARGET_KEY,
-        recipe_id=RECIPE_ID,
+        recipe_id=recipe_id,
         repo_root=_repo_root(),
         model_dir=model_dir,
         out_path=out_path,
@@ -189,13 +196,15 @@ def convert(
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
+    inventory: types.ModuleType = inventory,
+    recipe_id: str = RECIPE_ID,
 ) -> Path:
     started = time.perf_counter()
     model = Path(model_dir)
     output = Path(out_path)
     requested_device = str(device)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(model)
+    preflight = preflight_conversion(model, inventory)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -245,6 +254,8 @@ def convert(
         final_bytes=final_bytes,
         device=resolved_device,
         ranking_path=ranking,
+        inventory=inventory,
+        recipe_id=recipe_id,
     )
     report_path = Path(str(output) + ".conversion.json")
     with report_path.open("w", encoding="utf-8") as handle:
@@ -262,8 +273,25 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--profile",
+        default="q4",
+        choices=("q4", "q3mix"),
+        help="storage profile: q4 (default) or q3mix (text mlp/down as Q3)",
+    )
     args = parser.parse_args(argv)
-    convert(args.model, args.out, device=args.device)
+    if args.profile == "q3mix":
+        from . import inventory_q3mix
+
+        convert(
+            args.model,
+            args.out,
+            device=args.device,
+            inventory=inventory_q3mix,
+            recipe_id="qwen3_8_27b-q3mix-v1",
+        )
+    else:
+        convert(args.model, args.out, device=args.device)
 
 
 if __name__ == "__main__":

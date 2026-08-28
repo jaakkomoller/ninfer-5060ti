@@ -1,0 +1,91 @@
+### (a) What Each Public Function Does
+
+1.  **`__init__(self)`**:
+    Initializes the `Index` object with two attributes:
+    *   `self.docs`: A dictionary mapping keys to document data.
+    *   `self.sorted_keys`: A list of keys, kept in sorted order.
+
+2.  **`add(self, key, doc)`**:
+    Adds a single key-value pair to the index.
+    *   Stores `doc` in `self.docs` under `key`.
+    *   Re-sorts all keys in `self.docs` and updates `self.sorted_keys` to reflect the new sorted order.
+
+3.  **`merge(self, other)`**:
+    Merges the contents of another `Index` instance (`other`) into the current instance (`self`).
+    *   Iterates over the keys in `other.sorted_keys`.
+    *   For each key, copies the corresponding document from `other.docs` into `self.docs`.
+    *   Re-sorts `self.docs` and updates `self.sorted_keys` after each insertion.
+
+---
+
+### (b) The Bug in `merge()`
+
+The bug is that **`merge()` does not handle key collisions correctly**. Specifically, if a key exists in both `self` and `other`, the value from `other` will overwrite the value in `self`, even if the intent was to preserve the original value or if the documents are identical. More critically, **the method assumes that `other.sorted_keys` contains all keys from `other.docs`**, which is true, but the real issue is **inefficiency and potential logical error in the merge semantics**.
+
+However, the most significant **functional bug** is that **`merge()` does not check if the key already exists in `self` before overwriting**. In many merge scenarios, you might want to:
+- Skip keys that already exist in `self` (first-wins).
+- Or explicitly overwrite (last-wins).
+- Or raise an error on conflict.
+
+The current implementation **silently overwrites** existing keys in `self` with values from `other`, which may not be the desired behavior. If the user expects `merge` to only add *new* keys (i.e., keys not already in `self`), this function will incorrectly overwrite existing data.
+
+Additionally, **the method is inefficient**: it calls `sorted(self.docs)` inside the loop for every single key, resulting in **O(N * M log M)** time complexity (where N is the number of keys in `other` and M is the total number of keys in `self` after each insertion). This is unnecessarily slow for large indices.
+
+---
+
+### (c) Why the Bug Occurs
+
+1.  **Lack of Conflict Resolution Logic**:
+    The `merge()` method blindly assigns `self
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      12.98 GiB     0.000 s
+load        weights                    100.00%     12.98 GiB /      12.98 GiB     6.518 s
+load        engine construction            9.319 s
+load        artifact/materialize           8.588 s
+load        host to device                 6.518 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        12.99 GiB
+summary     weight H2D                12.98 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.553 s
+generate    decode                        25.756 s
+generate    total                         26.311 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             143
+summary     reused prompt tokens      0
+summary     generated tokens          600
+summary     model elapsed             26.309 s
+summary     prefill speed             258.69 tok/s
+summary     decode speed              23.26 tok/s
+summary     throughput (overall)      22.81 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          12.98 GiB / 12.98 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        2.37 GiB
+summary     free after startup        2.28 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 12.98 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             2.27 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.07 GiB

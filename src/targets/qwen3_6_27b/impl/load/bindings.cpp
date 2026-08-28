@@ -160,7 +160,7 @@ Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_co
         throw std::logic_error("invalid target row view");
     }
     const std::uint64_t groups    = static_cast<std::uint64_t>(block.padded_shape[1] / block.group);
-    const std::uint64_t low_group = 32;
+    const std::uint64_t low_group = block.qtype == QType::Q3G64_F16S ? 24 : 32;
     const std::uint64_t high_group = block.qtype == QType::Q5G64_F16S   ? 8
                                      : block.qtype == QType::Q6G64_F16S ? 16
                                                                         : 0;
@@ -236,10 +236,16 @@ load_gdn_control_projection(const GdnPlan& plan,
 }
 
 void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
-    // Text projection roles may be stored as Q5 or Q4. The runtime dispatch is
-    // weight-qtype driven, so the binding probes the artifact's actual format.
+    // Text projection roles may be stored as Q5 or Q4; mlp/down may additionally
+    // be stored as Q3 under the Q3 profile. The runtime dispatch is weight-qtype
+    // driven, so the binding probes the artifact's actual format.
     const auto q4_or_q5 = [&binder](std::string name) {
         return weight_format_for(binder, name, {NumericFormat::Q4G64_F16S,
+                                                NumericFormat::Q5G64_F16S});
+    };
+    const auto mlp_down_format = [&binder](std::string name) {
+        return weight_format_for(binder, name, {NumericFormat::Q3G64_F16S,
+                                                NumericFormat::Q4G64_F16S,
                                                 NumericFormat::Q5G64_F16S});
     };
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
@@ -292,7 +298,7 @@ target.gdn.input_projection = SplitGdnInputProjectionPlan{
         target.mlp.gate_up =
             bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120});
         target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", q4_or_q5(prefix + "mlp/down"),
+            bind_weight(binder, prefix + "mlp/down", mlp_down_format(prefix + "mlp/down"),
                         {5120, 17408});
     }
 }

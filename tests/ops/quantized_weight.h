@@ -150,6 +150,8 @@ struct QuantSpec {
 
 inline QuantSpec quant_spec(QType qtype) {
     switch (qtype) {
+    case QType::Q3G64_F16S:
+        return {3, 64, 3, -4};
     case QType::Q4G64_F16S:
         return {4, 64, 7, -8};
     case QType::Q5G64_F16S:
@@ -164,7 +166,9 @@ inline QuantSpec quant_spec(QType qtype) {
 }
 
 inline int nibble_bytes_per_group(const QuantSpec& spec) {
-    return spec.bits == 8 ? spec.group_size : spec.group_size / 2;
+    if (spec.bits == 8) { return spec.group_size; }
+    if (spec.bits == 3) { return spec.group_size * 3 / 8; }
+    return spec.group_size / 2;
 }
 
 inline int high_bytes_per_group(const QuantSpec& spec) {
@@ -181,6 +185,20 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
     if (spec.bits == 8) {
         for (int i = 0; i < spec.group_size; ++i) {
             nibble_out[i] = static_cast<std::uint8_t>(codes[i]);
+        }
+        return;
+    }
+    if (spec.bits == 3) {
+        // Q3 offset encoding: stored u = (q + 4) & 7, code i occupies bit [3i, 3i + 3).
+        for (int i = 0; i < spec.group_size; ++i) {
+            const std::uint32_t u     = (static_cast<std::uint32_t>(codes[i]) + 4u) & 7u;
+            const int bit             = 3 * i;
+            const int byte            = bit >> 3;
+            const int shift           = bit & 7;
+            nibble_out[byte] |= static_cast<std::uint8_t>((u << shift) & 0xffu);
+            if (shift + 3 > 8) {
+                nibble_out[byte + 1] |= static_cast<std::uint8_t>((u << shift) >> 8);
+            }
         }
         return;
     }
@@ -208,6 +226,21 @@ inline void pack_lowbit_group(const std::int8_t* codes, const QuantSpec& spec,
 inline int unpack_lowbit_code(const std::uint8_t* nibble, const std::uint8_t* high,
                               const QuantSpec& spec, int index) {
     if (spec.bits == 8) { return static_cast<std::int8_t>(nibble[index]); }
+    if (spec.bits == 3) {
+        // Q3 offset encoding: code i at bit [3i, 3i + 3), stored u, q = u - 4.
+        const int bit   = 3 * index;
+        const int byte  = bit >> 3;
+        const int shift = bit & 7;
+        std::uint32_t word;
+        if (shift + 3 <= 8) {
+            word = nibble[byte];
+        } else {
+            word = static_cast<std::uint32_t>(nibble[byte]) |
+                   (static_cast<std::uint32_t>(nibble[byte + 1]) << 8);
+        }
+        const std::uint32_t u = (word >> shift) & 7u;
+        return static_cast<int>(u) - 4;
+    }
     const std::uint8_t low_byte = nibble[index >> 1];
     const std::uint32_t low     = (index & 1) ? (low_byte >> 4) : (low_byte & 0x0fu);
     std::uint32_t hi            = 0;
@@ -862,6 +895,11 @@ inline PackedWeight pack_row_split_lowbit(const std::vector<float>& source, std:
     out.weight.n               = n;
     out.weight.k               = k;
     return out;
+}
+
+inline PackedWeight pack_q3_row_split(const std::vector<float>& source, std::int32_t n,
+                                      std::int32_t k) {
+    return pack_row_split_lowbit(source, n, k, QType::Q3G64_F16S);
 }
 
 inline PackedWeight pack_q4_row_split(const std::vector<float>& source, std::int32_t n,

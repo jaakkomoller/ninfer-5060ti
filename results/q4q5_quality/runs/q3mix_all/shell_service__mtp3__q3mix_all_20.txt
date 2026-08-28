@@ -1,0 +1,95 @@
+```ini
+# /etc/systemd/system/myapp.service
+# Systemd service unit file for myapp
+
+[Unit]
+# Description shown in systemctl status output
+Description=My Application Service
+
+# Ensure the service starts only after the network is fully online
+# This prevents the app from starting before network interfaces are up
+After=network-online.target
+
+# Create a dependency on network-online.target so systemd waits for it
+Wants=network-online.target
+
+[Service]
+# Run the process as the unprivileged user 'myapp'
+User=myapp
+
+# The full command to execute, including the port argument
+ExecStart=/usr/local/bin/myapp --port 8080
+
+# Restart the service if it exits with a non-zero status (failure)
+Restart=on-failure
+
+# Wait 5 seconds before restarting a failed service
+RestartSec=5
+
+# Optional: set working directory if needed
+# WorkingDirectory=/var/lib/myapp
+
+[Install]
+# Specify the target to enable the service at boot
+WantedBy=multi-user.target
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.19 GiB     0.000 s
+load        weights                    100.00%     13.19 GiB /      13.19 GiB     6.992 s
+load        engine construction           10.247 s
+load        artifact/materialize           9.181 s
+load        host to device                 6.992 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.20 GiB
+summary     weight H2D                13.19 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.357 s
+generate    decode                         5.924 s
+generate    total                          6.282 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             74
+summary     reused prompt tokens      0
+summary     generated tokens          224
+summary     model elapsed             6.281 s
+summary     prefill speed             207.24 tok/s
+summary     decode speed              37.64 tok/s
+summary     throughput (overall)      35.66 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.19 GiB / 13.19 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        2.16 GiB
+summary     free after startup        2.07 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.19 GiB
+  runtime fixed           77.73 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             2.07 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.28 GiB
+summary     mtp draft window          3
+summary     mtp rounds                78
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        234
+summary     mtp accepted tokens       145
+summary     mtp acceptance rate       61.97%
+summary     mtp acceptance length     2.86 tok/round
+summary     mtp accepted by pos       63,47,35
