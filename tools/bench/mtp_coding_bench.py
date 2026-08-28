@@ -48,7 +48,7 @@ PROMPTS: list[dict[str, Any]] = [
         "id": "small_factorial",
         "category": "small_codegen",
         "prompt": "Write a Python function `factorial(n)` that computes n! iteratively (no recursion). Raise ValueError for negative inputs. Include a docstring and a usage example.",
-        "max_new": 250,
+        "max_new": 512,
     },
     {
         "id": "small_greet",
@@ -150,7 +150,7 @@ PROMPTS: list[dict[str, Any]] = [
         "id": "explain_regex",
         "category": "explaining",
         "prompt": "Explain in plain English what this regex matches, give two example strings (one that matches, one that does not), and describe each group:\n`^(?:https?://)?(?:www\\.)?([a-z0-9-]+)\\.(com|org|io)/?(?:\\?([^#]*))?(?:#(.*))?$`",
-        "max_new": 500,
+        "max_new": 800,
     },
 
     # ---------- 8. reasoning over moderate source-code context ----------
@@ -158,7 +158,7 @@ PROMPTS: list[dict[str, Any]] = [
         "id": "reason_source_explain",
         "category": "reasoning_source",
         "prompt": "Read the following Python module and explain (a) what each public function does, (b) the bug in `merge()`, and (c) why the bug occurs:\n```python\nclass Index:\n    def __init__(self):\n        self.docs = {}\n        self.sorted_keys = []\n\n    def add(self, key, doc):\n        self.docs[key] = doc\n        self.sorted_keys = sorted(self.docs)\n\n    def merge(self, other):\n        for key in other.sorted_keys:\n            self.docs[key] = other.docs[key]\n            self.sorted_keys = sorted(self.docs)\n```",
-        "max_new": 600,
+        "max_new": 900,
     },
 
     # ---------- 9. multi-file repository style ----------
@@ -207,7 +207,7 @@ PROMPTS: list[dict[str, Any]] = [
         "id": "shell_service",
         "category": "shell_sysadmin",
         "prompt": "Write a systemd service unit file `/etc/systemd/system/myapp.service` that runs `/usr/local/bin/myapp --port 8080` as user `myapp`, restarts on failure with a 5-second delay, and only starts after network-online.target. Include comments explaining each directive.",
-        "max_new": 600,
+        "max_new": 800,
     },
 ]
 

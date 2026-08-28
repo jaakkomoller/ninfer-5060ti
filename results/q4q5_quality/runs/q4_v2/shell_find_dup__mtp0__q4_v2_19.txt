@@ -1,0 +1,55 @@
+```bash
+find /var/log -type f -readable -print0 | xargs -0 sha256sum 2>/dev/null | awk '{print $1}' | sort | uniq -c | sort -rn | while read -r count hash; do echo "=== $hash ($count files) ==="; find /var/log -type f -readable -print0 | xargs -0 sha256sum 2>/dev/null | awk -v h="$hash" '$1==h {print $2}'; done
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.64 GiB     0.000 s
+load        weights                    100.00%     13.64 GiB /      13.64 GiB     6.195 s
+load        engine construction            8.979 s
+load        artifact/materialize           8.054 s
+load        host to device                 6.195 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.65 GiB
+summary     weight H2D                13.64 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.250 s
+generate    decode                         4.693 s
+generate    total                          4.944 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             59
+summary     reused prompt tokens      0
+summary     generated tokens          118
+summary     model elapsed             4.943 s
+summary     prefill speed             236.07 tok/s
+summary     decode speed              24.93 tok/s
+summary     throughput (overall)      23.87 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.64 GiB / 13.64 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        6.55 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        1.70 GiB
+summary     free after startup        1.62 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.64 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             1.61 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.73 GiB

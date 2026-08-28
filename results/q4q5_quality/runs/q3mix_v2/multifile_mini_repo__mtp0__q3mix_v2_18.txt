@@ -1,0 +1,79 @@
+```python
+class Counter:
+    def __init__(self):
+        self._data = {}
+    def incr(self, key, by=1):
+        self._data[key] = self._data.get(key, 0) + by
+    def get(self, key):
+        return self._data.get(key, 0)
+    def __str__(self):
+        items = sorted(self._data.items(), key=lambda x: (-x[1], x[0]))
+        return ', '.join(f"{k}:{v}" for k, v in items)
+```
+
+```python
+from storage import Counter
+c = Counter()
+c.incr('a'); c.incr('b', 2); c.incr('a')
+assert c.get('a') == 2
+assert str(c) == 'a:2, b:2'
+
+c2 = Counter()
+c2.incr('z', 5); c2.incr('a', 3); c2.incr('m', 5)
+assert str(c2) == 'm:5, z:5, a:3'
+
+c3 = Counter()
+assert str(c3) == ''
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      12.98 GiB     0.000 s
+load        weights                    100.00%     12.98 GiB /      12.98 GiB     6.792 s
+load        engine construction            9.668 s
+load        artifact/materialize           8.882 s
+load        host to device                 6.792 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        12.99 GiB
+summary     weight H2D                12.98 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.001 s
+generate    vision                         0.000 s
+generate    text prefill                   0.753 s
+generate    decode                        11.134 s
+generate    total                         11.889 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             259
+summary     reused prompt tokens      0
+summary     generated tokens          258
+summary     model elapsed             11.887 s
+summary     prefill speed             343.96 tok/s
+summary     decode speed              23.08 tok/s
+summary     throughput (overall)      21.70 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          12.98 GiB / 12.98 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        2.37 GiB
+summary     free after startup        2.28 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 12.98 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             2.27 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.07 GiB

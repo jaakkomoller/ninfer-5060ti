@@ -1,0 +1,59 @@
+```c
+int copy_n(int *dst, const int *src, int n) {
+    if (n > 8) n = 8;
+    for (int i = 0; i < n; i++) dst[i] = src[i];
+    return n;
+}
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.64 GiB     0.000 s
+load        weights                    100.00%     13.64 GiB /      13.64 GiB     5.675 s
+load        engine construction            8.408 s
+load        artifact/materialize           7.584 s
+load        host to device                 5.675 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.65 GiB
+summary     weight H2D                13.64 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.391 s
+generate    decode                         2.604 s
+generate    total                          2.996 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             115
+summary     reused prompt tokens      0
+summary     generated tokens          66
+summary     model elapsed             2.995 s
+summary     prefill speed             294.29 tok/s
+summary     decode speed              24.96 tok/s
+summary     throughput (overall)      22.04 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.64 GiB / 13.64 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        1.70 GiB
+summary     free after startup        1.62 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.64 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             1.61 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.73 GiB

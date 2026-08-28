@@ -1,0 +1,104 @@
+```python
+import heapq
+from typing import Dict, List, Tuple
+
+
+def dijkstra(graph: Dict[int, List[Tuple[int, int]]], source: int) -> Dict[int, float]:
+    """
+    Compute shortest paths from source to all reachable nodes using Dijkstra's algorithm.
+    
+    Args:
+        graph: A dictionary mapping each node to a list of (neighbor, weight) tuples.
+        source: The starting node.
+    
+    Returns:
+        A dictionary mapping each reachable node to its shortest distance from source.
+    """
+    # Initialize distances to infinity for all nodes
+    # We'll collect all nodes from the graph
+    all_nodes = set()
+    for node, neighbors in graph.items():
+        all_nodes.add(node)
+        for neighbor, weight in neighbors:
+            all_nodes.add(neighbor)
+    
+    # Initialize distances
+    distances: Dict[int, float] = {node: float('inf') for node in all_nodes}
+    distances[source] = 0
+    
+    # Priority queue: (distance, node)
+    pq: List[Tuple[float, int]] = [(0, source)]
+    
+    # Process nodes
+    while pq:
+        dist, node = heapq.heappop(pq)
+        
+        # If we've already found a shorter path, skip
+        if dist > distances[node]:
+            continue
+        
+        # Explore neighbors
+        if node in graph:
+            for neighbor, weight in graph[node]:
+                new_dist = dist + weight
+                if new_dist < distances[neighbor]:
+                    distances[neighbor] = new_dist
+                    heapq.heappush(pq, (new_dist, neighbor))
+    
+    # Remove unreachable nodes (distance is still infinity)
+    result = {node: dist for node, dist in distances.items() if dist != float('inf')}
+    
+    return result
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      12.98 GiB     0.000 s
+load        weights                    100.00%     12.98 GiB /      12.98 GiB     5.862 s
+load        engine construction            8.637 s
+load        artifact/materialize           7.928 s
+load        host to device                 5.862 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        12.99 GiB
+summary     weight H2D                12.98 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.252 s
+generate    decode                        17.263 s
+generate    total                         17.516 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             66
+summary     reused prompt tokens      0
+summary     generated tokens          402
+summary     model elapsed             17.515 s
+summary     prefill speed             262.12 tok/s
+summary     decode speed              23.23 tok/s
+summary     throughput (overall)      22.95 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          12.98 GiB / 12.98 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        7.39 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        2.37 GiB
+summary     free after startup        2.28 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 12.98 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             2.27 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.07 GiB

@@ -1,0 +1,117 @@
+### Plain English Explanation
+
+This regular expression matches a **URL** that points to a website with a specific domain name and one of three specific top-level domains: `.com`, `.org`, or `.io`.
+
+Here’s the breakdown in plain English:
+1.  **Protocol (Optional):** It may start with `http://` or `https://`.
+2.  **Subdomain (Optional):** It may include `www.` before the main domain.
+3.  **Domain Name (Required):** It must have a domain name consisting only of lowercase letters (`a-z`), digits (`0-9`), and hyphens (`-`).
+4.  **Top-Level Domain (Required):** The domain must end with exactly `.com`, `.org`, or `.io`.
+5.  **Path (Optional):** There may be a `/` followed by nothing (or it can be omitted entirely).
+6.  **Query String (Optional):** There may be a `?` followed by any characters (except `#`) representing query parameters.
+7.  **Fragment (Optional):** There may be a `#` followed by any characters representing a fragment/anchor.
+
+**Key Constraints:**
+- The domain name part **cannot** contain uppercase letters, underscores, or other special characters.
+- The TLD is restricted to only `.com`, `.org`, or `.io`. Other TLDs like `.net`, `.edu`, or `.dev` will **not** match.
+- The entire string must match from start to finish (due to `^` and `$`).
+
+---
+
+### Example Strings
+
+#### ✅ Matching String
+```
+https://www.example-site.org?query=123#section
+```
+**Why it matches:**
+- Starts with `https://` (optional protocol).
+- Has `www.` (optional subdomain).
+- Domain is `example-site` (only lowercase letters and hyphens).
+- TLD is `.org` (one of the allowed TLDs).
+- Has a `/` (optional, present here).
+- Has `?query=123` (optional query string).
+- Has `#section` (optional fragment).
+- Matches the entire pattern from start to end.
+
+#### ❌ Non-Matching String
+```
+https://example.net/path
+```
+**Why it does NOT match:**
+- The TLD is `.net`, but the regex only allows `.com`, `.org`, or `.io`.
+- Even though the rest of the structure is valid, the TLD restriction causes the match to fail.
+
+---
+
+### Group Descriptions
+
+The regex has **three** capturing groups (parentheses without `?:`):
+
+| Group # | Pattern | Description |
+|---------|---------|-------------|
+| **1** | `([a-z0-9-]+)` | Captures the **domain name** (the part before the TLD). It consists of one or more lowercase letters, digits, or hyphens. Example: in `example-site.org`, this captures `example-site`. |
+| **2** | `(com\|org\|io)` | Captures the **top-level domain** (TLD). It will be exactly one of: `com`, `org`, or `io`. Example: in `example-site.org`, this captures `org`. |
+| **3** | `([^#]*)` | Captures the **query string** (the part after `?` and before `#`). It matches any characters except `#`. If no query string is present, this group captures an empty string. Example: in `?query=123#section`, this captures `query=123`. |
+
+**Note:** The other parentheses in the regex use `(?:...)`, which are **
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.19 GiB     0.000 s
+load        weights                    100.00%     13.19 GiB /      13.19 GiB     6.684 s
+load        engine construction            9.709 s
+load        artifact/materialize           8.609 s
+load        host to device                 6.684 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.20 GiB
+summary     weight H2D                13.19 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.406 s
+generate    decode                        19.533 s
+generate    total                         19.941 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             86
+summary     reused prompt tokens      0
+summary     generated tokens          800
+summary     model elapsed             19.940 s
+summary     prefill speed             211.73 tok/s
+summary     decode speed              40.90 tok/s
+summary     throughput (overall)      40.12 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.19 GiB / 13.19 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        2.16 GiB
+summary     free after startup        2.07 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.19 GiB
+  runtime fixed           77.73 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             2.07 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.28 GiB
+summary     mtp draft window          3
+summary     mtp rounds                257
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        771
+summary     mtp accepted tokens       542
+summary     mtp acceptance rate       70.30%
+summary     mtp acceptance length     3.11 tok/round
+summary     mtp accepted by pos       215,186,141

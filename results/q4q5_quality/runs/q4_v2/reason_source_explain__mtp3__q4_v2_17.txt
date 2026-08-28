@@ -1,0 +1,118 @@
+### (a) What each public function does
+
+1.  **`__init__(self)`**
+    *   Initializes a new `Index` instance.
+    *   Sets `self.docs` to an empty dictionary (mapping keys to documents).
+    *   Sets `self.sorted_keys` to an empty list (intended to hold keys in sorted order).
+
+2.  **`add(self, key, doc)`**
+    *   Adds a single key-value pair to the index.
+    *   Stores `doc` in `self.docs` under `key`.
+    *   **Recomputes** the entire sorted list of keys by calling `sorted(self.docs)` and assigns it to `self.sorted_keys`.
+    *   *Note:* This is inefficient for large indices because it sorts the entire dictionary every time a single item is added, but it is functionally correct for maintaining a sorted list.
+
+3.  **`merge(self, other)`**
+    *   Intended to merge the contents of another `Index` instance (`other`) into `self`.
+    *   Iterates through the keys in `other.sorted_keys`.
+    *   For each key, it copies the corresponding document from `other.docs` into `self.docs`.
+    *   **Recomputes** the entire sorted list of keys for `self` after *every single insertion*.
+
+---
+
+### (b) The bug in `merge()`
+
+The bug is a **performance bug** (specifically, an algorithmic complexity issue), not a logical correctness bug.
+
+The `merge` function calls `self.sorted_keys = sorted(self.docs)` **inside the loop** for every key being merged.
+
+*   If `other` has $N$ keys, the loop runs $N$ times.
+*   Each call to `sorted(self.docs)` takes $O(M \log M)$ time, where $M$ is the current size of `self.docs`.
+*   As the loop progresses, $M$ increases from its initial size to `initial_size + N`.
+*   The total time complexity becomes roughly:
+    $$ \sum_{i=0}^{N} O((M_0 + i) \log (M_0 + i)) $$
+    This results in **$O(N \cdot M \log M)$** or worse, depending on the initial size $M_0$.
+
+**The fix:** The sorting should happen **once** after all keys have been added, not inside the loop.
+
+**Corrected `merge`:**
+```python
+def merge(self, other):
+    for key in other.sorted_keys:
+        self.docs[key] = other.docs[key]
+    # Sort only once after all insertions are complete
+    self.sorted_keys = sorted(self.docs)
+```
+
+---
+
+### (c) Why the bug occurs
+
+The bug occurs due to a **misunderstanding of the cost of maintaining sorted state during incremental updates**.
+
+1.  **Redundant Work:** The developer likely copied the pattern from `add()`, where sorting after each insertion is acceptable for a single operation. However, in `merge()`, this pattern is applied in a loop, leading to redundant recomputation.
+2.  **Lack of Batch Optimization:** The developer did not recognize that when performing a bulk operation (merging multiple keys), it is more efficient to:
+    *   Perform all the dictionary updates first (which are $O(1)$ each).
+    *   Perform the expensive sort operation **once** at the end.
+3.  **Quadratic Behavior:** By sorting inside the loop, the algorithm degrades from a linear-time merge (with one final sort) to a quadratic (or worse) time complexity, making it extremely slow for large indices.
+
+**In summary:** The bug is an inefficiency caused by performing an $O(n \log n)$ operation inside an $O(n)$ loop, resulting in $O(n^2 \log n)$ behavior instead of the optimal $O(n \log n)$.
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.85 GiB     0.000 s
+load        weights                    100.00%     13.85 GiB /      13.85 GiB     7.679 s
+load        engine construction           10.651 s
+load        artifact/materialize           9.685 s
+load        host to device                 7.679 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.86 GiB
+summary     weight H2D                13.85 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.558 s
+generate    decode                        21.741 s
+generate    total                         22.301 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             143
+summary     reused prompt tokens      0
+summary     generated tokens          850
+summary     model elapsed             22.299 s
+summary     prefill speed             256.11 tok/s
+summary     decode speed              39.05 tok/s
+summary     throughput (overall)      38.12 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.85 GiB / 13.85 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        1.49 GiB
+summary     free after startup        1.40 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.85 GiB
+  runtime fixed           77.73 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             1.40 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.94 GiB
+summary     mtp draft window          3
+summary     mtp rounds                286
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        858
+summary     mtp accepted tokens       565
+summary     mtp acceptance rate       65.85%
+summary     mtp acceptance length     2.98 tok/round
+summary     mtp accepted by pos       236,192,137

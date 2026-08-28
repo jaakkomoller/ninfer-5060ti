@@ -130,7 +130,7 @@ NEW_PROMPTS: list[dict[str, Any]] = [
         "prompt": "Answer the question below. Your reply must end with exactly one line of the "
                   "form RESULT: <value> where <value> is an integer, and nothing may follow that "
                   "line. Question: how many positive integers divide 120 evenly?",
-        "max_new": 200,
+        "max_new": 300,
     },
     {
         "id": "understand_trace",
@@ -310,10 +310,32 @@ BASH_BLOCK_RE = re.compile(r"```(?:bash|sh|shell)\s*\n(.*?)```", re.DOTALL)
 # greedy: JSDoc/code may contain nested fences; the block's real close is the last fence
 TS_BLOCK_RE = re.compile(r"```(?:typescript|ts)\s*\n(.*)```", re.DOTALL)
 
+# Opening fences per block regex, used only for the truncation fallback in _first.
+_FENCE_OPENS = {
+    PY_BLOCK_RE: re.compile(r"```(?:python|py)[ \t]*\n"),
+    C_BLOCK_RE: re.compile(r"```c[ \t]*\n"),
+    CPP_BLOCK_RE: re.compile(r"```cpp[ \t]*\n"),
+    BASH_BLOCK_RE: re.compile(r"```(?:bash|sh|shell)[ \t]*\n"),
+    TS_BLOCK_RE: re.compile(r"```(?:typescript|ts)[ \t]*\n"),
+}
+
 
 def _first(rx: re.Pattern, text: str) -> str | None:
-    m = rx.search(text or "")
-    return m.group(1).rstrip() if m and m.group(1).strip() else None
+    t = text or ""
+    m = rx.search(t)
+    if m and m.group(1).strip():
+        return m.group(1).rstrip()
+    # Truncation fallback: when the response ends inside a code fence because the
+    # output budget cut the closing fence, the content after the last opening
+    # fence is the intended block. It must still pass the functional validator.
+    open_rx = _FENCE_OPENS.get(rx)
+    if open_rx is not None:
+        opens = list(re.finditer(open_rx, t))
+        if opens:
+            tail = t[opens[-1].end():]
+            if tail.strip():
+                return tail.rstrip()
+    return None
 
 
 def _run_python(model_code: str, driver: str, timeout: int = 15) -> tuple[bool, str]:
@@ -735,11 +757,19 @@ def v_refactor_split(raw: str) -> tuple[bool, str, bool]:
 def v_explain_regex(raw: str) -> tuple[bool, str, bool]:
     import re as _re
     pat = _re.compile(r"^(?:https?://)?(?:www\.)?([a-z0-9-]+)\.(com|org|io)/?(?:\?([^#]*))?(?:#(.*))?$")
-    quoted = _re.findall(r"[`\"'“”]([^`\"'“”\n]{3,80})[`\"'“”]", raw or "")
-    matches = [s for s in quoted if pat.match(s.strip())]
-    nonmatches = [s for s in quoted if s.strip() and not pat.match(s.strip())]
+    # Candidate examples: inline quoted spans (backtick/quote delimited) and the
+    # lines of fenced code blocks, so the check is independent of how the model
+    # presents its examples. Every candidate is still evaluated strictly against
+    # the regex: a "matching" example must actually match and a "non-matching"
+    # one must actually fail.
+    raw = raw or ""
+    candidates = _re.findall(r"[`\"'“”]([^`\"'“”\n]{3,80})[`\"'“”]", raw)
+    for block in _re.findall(r"```[^\n]*\n(.*?)```", raw, _re.DOTALL):
+        candidates.extend(line.strip() for line in block.splitlines() if line.strip())
+    matches = [s for s in candidates if pat.match(s.strip())]
+    nonmatches = [s for s in candidates if s.strip() and not pat.match(s.strip())]
     ok = len(matches) >= 1 and len(nonmatches) >= 1
-    return ok, f"quoted examples matching: {len(matches)}, non-matching: {len(nonmatches)}", True
+    return ok, f"examples matching: {len(matches)}, non-matching: {len(nonmatches)}", True
 
 
 def v_reason_source_explain(raw: str) -> tuple[bool, str, bool]:

@@ -1,0 +1,98 @@
+### Plain English Explanation
+
+This regular expression matches a **URL** (or a domain name) that ends with one of three specific top-level domains: `.com`, `.org`, or `.io`.
+
+Here are the specific rules it enforces:
+1.  **Protocol is optional:** It can start with `http://` or `https://`, or it can omit the protocol entirely (e.g., `example.com` is valid, `example` is not).
+2.  **`www` is optional:** It can include `www.` before the domain name, or it can omit it.
+3.  **Domain name:** Must consist of lowercase letters, numbers, or hyphens (`[a-z0-9-]+`).
+4.  **Top-Level Domain (TLD):** Must be exactly `.com`, `.org`, or `.io`.
+5.  **Path is ignored:** The regex does **not** capture or validate any path after the domain (e.g., `/products`). It allows an optional `/` after the domain, but doesn't store it.
+6.  **Query string:** If present, it must start with `?` and can contain any characters except `#`.
+7.  **Fragment:** If present, it must start with `#` and can contain any characters.
+8.  **Strict boundaries:** The `^` and `$` anchors ensure the *entire* string must match this pattern. No extra characters are allowed at the start or end.
+
+---
+
+### Example Strings
+
+#### ✅ Matches
+```text
+https://my-site.org?user=123#profile
+```
+*   **Why:** It has `https://`, no `www`, a valid domain `my-site`, a valid TLD `.org`, a query string `?user=123`, and a fragment `#profile`.
+
+#### ❌ Does Not Match
+```text
+http://example.net
+```
+*   **Why:** The TLD is `.net`, but the regex only allows `.com`, `.org`, or `.io`.
+
+---
+
+### Group Descriptions
+
+The regex uses **capturing groups** (parentheses `(...)`) and **non-capturing groups** (parentheses `(?:...)`). Only the capturing groups are stored for later use.
+
+| Group # | Pattern | Description |
+| :--- | :--- | :--- |
+| **1** | `([a-z0-9-]+)` | **Domain Name:** Captures the main part of the domain (e.g., `my-site` in `my-site.org`). It must be one or more lowercase letters, digits, or hyphens. |
+| **2** | `(com\|org\|io)` | **Top-Level Domain (TLD):** Captures the TLD without the dot (e.g., `org` in `my-site.org`). It must be exactly `com`, `org`, or `io`. |
+| **3** | `([^#]*)` | **Query String:** Captures the query parameters (e.g., `user=123` in `?user=123#profile`). It matches any characters *except* `#`. If no query string exists, this group is `null` or empty. |
+| **4** | `(.*))` | **Fragment:** Captures the fragment/anchor (e.g., `profile` in `?user=123#profile`). It matches any characters after the `#`. If no fragment exists, this group is `null` or empty. |
+
+> **Note on Non-Capturing Groups:**
+> - `(?:https?://)?` – Matches `http://` or `https://` but does **not** capture it.
+> - `(?:www
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.64 GiB     0.000 s
+load        weights                    100.00%     13.64 GiB /      13.64 GiB     6.140 s
+load        engine construction            8.728 s
+load        artifact/materialize           8.038 s
+load        host to device                 6.140 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.65 GiB
+summary     weight H2D                13.64 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.381 s
+generate    decode                        32.015 s
+generate    total                         32.399 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             86
+summary     reused prompt tokens      0
+summary     generated tokens          800
+summary     model elapsed             32.397 s
+summary     prefill speed             225.50 tok/s
+summary     decode speed              24.96 tok/s
+summary     throughput (overall)      24.69 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.64 GiB / 13.64 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        1.70 GiB
+summary     free after startup        1.62 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.64 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             1.61 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.73 GiB
