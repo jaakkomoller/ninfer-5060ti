@@ -739,15 +739,43 @@ use `MAXABS_F16_RECIP_RNE_V1` with `row-split-k128-v1`. The artifact is produced
 official source revision in Section 10.1 and binds through the `Qwen38GroupwiseInt` profile. Its
 registered NVFP4 peer binds through `Qwen38Nvfp4`.
 
-Its canonical conversion entry point remains:
+The committed converter no longer writes this upstream Q5-heavy allocation. Its canonical
+entry point, shown in Section 13.1, produces the RTX 5060 Ti 16 GB `q4` allocation by default
+and the selective `q3mix` allocation with `--profile q3mix`; both bind through the same
+`Qwen38GroupwiseInt` profile. The upstream artifact remains a registered peer with the identity
+above.
+
+### 13.1 RTX 5060 Ti 16 GB storage profiles
+
+The committed converter default is the RTX 5060 Ti 16 GB Q4 text-weight profile: the five
+residual/gate Text projection roles (`attention/gate_value`, `attention/output`, `gdn/value_z`,
+`gdn/output`, `mlp/down`) are stored as `Q4G64_F16S` instead of the upstream `Q5G64_F16S`, and the
+MTP transformer matrices use the Q4 mix. Everything else matches the upstream inventory. Format
+counts: 582 BF16, 96 FP32, 1 I32, 381 Q4G64_F16S, 54 Q5G64_F16S, 2 Q6G64_F16S, 2 W8G32_F16S.
+
+The selective Q3 profile (`q3mix`) is the same Q4 profile with only the 64 text `mlp/down`
+projections `[5120,17408]` stored as `Q3G64_F16S`. It is 713,031,680 B smaller than the Q4
+artifact (14,823,303,168 B file; ~13.19 GiB resident weights) and is the production profile for
+the 16 GB card: with INT4 KV it fits 100,000-token MTP3 context (the Q4 artifact is short by
+331.0 MiB at that capacity). The Engine binds the stored format per weight, so the two artifacts
+share the registered `qwen3.8-27b/groupwise-int` identity and load through the same `Qwen38GroupwiseInt`
+profile.
+
+Conversion from the official BF16 checkpoint (CPU-only: the GPU path OOMs on the 5.1 GiB FP32
+embedding pass):
 
 ```bash
 python3 -m tools.convert.qwen3_8_27b.convert \
   --model /path/to/Qwen3.8-27B \
-  --out out/qwen3_8_27b.ninfer \
-  --device cuda
+  --out out/qwen3_8_27b_rtx5060ti_q3mix.ninfer \
+  --profile q3mix \
+  --device cpu
 ```
 
-The converter validates the official checkpoint, frontend resources, complete object plan, and
-numeric recipes before opening the output, then writes the sibling
-`qwen3_8_27b.ninfer.conversion.json` report.
+`--profile q4` (the default) writes the Q4 profile to the same entry point. The q3mix
+environment is Python 3.14 / torch 2.11.0+cu130 / numpy 2.4.6 / safetensors 0.8.0; conversion is
+deterministic on CPU (~260 s) and a single tensor re-quantized from the BF16 source reproduces
+its stored payload byte-for-byte. Verify a converted artifact by: identity
+`qwen3.8-27b/groupwise-int`; 1118 tensors; 64 `Q3G64_F16S` tensors all named
+`text/layers/{0..63}/mlp/down` (shape `[5120,17408]`, 36,208,640 B each); 317 `Q4G64_F16S`;
+file size 14,823,303,168 B.
