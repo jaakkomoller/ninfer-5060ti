@@ -497,3 +497,38 @@ policy 只是许可，长期 benchmark 不把许可本身冒充为低精度执�
 
 benchmark 不承担数值 correctness；各 weight/activation-compute profile 继续由 public
 Linear conformance suite 和统一 CPU FP64 GEMM oracle 负责。
+
+## 10. linear_add 融合 route benchmark（Q3/Q4）
+
+pure `Linear` benchmark 不覆盖 Q3：Q3 row-split 只存在于 `linear_add` 融合路径
+（residual add 与 dequant GEMM 同 kernel）。两个独立 target 直接测量该路径的
+production shape：
+
+```bash
+# q3mix 的 mlp/down shape（[5120,17408]，K 只能为 17408）
+./build-bench/bench/ninfer_q3_linear_add_bench --k 17408 --t-sweep 1,2,3,4,8,16,32,64,128,256
+
+# Q4 的 mlp/down 与 GDN value/z shape
+./build-bench/bench/ninfer_q4_linear_add_bench --k 6144|17408 --t-sweep 1,2,4,8,16,32,64
+```
+
+每个 point 走 public `linear_add()` 的 plan/selector，输出 route 名、median 时延、
+weight-byte 口径的 GB/s 和 useful TFLOP/s。计时合同与 §6 相同（cold-cache、
+warmup + 重复采样取 median）。
+
+RTX 5060 Ti（40 SM，`sm_120a`）`[5120,17408]` 实测（单次运行）：
+
+| T | Q3 route | Q3 GB/s | Q4 route | Q4 GB/s |
+|---:|---|---:|---|---:|
+| 1 | gemv.residual | 180.7 | gemv.residual | 263.1 |
+| 2 | simt.residual | 115.2 | simt.residual | 145.7 |
+| 4 | simt.residual | 99.9 | simt.residual | 129.1 |
+| 8 | simt.residual | 73.8 | simt.residual | 156.6 |
+| 16 | simt.residual | 64.9 | simt.residual | 84.7 |
+| 32 | mma.r64.c32 | 70.2 | mma.r64.c32 | 99.5 |
+| 64 | mma.r64.c64 | 67.2 | mma.r64.c64 | 94.1 |
+| 128 | mma.r64.c64 | 39.9 | mma.r64.c64 | 63.9 |
+| 256 | mma.r64.c128 | 33.6 | mma.r64.c128 | 46.9 |
+
+Q3 在每个 T 比 Q4 慢 9–15%（T=1 为 11%），与 3-bit 相对 4-bit 的 kernel 效率差一致；
+端到端影响见 README 的 q3mix 对照表（MTP3 decode 持平，MTP0 decode −6.6%）。

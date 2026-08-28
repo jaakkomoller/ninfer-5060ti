@@ -12,7 +12,7 @@ The storage registry contains exactly these identities:
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
 | `contiguous-le-v1` | tensor layout | `BF16`, `FP32`, `I32` | rank `0..16` | 256 bytes |
-| `row-split-k128-v1` | tensor layout | `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
+| `row-split-k128-v1` | tensor layout | `Q3G64_F16S`, `Q4G64_F16S`, `Q5G64_F16S`, `Q6G64_F16S`, `W8G32_F16S` | rank 2 `[N,K]` | 256 bytes |
 | `blockscale-k16-m128x4-v1` | tensor layout | `NVFP4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row-scale-v1` | tensor layout | `FP8_E4M3FN_ROW_BF16S` | rank 2 `[N,K]` | 256 bytes |
 | `raw-bytes-v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
@@ -88,6 +88,7 @@ group size `G`:
 
 | Format | `b` | `G` | Base bytes per group `B` | High bytes per group `H` |
 |---|---:|---:|---:|---:|
+| `Q3G64_F16S` | 3 | 64 | 24 | 0 |
 | `Q4G64_F16S` | 4 | 64 | 32 | 0 |
 | `Q5G64_F16S` | 5 | 64 | 32 | 8 |
 | `Q6G64_F16S` | 6 | 64 | 32 | 16 |
@@ -122,8 +123,8 @@ zero padding to a 256-byte boundary
 binary16 scale plane
 ```
 
-Q4 and W8 have no high-bit bytes. They still place the scale plane at the first 256-byte boundary
-after the base-code plane. There is no padding after the scale plane inside the object.
+Q3, Q4, and W8 have no high-bit bytes. They still place the scale plane at the first 256-byte
+boundary after the base-code plane. There is no padding after the scale plane inside the object.
 
 Within every plane, traversal order is:
 
@@ -149,6 +150,12 @@ base[j] = (u[2*j] & 0x0f) | ((u[2*j + 1] & 0x0f) << 4)
 
 Thus the even lane is in the low nibble and the odd lane is in the high nibble. Every G64 group
 occupies 32 base bytes.
+
+For Q3, let `u[i] = (q[i] + 4) & 7` be lane `i`'s offset word (Section 5.2 of
+[`tensor-formats.md`](tensor-formats.md)). The 64 words are packed little-endian at 3 bits per word
+into the 24-byte group word: lane `i` occupies bit range `[3*i, 3*i + 3)`, so lane 0 holds the least
+significant bits. A lane whose bit offset within a byte is 6 or 7 straddles two consecutive bytes;
+that is lane `i` with `i mod 8` in `{2, 7}`. Each G64 group occupies 24 base bytes.
 
 For W8, each lane occupies one byte containing its exact 8-bit two's-complement word. Lane `i`
 occupies byte `i`, so every G32 group occupies 32 base bytes. The numeric-format restriction that

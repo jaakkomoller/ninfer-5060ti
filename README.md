@@ -205,10 +205,54 @@ The `q4` artifact (`out/qwen3_8_27b_rtx5060ti_q4.ninfer`, 14.44 GiB file; 13.82 
  build/apps/ninfer out/qwen3_8_27b_rtx5060ti_q4.ninfer \
    --prompt <text> --max-context 80384 --kv-capacity auto --kv-dtype int4 \
    --prefill-chunk 64 --no-thinking --greedy --spec mtp --draft-tokens 3
- ```
+  ```
 
-See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
-and per-fixture results.
+ **Qwen3.8-27B (`groupwise-int`) Q3mix Text Weights on RTX 5060 Ti**
+ 
+ The `q3mix` artifact (`out/qwen3_8_27b_rtx5060ti_q3mix.ninfer`, 13.73 GiB file; 13.19 GiB
+ resident weights) is a selective 3-bit profile of the `q4` artifact: the 64 text
+ `mlp/down` weights (layers 0-63, `[5120,17408]`) are re-encoded from Q4G64 to
+ Q3G64_F16S; the other four text linear roles stay Q4G64, and Vision, MTP, and all state
+ codecs are unchanged. That removes 680 MiB of resident weight versus `q4`. Q3G64_F16S
+ packs 64 signed 3-bit codes per group with one FP16 scale; the offset code `u` stores
+ `q = u - 4` for `q ∈ [-4, 3]` (see [tensor formats](docs/maintainer/tensor-formats.md)).
+ With INT4 KV, the context ceiling on this card is:
+ 
+ | Flags | KV | Max ctx | Auto KV | Note |
+ |---|---|---:|---:|---|
+ | production (`--no-prefix-reuse --spec mtp --draft-tokens 3`, `--max-context 100000`) | int4 | **100,000** | 100,032 (1,563 groups) | 371 MiB planned slack; 90K-token prompts verified end-to-end |
+ | production flags, no explicit cap | int4 | **119,168** | 119,168 (1,862 groups) | 33 MiB planned slack; 119,232 is rejected before upload |
+ | defaults (prefix reuse) | int4 | 107,904 | 107,904 (1,686 groups) | 193 MiB planned slack |
+ 
+ Head-to-head against `q4` on one 5,113-token code prompt, 128 generated tokens, greedy,
+ `--max-context 6144 --prefill-chunk 128 --no-prefix-reuse`:
+ 
+ | Metric | q3mix | q4 |
+ |---|---:|---:|
+ | MTP3 prefill | 615.9 tok/s | 650.2 tok/s |
+ | MTP3 decode | 46.13 tok/s | 46.00 tok/s |
+ | MTP3 acceptance | 86.67% (3.60 tok/round) | 85.05% (3.53 tok/round) |
+ | MTP0 prefill | 617.1 tok/s | 658.2 tok/s |
+ | MTP0 decode | 23.03 tok/s | 24.65 tok/s |
+ 
+ Q3mix decode is at parity under MTP3 (its mlp/down decode reads less data than Q4's and
+ its acceptance is marginally higher) and 6.6% slower under MTP0; prefill is 5-6% slower
+ because the 3-bit down-projection GEMM is less efficient per byte. Quality on the
+ 175-problem LiveCodeBench v6 subset (greedy, max 2,000 tokens, single sample): 43/175
+ for `q3mix` vs 41/175 for `q4` — the Q3 profile introduces no measurable regression, and
+ the shared gap to the stored vLLM reference (60/175) is runtime/decode-budget behavior,
+ not quantization. The small quality gate scores 29/35 for `q3mix` vs 28/35 for `q4`.
+ Reproduction:
+ 
+ ```
+ build/apps/ninfer-serve out/qwen3_8_27b_rtx5060ti_q3mix.ninfer \
+   --host 127.0.0.1 --port 8081 --model-id qwen3.8-27b-q3mix --max-context 100000 \
+   --kv-capacity auto --kv-dtype int4 --spec mtp --draft-tokens 3 --prefill-chunk 128 \
+   --no-prefix-reuse --no-thinking --default-max-tokens 8192 --max-concurrency 1
+ ```
+ 
+ See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
+ and per-fixture results.
 
 ## Evaluation
 
