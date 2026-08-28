@@ -13,6 +13,7 @@
 // remain runtime dimensions; registered shapes select a closed schedule and a
 // statically compiled boundary variant outside the kernel.
 
+#include "ops/common/bf16_vector.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
 
@@ -32,6 +33,18 @@ enum class Q4ScaleLoad {
     Scalar16,
     Pair32,
 };
+
+enum class Q4MmaEpilogue {
+    Store,
+    CtaCollectiveResidual,
+};
+
+union alignas(16) Q4Bf16x8Bits {
+    int4 raw;
+    Bf16x8Pack pack;
+};
+
+static_assert(sizeof(Q4Bf16x8Bits) == 16);
 
 template <int BlockRows_, int BlockCols_, int BlockK_, int WarpRows_, int WarpCols_,
           int PipelineStages_, int LaunchBoundsMinBlocks_, Q4FragmentPipeline FragmentPipeline_,
@@ -90,7 +103,7 @@ __device__ __forceinline__ int q4_mma_swizzle_k64(int row, int col) {
 }
 
 // clang-format off
-template <class Schedule_, bool Full>
+template <class Schedule_, bool Full, Q4MmaEpilogue Epilogue = Q4MmaEpilogue::Store>
 __global__ __launch_bounds__(Schedule_::kThreads, Schedule_::kLaunchBoundsMinBlocks)
 void q4_rowsplit_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x,
@@ -104,6 +117,9 @@ void q4_rowsplit_gemm_mma_kernel(
     // clang-format on
     using Schedule       = Schedule_;
     constexpr bool kFull = Full;
+    static_assert(Epilogue == Q4MmaEpilogue::Store ||
+                      Epilogue == Q4MmaEpilogue::CtaCollectiveResidual,
+                  "Q4 MMA requires a supported epilogue");
     constexpr int BM     = Schedule::kBlockRows;
     constexpr int BN     = Schedule::kBlockCols;
     constexpr int BK     = Schedule::kBlockK;
@@ -369,6 +385,82 @@ void q4_rowsplit_gemm_mma_kernel(
         cp_commit();
     }
 
+if constexpr (Epilogue == Q4MmaEpilogue::CtaCollectiveResidual) {
+        static_assert(BM == BK, "Q4 collective residual reuses Bs and requires BM == BK");
+        __nv_bfloat16* projected_shared = Bs[0];
+#pragma unroll
+        for (int mi = 0; mi < MT; ++mi) {
+            const int local_row0 = warp_row * WM + mi * 16 + mma_row;
+            const int local_row1 = local_row0 + 8;
+#pragma unroll
+            for (int ni = 0; ni < NT; ++ni) {
+                const int local_col0 = warp_col * WN + ni * 8 + 2 * mma_col;
+                const int local_col1 = local_col0 + 1;
+                const float* values  = accum[mi][ni];
+                projected_shared[local_col0 * BM + local_row0] = __float2bfloat16_rn(values[0]);
+                projected_shared[local_col1 * BM + local_row0] = __float2bfloat16_rn(values[1]);
+                projected_shared[local_col0 * BM + local_row1] = __float2bfloat16_rn(values[2]);
+                projected_shared[local_col1 * BM + local_row1] = __float2bfloat16_rn(values[3]);
+            }
+        }
+        __syncthreads();
+
+        constexpr int kRowsPerPack = 8;
+        constexpr int kPacksPerCol = BM / kRowsPerPack;
+        static_assert(BM % kRowsPerPack == 0);
+        for (int pack = tid; pack < BN * kPacksPerCol; pack += Schedule::kThreads) {
+            const int local_col = pack / kPacksPerCol;
+            const int row_pack  = pack - local_col * kPacksPerCol;
+            const int local_row = row_pack * kRowsPerPack;
+            const int col       = col0 + local_col;
+            const int row       = row0 + local_row;
+            if constexpr (kFull) {
+                Q4Bf16x8Bits projected;
+                projected.raw = load_vec<int4>(&projected_shared[local_col * BM + local_row]);
+                Q4Bf16x8Bits residual_values;
+                residual_values.raw =
+                    load_vec<int4>(&out[static_cast<std::int64_t>(col) * rows + row]);
+#pragma unroll
+                for (int pair = 0; pair < 4; ++pair) {
+                    residual_values.pack.pair[pair] =
+                        __floats2bfloat162_rn(__low2float(residual_values.pack.pair[pair]) +
+                                                  __low2float(projected.pack.pair[pair]),
+                                              __high2float(residual_values.pack.pair[pair]) +
+                                                  __high2float(projected.pack.pair[pair]));
+                }
+                store_vec(&out[static_cast<std::int64_t>(col) * rows + row], residual_values.raw);
+            } else if (col < cols && row < rows) {
+                if (row + kRowsPerPack <= rows) {
+                    Q4Bf16x8Bits projected;
+                    projected.raw = load_vec<int4>(&projected_shared[local_col * BM + local_row]);
+                    Q4Bf16x8Bits residual_values;
+                    residual_values.raw =
+                        load_vec<int4>(&out[static_cast<std::int64_t>(col) * rows + row]);
+#pragma unroll
+                    for (int pair = 0; pair < 4; ++pair) {
+                        residual_values.pack.pair[pair] =
+                            __floats2bfloat162_rn(__low2float(residual_values.pack.pair[pair]) +
+                                                      __low2float(projected.pack.pair[pair]),
+                                                  __high2float(residual_values.pack.pair[pair]) +
+                                                      __high2float(projected.pack.pair[pair]));
+                    }
+                    store_vec(&out[static_cast<std::int64_t>(col) * rows + row],
+                              residual_values.raw);
+                } else {
+#pragma unroll
+                    for (int i = 0; i < kRowsPerPack; ++i) {
+                        if (row + i < rows) {
+                            const std::int64_t index =
+                                static_cast<std::int64_t>(col) * rows + row + i;
+                            out[index] = __float2bfloat16_rn(
+                                __bfloat162float(out[index]) +
+                                __bfloat162float(projected_shared[local_col * BM + local_row + i]));
+                        }
+                    }
+                }
+            }
+        }
+    } else {
 #pragma unroll
     for (int mi = 0; mi < MT; ++mi) {
         const int output_row0 = row0 + warp_row * WM + mi * 16 + mma_row;
@@ -410,6 +502,7 @@ void q4_rowsplit_gemm_mma_kernel(
                 }
             }
         }
+    }
     }
 }
 

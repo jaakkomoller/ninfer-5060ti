@@ -132,26 +132,26 @@ Weight materialized_weight(const artifact::MaterializedArtifact& materialized,
     return out;
 }
 
-// Return the format that the artifact actually stores for a given MTP tensor,
+// Return the format that the artifact actually stores for a given weight tensor,
 // selected from a list of acceptable formats. The format determines which
-// runtime dispatch path will be taken when --spec mtp is enabled.
-NumericFormat mtp_format_for(artifact::Binder& binder, std::string_view name,
-                            std::initializer_list<NumericFormat> acceptable) {
+// runtime dispatch path will be taken for that role.
+NumericFormat weight_format_for(artifact::Binder& binder, std::string_view name,
+                                std::initializer_list<NumericFormat> acceptable) {
     const auto* object = binder.reader().find(name);
     if (object == nullptr) {
-        throw artifact::ArtifactError("MTP format probe: tensor " + std::string(name) +
-                                     " is missing from the artifact");
+        throw artifact::ArtifactError("weight format probe: tensor " + std::string(name) +
+                                      " is missing from the artifact");
     }
     const auto* tensor = std::get_if<artifact::TensorDescriptor>(object);
     if (tensor == nullptr) {
-        throw artifact::ArtifactError("MTP format probe: object " + std::string(name) +
-                                     " is not a tensor");
+        throw artifact::ArtifactError("weight format probe: object " + std::string(name) +
+                                      " is not a tensor");
     }
     for (NumericFormat candidate : acceptable) {
         if (tensor->format == candidate) { return candidate; }
     }
-    throw artifact::ArtifactError("MTP format probe: tensor " + std::string(name) +
-                                 " has unsupported format");
+    throw artifact::ArtifactError("weight format probe: tensor " + std::string(name) +
+                                  " has unsupported format");
 }
 
 Weight row_view(const Weight& block, std::int32_t row_begin, std::int32_t row_count) {
@@ -236,25 +236,32 @@ load_gdn_control_projection(const GdnPlan& plan,
 }
 
 void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
+    // Text projection roles may be stored as Q5 or Q4. The runtime dispatch is
+    // weight-qtype driven, so the binding probes the artifact's actual format.
+    const auto q4_or_q5 = [&binder](std::string name) {
+        return weight_format_for(binder, name, {NumericFormat::Q4G64_F16S,
+                                                NumericFormat::Q5G64_F16S});
+    };
     for (std::size_t layer = 0; layer < kTextLayers; ++layer) {
         TextLayerPlan& target    = out.text_layers[layer];
         const std::string prefix = "text/layers/" + std::to_string(layer) + "/";
         target.input_norm        = artifact::bind_device_tensor(binder, prefix + "input_norm",
-                                                                NumericFormat::BF16, {5120});
+                                                                 NumericFormat::BF16, {5120});
         target.is_full_attention = is_full_layer(layer);
         if (target.is_full_attention) {
             target.attention.projection = SplitAttentionProjectionPlan{
                 .query_key  = bind_weight(binder, prefix + "attention/query_key",
                                           NumericFormat::Q4G64_F16S, {7168, 5120}),
                 .gate_value = bind_weight(binder, prefix + "attention/gate_value",
-                                          NumericFormat::Q5G64_F16S, {7168, 5120}),
+                                          q4_or_q5(prefix + "attention/gate_value"), {7168, 5120}),
             };
             target.attention.query_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/query_norm", NumericFormat::BF16, {256});
             target.attention.key_norm = artifact::bind_device_tensor(
                 binder, prefix + "attention/key_norm", NumericFormat::BF16, {256});
             target.attention.output = bind_weight(binder, prefix + "attention/output",
-                                                  NumericFormat::Q5G64_F16S, {5120, 6144});
+                                                  q4_or_q5(prefix + "attention/output"), {5120,
+                                                                                          6144});
         } else {
             target.gdn.a_log       = artifact::bind_device_tensor(binder, prefix + "gdn/a_log",
                                                                   NumericFormat::FP32, {48});
@@ -268,23 +275,25 @@ void bind_groupwise_text_layers(artifact::Binder& binder, BindingPlan& out) {
                 .b_projection = bind_weight(binder, prefix + "gdn/b_projection",
                                             NumericFormat::BF16, {48, 5120}),
             };
-            target.gdn.input_projection = SplitGdnInputProjectionPlan{
+target.gdn.input_projection = SplitGdnInputProjectionPlan{
                 .query_key = bind_weight(binder, prefix + "gdn/query_key",
                                          NumericFormat::Q4G64_F16S, {4096, 5120}),
-                .value_z   = bind_weight(binder, prefix + "gdn/value_z", NumericFormat::Q5G64_F16S,
-                                         {12288, 5120}),
+                .value_z   = bind_weight(binder, prefix + "gdn/value_z",
+                                         q4_or_q5(prefix + "gdn/value_z"), {12288, 5120}),
             };
             target.gdn.norm = artifact::bind_device_tensor(binder, prefix + "gdn/norm",
                                                            NumericFormat::BF16, {128});
             target.gdn.output =
-                bind_weight(binder, prefix + "gdn/output", NumericFormat::Q5G64_F16S, {5120, 6144});
+                bind_weight(binder, prefix + "gdn/output", q4_or_q5(prefix + "gdn/output"),
+                            {5120, 6144});
         }
         target.post_attention_norm = artifact::bind_device_tensor(
             binder, prefix + "post_attention_norm", NumericFormat::BF16, {5120});
         target.mlp.gate_up =
             bind_weight(binder, prefix + "mlp/gate_up", NumericFormat::Q4G64_F16S, {34816, 5120});
         target.mlp.down =
-            bind_weight(binder, prefix + "mlp/down", NumericFormat::Q5G64_F16S, {5120, 17408});
+            bind_weight(binder, prefix + "mlp/down", q4_or_q5(prefix + "mlp/down"),
+                        {5120, 17408});
     }
 }
 
@@ -492,20 +501,20 @@ ArtifactLoadPlan bind_artifact(artifact::Binder& binder, WeightsProfile weights_
     // format and use it; the binding then routes through the dispatch tables
     // appropriate to the format present.
     const NumericFormat mtp_input_projection_format =
-        mtp_format_for(binder, "mtp/input_projection",
+        weight_format_for(binder, "mtp/input_projection",
                        {NumericFormat::W8G32_F16S, NumericFormat::Q4G64_F16S});
     const NumericFormat mtp_qkv_format =
-        mtp_format_for(binder, "mtp/layer/attention/query_key_gate_value",
+        weight_format_for(binder, "mtp/layer/attention/query_key_gate_value",
                        {NumericFormat::W8G32_F16S, NumericFormat::Q4G64_F16S});
     const NumericFormat mtp_output_format =
-        mtp_format_for(binder, "mtp/layer/attention/output",
+        weight_format_for(binder, "mtp/layer/attention/output",
                        {NumericFormat::W8G32_F16S, NumericFormat::Q5G64_F16S,
                         NumericFormat::Q4G64_F16S});
     const NumericFormat mtp_gate_up_format =
-        mtp_format_for(binder, "mtp/layer/mlp/gate_up",
+        weight_format_for(binder, "mtp/layer/mlp/gate_up",
                        {NumericFormat::W8G32_F16S, NumericFormat::Q4G64_F16S});
     const NumericFormat mtp_down_format =
-        mtp_format_for(binder, "mtp/layer/mlp/down",
+        weight_format_for(binder, "mtp/layer/mlp/down",
                        {NumericFormat::W8G32_F16S, NumericFormat::Q5G64_F16S,
                         NumericFormat::Q4G64_F16S});
     out.mtp.input_projection =

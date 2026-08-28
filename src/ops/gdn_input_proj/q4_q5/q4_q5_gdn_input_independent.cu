@@ -97,6 +97,78 @@ void launch_q4(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t 
 }
 
 template <class Geometry>
+void launch_q4_gemv_vz(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                       cudaStream_t stream) {
+    using Schedule = std::conditional_t<Geometry::kHidden == 4096,
+                                        Q4GemvR1W8DirectK64Schedule, Q4GemvR1W8DirectSchedule>;
+    constexpr std::int32_t kValueZRows = Geometry::kValueZRows;
+    constexpr std::int32_t kValueRows  = Geometry::kValueRows;
+    constexpr std::int32_t kHidden     = Geometry::kHidden;
+    const dim3 grid(static_cast<unsigned>(div_up(kValueZRows, Schedule::kRowsPerCta)), 1u, 1u);
+    constexpr dim3 block(static_cast<unsigned>(Schedule::kThreads), 1u, 1u);
+    q4_rowsplit_gemv_kernel<Schedule, true, kValueRows><<<grid, block, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.scales), static_cast<__nv_bfloat16*>(value.data),
+        static_cast<__nv_bfloat16*>(z.data), kValueZRows, kHidden);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Geometry, class Schedule, bool Full>
+void launch_q4_simt_vz(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                       cudaStream_t stream) {
+    constexpr std::int32_t kValueZRows = Geometry::kValueZRows;
+    constexpr std::int32_t kValueRows  = Geometry::kValueRows;
+    constexpr std::int32_t kHidden     = Geometry::kHidden;
+    const std::int32_t cols   = x.ne[1];
+    const std::int32_t value_ld = static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    const std::int32_t z_ld     = static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16));
+    const dim3 grid(static_cast<unsigned>(div_up(kValueZRows, Schedule::kRowsPerCta)),
+                    static_cast<unsigned>(div_up(cols, Schedule::kColsPerTile)), 1u);
+    q4_rowsplit_gemm_simt_kernel<Schedule, Full, true, kValueRows>
+        <<<grid, Schedule::kThreads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(weight.qdata),
+            static_cast<const std::uint8_t*>(weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data), value_ld,
+            z_ld, kValueZRows, kHidden, cols, weight.padded_shape[1]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <class Geometry, class Schedule>
+void launch_q4_simt_vz_route(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                             cudaStream_t stream) {
+    constexpr std::int32_t kValueZRows = Geometry::kValueZRows;
+    constexpr std::int32_t kHidden     = Geometry::kHidden;
+    const bool full = (kValueZRows % Schedule::kRowsPerCta) == 0 &&
+                      ((kHidden / Q4RowSplitStorage::kGroupK) % Schedule::kGroupsPerStage) == 0 &&
+                      (x.ne[1] % Schedule::kColsPerTile) == 0;
+    if (full) {
+        launch_q4_simt_vz<Geometry, Schedule, true>(x, weight, value, z, stream);
+    } else {
+        launch_q4_simt_vz<Geometry, Schedule, false>(x, weight, value, z, stream);
+    }
+}
+
+template <class Geometry>
+void launch_q4_vz(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
+                  cudaStream_t stream) {
+    if (x.ne[1] == 1) {
+        launch_q4_gemv_vz<Geometry>(x, weight, value, z, stream);
+        return;
+    }
+    if (x.ne[1] <= 4) {
+        launch_q4_simt_vz_route<Geometry, Q4GdnSimtR8C4Schedule>(x, weight, value, z, stream);
+        return;
+    }
+    if (x.ne[1] <= 16) {
+        launch_q4_simt_vz_route<Geometry, Q4GdnSimtR8C8Schedule>(x, weight, value, z, stream);
+        return;
+    }
+    throw std::invalid_argument("Q4 GDN value_z independent launch requires T in [1,16]");
+}
+
+template <class Geometry>
 void launch_q5_gemv(const Tensor& x, const Weight& weight, Tensor& value, Tensor& z,
                     cudaStream_t stream) {
     constexpr std::int32_t kValueZRows = Geometry::kValueZRows;
@@ -215,18 +287,35 @@ void launch_t4_pdl(const Tensor& x, const Weight& qk_weight, const Weight& value
 
     // Q5 and Q4 publish disjoint row ranges. Q4 can execute while Q5 drains and joins Q5 only at
     // exit, before the following convolution/snapshot kernel becomes runnable.
-    q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 4, Geometry::kFullSlabs,
-                                        Geometry::kHidden, true, Geometry::kValueRows,
-                                        Q5Split4StoreEpilogue, true, false>
-        <<<q5_grid, kQ5Threads, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(value_z_weight.qdata),
-            static_cast<const std::uint8_t*>(value_z_weight.qhigh),
-            static_cast<const std::uint8_t*>(value_z_weight.scales),
-            static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
-            Geometry::kValueZRows, q5_out_ld, Geometry::kHidden, 4,
-            value_z_weight.padded_shape[1], Geometry::kFullSlabs);
-    CUDA_CHECK(cudaGetLastError());
+    if (value_z_weight.qtype == QType::Q4G64_F16S) {
+        const dim3 vz_grid(Geometry::kValueZRows / Q4Schedule::kRowsPerCta, 1u, 1u);
+        const std::int32_t vz_out_ld =
+            static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+        const std::int32_t vz_z_ld = static_cast<std::int32_t>(z.nb[1] / sizeof(__nv_bfloat16));
+        q4_rowsplit_gemm_simt_kernel<Q4Schedule, true, true, Geometry::kValueRows,
+                                     Q4SimtStoreEpilogue, true, false>
+            <<<vz_grid, Q4Schedule::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(value_z_weight.qdata),
+                static_cast<const std::uint8_t*>(value_z_weight.scales),
+                static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+                vz_out_ld, vz_z_ld, Geometry::kValueZRows, Geometry::kHidden, 4,
+                value_z_weight.padded_shape[1], Q4SimtStoreEpilogue{});
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        q5_rowsplit_gemm_simt_split4_kernel<Q5RowSplitSimtSchedule, 4, Geometry::kFullSlabs,
+                                            Geometry::kHidden, true, Geometry::kValueRows,
+                                            Q5Split4StoreEpilogue, true, false>
+            <<<q5_grid, kQ5Threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(value_z_weight.qdata),
+                static_cast<const std::uint8_t*>(value_z_weight.qhigh),
+                static_cast<const std::uint8_t*>(value_z_weight.scales),
+                static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
+                Geometry::kValueZRows, q5_out_ld, Geometry::kHidden, 4,
+                value_z_weight.padded_shape[1], Geometry::kFullSlabs);
+        CUDA_CHECK(cudaGetLastError());
+    }
     CUDA_CHECK(pdl::launch_dependent(
         {q4_grid, dim3(Q4Schedule::kThreads), 0, stream},
         q4_rowsplit_gemm_simt_kernel<Q4Schedule, true, false, 0, Q4SimtStoreEpilogue, false, true>,
@@ -245,7 +334,11 @@ void launch_geometry(const Tensor& x, const Weight& qk_weight, const Weight& val
         return;
     }
     launch_q4<Geometry>(x, qk_weight, qk, stream);
-    launch_q5<Geometry>(x, value_z_weight, value, z, stream);
+    if (value_z_weight.qtype == QType::Q4G64_F16S) {
+        launch_q4_vz<Geometry>(x, value_z_weight, value, z, stream);
+    } else {
+        launch_q5<Geometry>(x, value_z_weight, value, z, stream);
+    }
 }
 
 } // namespace

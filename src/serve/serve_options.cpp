@@ -92,9 +92,10 @@ std::string serve_usage_text(const char* argv0) {
            "default\n"
            "       --log-stats-interval-ms defaults to 5000; 0 disables periodic throughput logs\n"
            "       --vision enables media and loads the fixed Vision GPU allocations\n"
-           "       --kv-capacity auto leaves " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom\n"
+"       --kv-capacity auto sizes the Main KV pool to the largest capacity whose exact "
+            "reservation fits after weights, keeping a " +
+            std::to_string(kAutomaticKvSafetyMarginBytes / (1024ULL * 1024ULL)) +
+            " MiB automatic safety margin for measured post-plan driver growth\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "

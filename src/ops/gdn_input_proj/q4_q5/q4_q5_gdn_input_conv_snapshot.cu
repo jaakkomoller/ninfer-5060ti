@@ -141,6 +141,47 @@ struct Q5GdnSmallTEpilogue {
     }
 };
 
+template <class Geometry, class Epilogue>
+struct Q4GdnValueZDecodeEpilogue {
+    Epilogue conv;
+    __nv_bfloat16* z;
+
+    template <bool, int>
+    __device__ __forceinline__ void operator()(__nv_bfloat16*, __nv_bfloat16*, int row,
+                                               float value) const {
+        if (row < Geometry::kValueRows) {
+            const float projected[1]{value};
+            conv.store(row, projected);
+        } else {
+            z[row - Geometry::kValueRows] = __float2bfloat16_rn(value);
+        }
+    }
+};
+
+template <class Geometry, int Tokens, class Epilogue>
+struct Q4GdnValueZSmallTEpilogue {
+    Epilogue conv;
+    __nv_bfloat16* z;
+
+    template <bool, int, int TileCols>
+    __device__ __forceinline__ void
+    operator()(__nv_bfloat16*, __nv_bfloat16*, std::int32_t, std::int32_t, std::int32_t row,
+               std::int32_t, std::int32_t active_cols, const float (&values)[TileCols]) const {
+        if (row < Geometry::kValueRows) {
+            float projected[Tokens];
+#pragma unroll
+            for (int token = 0; token < Tokens; ++token) { projected[token] = values[token]; }
+            if (active_cols == Tokens) { conv.store(row, projected); }
+        } else {
+#pragma unroll
+            for (int token = 0; token < Tokens; ++token) {
+                z[static_cast<std::int64_t>(token) * Geometry::kZRows + row - Geometry::kValueRows] =
+                    __float2bfloat16_rn(values[token]);
+            }
+        }
+    }
+};
+
 template <class Geometry, class Epilogue, bool TriggerPdl, bool JoinPdl, bool Dependent>
 void launch_q4_t1(const Tensor& x, const Weight& qk_weight, const Epilogue& qk_epilogue,
                   Tensor& query, cudaStream_t stream) {
@@ -198,6 +239,34 @@ void launch_q5_t1(const Tensor& x, const Weight& value_z_weight, const Epilogue&
                 static_cast<__nv_bfloat16*>(value.data), static_cast<__nv_bfloat16*>(z.data),
                 Q5GdnDecodeEpilogue<Geometry, Epilogue>{value_epilogue,
                                                         static_cast<__nv_bfloat16*>(z.data)});
+    }
+}
+
+template <class Geometry, class Epilogue, bool TriggerPdl, bool JoinPdl, bool Dependent>
+void launch_q4_vz_t1(const Tensor& x, const Weight& value_z_weight, const Epilogue& value_epilogue,
+                     Tensor& value, Tensor& z, cudaStream_t stream) {
+    using Schedule = std::conditional_t<Geometry::kHidden == 4096,
+                                        Q4GemvR1W8DirectK64Schedule, Q4GemvR1W8DirectSchedule>;
+    constexpr int threads = Schedule::kThreads;
+    constexpr int blocks  = Geometry::kValueZRows / Schedule::kRowsPerCta;
+    using EpilogueT = Q4GdnValueZDecodeEpilogue<Geometry, Epilogue>;
+    if constexpr (Dependent) {
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(blocks), dim3(threads), 0, stream},
+            q4_rowsplit_gemv_kernel<Schedule, false, 0, EpilogueT, TriggerPdl, JoinPdl>,
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(value_z_weight.qdata),
+            static_cast<const std::uint8_t*>(value_z_weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), nullptr, Geometry::kValueZRows,
+            Geometry::kHidden, EpilogueT{value_epilogue, static_cast<__nv_bfloat16*>(z.data)}));
+    } else {
+        q4_rowsplit_gemv_kernel<Schedule, false, 0, EpilogueT, TriggerPdl, JoinPdl>
+            <<<blocks, threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(value_z_weight.qdata),
+                static_cast<const std::uint8_t*>(value_z_weight.scales),
+                static_cast<__nv_bfloat16*>(value.data), nullptr, Geometry::kValueZRows,
+                Geometry::kHidden, EpilogueT{value_epilogue, static_cast<__nv_bfloat16*>(z.data)});
     }
 }
 
@@ -269,6 +338,39 @@ void launch_q5_small_t(const Tensor& x, const Weight& value_z_weight,
     }
 }
 
+template <class Geometry, int Tokens, class Epilogue, bool TriggerPdl, bool JoinPdl,
+          bool Dependent>
+void launch_q4_vz_small_t(const Tensor& x, const Weight& value_z_weight,
+                          const Epilogue& value_epilogue, Tensor& value, Tensor& z,
+                          cudaStream_t stream) {
+    using Schedule  = Q4ScheduleC8;
+    using EpilogueT = Q4GdnValueZSmallTEpilogue<Geometry, Tokens, Epilogue>;
+    constexpr int threads = Schedule::kThreads;
+    constexpr int blocks  = Geometry::kValueZRows / Schedule::kRowsPerCta;
+    const std::int32_t value_ld =
+        static_cast<std::int32_t>(value.nb[1] / sizeof(__nv_bfloat16));
+    if constexpr (Dependent) {
+        CUDA_CHECK(pdl::launch_dependent(
+            {dim3(blocks), dim3(threads), 0, stream},
+            q4_rowsplit_gemm_simt_kernel<Schedule, false, false, 0, EpilogueT, TriggerPdl, JoinPdl>,
+            static_cast<const __nv_bfloat16*>(x.data),
+            static_cast<const std::uint8_t*>(value_z_weight.qdata),
+            static_cast<const std::uint8_t*>(value_z_weight.scales),
+            static_cast<__nv_bfloat16*>(value.data), nullptr, value_ld, 0, Geometry::kValueZRows,
+            Geometry::kHidden, Tokens, value_z_weight.padded_shape[1],
+            EpilogueT{value_epilogue, static_cast<__nv_bfloat16*>(z.data)}));
+    } else {
+        q4_rowsplit_gemm_simt_kernel<Schedule, false, false, 0, EpilogueT, TriggerPdl, JoinPdl>
+            <<<blocks, threads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::uint8_t*>(value_z_weight.qdata),
+                static_cast<const std::uint8_t*>(value_z_weight.scales),
+                static_cast<__nv_bfloat16*>(value.data), nullptr, value_ld, 0,
+                Geometry::kValueZRows, Geometry::kHidden, Tokens, value_z_weight.padded_shape[1],
+                EpilogueT{value_epilogue, static_cast<__nv_bfloat16*>(z.data)});
+    }
+}
+
 template <class Geometry, PdlOrder Order, class Epilogue>
 void launch_t1(const Tensor& x, const Weight& qk_weight, const Weight& value_z_weight,
                const Epilogue& qk_epilogue, const Epilogue& value_epilogue, Tensor& query,
@@ -276,14 +378,25 @@ void launch_t1(const Tensor& x, const Weight& qk_weight, const Weight& value_z_w
     // RTX 5060 Ti 16 GB path: disable PDL on this layer because the consumer-launch
     // attribute fragments the GPU memory allocator and the small headroom on
     // 16 GB class GPUs cannot absorb the extra reservation.
+    const bool value_z_q4 = value_z_weight.qtype == QType::Q4G64_F16S;
     if constexpr (Order == PdlOrder::Q5ThenQ4) {
-        launch_q5_t1<Geometry, Epilogue, true, false, false>(x, value_z_weight, value_epilogue, value,
-                                                             z, stream);
+        if (value_z_q4) {
+            launch_q4_vz_t1<Geometry, Epilogue, true, false, false>(x, value_z_weight, value_epilogue,
+                                                                    value, z, stream);
+        } else {
+            launch_q5_t1<Geometry, Epilogue, true, false, false>(x, value_z_weight, value_epilogue,
+                                                                 value, z, stream);
+        }
         launch_q4_t1<Geometry, Epilogue, false, true, false>(x, qk_weight, qk_epilogue, query, stream);
     } else {
         launch_q4_t1<Geometry, Epilogue, true, false, false>(x, qk_weight, qk_epilogue, query, stream);
-        launch_q5_t1<Geometry, Epilogue, false, true, false>(x, value_z_weight, value_epilogue, value,
-                                                             z, stream);
+        if (value_z_q4) {
+            launch_q4_vz_t1<Geometry, Epilogue, false, true, false>(x, value_z_weight,
+                                                                    value_epilogue, value, z, stream);
+        } else {
+            launch_q5_t1<Geometry, Epilogue, false, true, false>(x, value_z_weight, value_epilogue,
+                                                                 value, z, stream);
+        }
     }
 }
 
@@ -294,16 +407,27 @@ void launch_small_t_schedule(const Tensor& x, const Weight& qk_weight, const Wei
     // RTX 5060 Ti 16 GB path: disable PDL on this layer because the consumer-launch
     // attribute fragments the GPU memory allocator and the small headroom on
     // 16 GB class GPUs cannot absorb the extra reservation.
+    const bool value_z_q4 = value_z_weight.qtype == QType::Q4G64_F16S;
     if constexpr (Order == PdlOrder::Q5ThenQ4) {
-        launch_q5_small_t<Geometry, Tokens, Epilogue, true, false, false>(
-            x, value_z_weight, value_epilogue, value, z, stream);
+        if (value_z_q4) {
+            launch_q4_vz_small_t<Geometry, Tokens, Epilogue, true, false, false>(
+                x, value_z_weight, value_epilogue, value, z, stream);
+        } else {
+            launch_q5_small_t<Geometry, Tokens, Epilogue, true, false, false>(
+                x, value_z_weight, value_epilogue, value, z, stream);
+        }
         launch_q4_small_t<Geometry, Tokens, Q4Schedule, Epilogue, false, true, false>(
             x, qk_weight, qk_epilogue, query, stream);
     } else {
         launch_q4_small_t<Geometry, Tokens, Q4Schedule, Epilogue, true, false, false>(
             x, qk_weight, qk_epilogue, query, stream);
-        launch_q5_small_t<Geometry, Tokens, Epilogue, false, true, false>(
-            x, value_z_weight, value_epilogue, value, z, stream);
+        if (value_z_q4) {
+            launch_q4_vz_small_t<Geometry, Tokens, Epilogue, false, true, false>(
+                x, value_z_weight, value_epilogue, value, z, stream);
+        } else {
+            launch_q5_small_t<Geometry, Tokens, Epilogue, false, true, false>(
+                x, value_z_weight, value_epilogue, value, z, stream);
+        }
     }
 }
 

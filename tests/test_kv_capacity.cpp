@@ -28,7 +28,7 @@ int main() {
     failures +=
         check(automatic.main_page_groups == 4 && automatic.resolved_tokens == 256 &&
                   automatic.runtime_reservation_bytes == 1256 &&
-                  automatic.automatic_headroom_bytes == 50 && automatic.planned_slack_bytes == 104,
+                  automatic.automatic_safety_margin_bytes == 50 && automatic.planned_slack_bytes == 104,
               "automatic KV capacity did not select the largest fitting page count");
 
     const auto capped =

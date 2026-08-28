@@ -1,0 +1,90 @@
+```cpp
+#include <deque>
+
+class MiniQueue {
+private:
+    std::deque<int> dq;
+
+public:
+    void push(int x) {
+        dq.push_back(x);
+    }
+
+    bool pop(int &x) {
+        if (dq.empty()) {
+            return false;
+        }
+        x = dq.front();
+        dq.pop_front();
+        return true;
+    }
+
+    int front() const {
+        return dq.front();
+    }
+
+    int size() const {
+        return static_cast<int>(dq.size());
+    }
+};
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB     6.522 s
+load        engine construction            9.431 s
+load        artifact/materialize           8.746 s
+load        host to device                 6.522 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        15.18 GiB
+summary     weight H2D                15.17 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.422 s
+generate    decode                         2.153 s
+generate    total                          2.575 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             90
+summary     reused prompt tokens      0
+summary     generated tokens          132
+summary     model elapsed             2.574 s
+summary     prefill speed             213.50 tok/s
+summary     decode speed              60.85 tok/s
+summary     throughput (overall)      51.27 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          15.17 GiB / 15.17 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        179.06 MiB
+summary     free after startup        87.06 MiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 15.17 GiB
+  runtime fixed           77.73 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             85.06 MiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      15.26 GiB
+summary     mtp draft window          3
+summary     mtp rounds                34
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        102
+summary     mtp accepted tokens       98
+summary     mtp acceptance rate       96.08%
+summary     mtp acceptance length     3.88 tok/round
+summary     mtp accepted by pos       33,33,32

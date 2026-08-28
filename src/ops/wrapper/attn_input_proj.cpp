@@ -47,6 +47,17 @@ void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, std:
     }
 }
 
+void require_rowsplit_either(const Weight& weight, QType qtype_a, QType qtype_b, std::int32_t rows,
+                             std::int32_t k, const char* label) {
+    if (weight.qtype == qtype_a) {
+        require_rowsplit(weight, qtype_a, rows, k, label);
+    } else if (weight.qtype == qtype_b) {
+        require_rowsplit(weight, qtype_b, rows, k, label);
+    } else {
+        throw std::invalid_argument(std::string("attn_input_proj: invalid ") + label);
+    }
+}
+
 void require_w8_rowsplit(const Weight& weight, std::int32_t rows, const char* label) {
     if (weight.qtype != QType::W8G32_F16S || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
@@ -233,10 +244,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
         require_matrix(gate, kQRows, cols, "gate");
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
-        require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, 5120,
-                         "query/key weight");
-        require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, 5120,
-                         "gate/value weight");
+require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, 5120,
+                          "query/key weight");
+        require_rowsplit_either(gate_value_weight, QType::Q4G64_F16S, QType::Q5G64_F16S,
+                                kQRows + kKvRows, 5120, "gate/value weight");
         break;
     }
     case 4096: {
@@ -247,10 +258,10 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
         require_matrix(gate, kQRows, cols, "gate");
         require_matrix(k, kKvRows, cols, "k");
         require_matrix(v, kKvRows, cols, "v");
-        require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, 4096,
-                         "query/key weight");
-        require_rowsplit(gate_value_weight, QType::Q5G64_F16S, kQRows + kKvRows, 4096,
-                         "gate/value weight");
+require_rowsplit(query_key_weight, QType::Q4G64_F16S, kQRows + kKvRows, 4096,
+                          "query/key weight");
+        require_rowsplit_either(gate_value_weight, QType::Q4G64_F16S, QType::Q5G64_F16S,
+                                kQRows + kKvRows, 4096, "gate/value weight");
         break;
     }
     default:

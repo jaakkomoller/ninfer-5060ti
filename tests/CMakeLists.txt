@@ -262,6 +262,10 @@ ninfer_add_op_test(ninfer_gdn_replay_fold_test
   SOURCES ops/test_gdn_replay_fold.cpp
   LIBRARIES ninfer_ops)
 ninfer_add_fused_linear_test(
+  ninfer_linear_add_q4_a16_test
+  ops/linear_add/test_q4_a16.cpp
+  ops/linear_add/linear_add_test_common.cpp)
+ninfer_add_fused_linear_test(
   ninfer_linear_add_q5_a16_test
   ops/linear_add/test_q5_a16.cpp
   ops/linear_add/linear_add_test_common.cpp)

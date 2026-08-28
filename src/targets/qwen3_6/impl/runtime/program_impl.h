@@ -2223,9 +2223,13 @@ MemorySummary ProgramImplCore::memory_summary() const noexcept {
     out.max_context = capacity;
     out.kv_capacity = kv_capacity;
     out.kv_cache = kv_dtype == DType::BF16
-                   ? KvCacheStorage::BFloat16
-                   : (kv_dtype == DType::I4 ? KvCacheStorage::Int4Group64
-                                            : KvCacheStorage::Int8Group64);
+                    ? KvCacheStorage::BFloat16
+                    : (kv_dtype == DType::I4 ? KvCacheStorage::Int4Group64
+                                             : KvCacheStorage::Int8Group64);
+    std::size_t free_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &out.device_total_bytes) != cudaSuccess) {
+        out.device_total_bytes = 0;
+    }
     DeviceArena& weights = *model.weights_arena;
     out.weights = ArenaMemorySummary{weights.capacity(), weights.used(), weights.peak_used()};
     out.sequence =

@@ -31,10 +31,11 @@ class TagIndex:
         if key not in self._tag_to_keys.get(tag, []
 phase       detail                      elapsed/progress
 load        weights                      0.00%           0 B /      15.17 GiB     0.000 s
-load        weights                    100.00%     15.17 GiB /      15.17 GiB     4.884 s
-load        engine construction            6.793 s
-load        artifact/materialize           6.660 s
-load        host to device                 4.884 s
+load        weights                     60.16%      9.12 GiB /      15.17 GiB    10.041 s
+load        weights                    100.00%     15.17 GiB /      15.17 GiB    16.238 s
+load        engine construction           19.391 s
+load        artifact/materialize          18.408 s
+load        host to device                16.238 s
 summary     target                    qwen3_8_27b
 summary     weights                   groupwise-int
 summary     artifact file read        15.18 GiB
@@ -43,35 +44,42 @@ summary     pinned staging peak       256.00 MiB
 summary     tensors/resources         783 / 6
 prepare     render/preprocess              0.003 s
 generate    vision                         0.000 s
-generate    text prefill                   4.098 s
-generate    decode                         4.070 s
-generate    total                          8.172 s
+generate    text prefill                   4.257 s
+generate    decode                         4.195 s
+generate    total                          8.455 s
 summary     sampling                  greedy (temperature 0)
 summary     finish reason             context-capacity
 summary     prompt tokens             1575
 summary     reused prompt tokens      0
 summary     generated tokens          218
-summary     model elapsed             8.168 s
-summary     prefill speed             384.34 tok/s
-summary     decode speed              53.32 tok/s
-summary     throughput (overall)      26.69 tok/s
+summary     model elapsed             8.451 s
+summary     prefill speed             370.00 tok/s
+summary     decode speed              51.73 tok/s
+summary     throughput (overall)      25.79 tok/s
 summary     device                    0
 summary     max context               1792
 summary     KV capacity policy        explicit
 summary     KV capacity               1792
 summary     KV page groups            28 / 28
 summary     gpu weights used          15.17 GiB / 15.17 GiB
-summary     gpu sequence used         145.48 MiB / 145.48 MiB
+summary     gpu sequence used         103.53 MiB / 103.53 MiB
 summary     kv cache dtype            int8-group64
 summary     kv cache payload          61.49 MiB
 summary     gpu workspace peak        10.79 MiB / 10.79 MiB
-summary     runtime reservation       168.26 MiB
+summary     runtime reservation       120.00 MiB
 summary     free after weights        179.06 MiB
-summary     free after startup        19.06 MiB
-summary     KV capacity headroom      0 B
-summary     planned slack             10.80 MiB
-summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
-summary     planned device total      15.33 GiB
+summary     free after startup        61.06 MiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 15.17 GiB
+  runtime fixed           103.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1792 tokens (28 / 28 page groups)
+  selected context        1792
+summary     planned slack             59.06 MiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      15.28 GiB
 summary     mtp draft window          2
 summary     mtp rounds                74
 summary     mtp fallback steps        0
@@ -79,4 +87,4 @@ summary     mtp drafted tokens        147
 summary     mtp accepted tokens       143
 summary     mtp acceptance rate       97.28%
 summary     mtp acceptance length     2.93 tok/round
-summary     mtp accepted by pos       73,70
+summary     mtp accepted by pos       72,71

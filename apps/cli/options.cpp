@@ -91,9 +91,11 @@ std::string usage_text(const char* argv0) {
            "Structured message content accepts text, image/image_url, and video/video_url parts;\n"
            "media sources may be local paths, HTTP(S) URLs, or base64 data URIs.\n"
            "--vision enables image/video input and loads the fixed Vision GPU allocations.\n"
-           "--kv-capacity auto leaves " +
-           std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
-           " MiB of sizing headroom.\n"
+"--kv-capacity auto sizes the Main KV pool to the largest capacity whose exact reservation\n"
+            "fits in the memory left after weights, keeping a " +
+            std::to_string(kAutomaticKvSafetyMarginBytes / (1024ULL * 1024ULL)) +
+            " MiB automatic safety margin for measured post-plan driver growth (lazy module\n"
+            "loads and allocator fragmentation).\n"
            "--no-prefix-reuse halves the Linear Attention state pool by dropping the rewrite\n"
            "checkpoint slot, useful for memory-constrained GPUs that do not need cross-request\n"
            "prefix caching.\n"

@@ -1,0 +1,614 @@
+{
+  "summary": {
+    "mtp0": {
+      "n": 14,
+      "runs_ok": 14,
+      "passed": 7,
+      "pass_pct": 50.0,
+      "strong_n": 14,
+      "strong_passed": 7,
+      "strong_pass_pct": 50.0
+    },
+    "mtp3": {
+      "n": 14,
+      "runs_ok": 14,
+      "passed": 7,
+      "pass_pct": 50.0,
+      "strong_n": 14,
+      "strong_passed": 7,
+      "strong_pass_pct": 50.0
+    }
+  },
+  "per_task": {
+    "c_gcd": {
+      "mtp0": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      }
+    },
+    "c_debug_max": {
+      "mtp0": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      }
+    },
+    "cpp_miniqueue": {
+      "mtp0": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      }
+    },
+    "cpp_debug_sorted": {
+      "mtp0": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      }
+    },
+    "cpp_debug_odds": {
+      "mtp0": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      }
+    },
+    "modify_c_api": {
+      "mtp0": {
+        "passed": false,
+        "detail": "run rc=5 out='' err=?",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": false,
+        "detail": "run rc=5 out='' err=?",
+        "strong": true
+      }
+    },
+    "py_lru": {
+      "mtp0": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      }
+    },
+    "if_json": {
+      "mtp0": {
+        "passed": false,
+        "detail": "answer=401 (expect 399)",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": false,
+        "detail": "answer=409 (expect 399)",
+        "strong": true
+      }
+    },
+    "if_result_line": {
+      "mtp0": {
+        "passed": false,
+        "detail": "last line '$$120 = 2^' is not RESULT: <int>",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": false,
+        "detail": "last line '$$120 = 2^' is not RESULT: <int>",
+        "strong": true
+      }
+    },
+    "understand_trace": {
+      "mtp0": {
+        "passed": false,
+        "detail": "last number 1023 (expect 15)",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": false,
+        "detail": "last number 1023 (expect 15)",
+        "strong": true
+      }
+    },
+    "understand_memo": {
+      "mtp0": {
+        "passed": false,
+        "detail": "last number 10 (expect 9)",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": false,
+        "detail": "last number 10 (expect 9)",
+        "strong": true
+      }
+    },
+    "reason_words": {
+      "mtp0": {
+        "passed": false,
+        "detail": "reply '10:30' (expect 11:06)",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": false,
+        "detail": "reply '10:30' (expect 11:06)",
+        "strong": true
+      }
+    },
+    "reason_graph": {
+      "mtp0": {
+        "passed": false,
+        "detail": "last number 11 (expect 8)",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": false,
+        "detail": "last number 11 (expect 8)",
+        "strong": true
+      }
+    },
+    "py_behavior_refactor": {
+      "mtp0": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      },
+      "mtp3": {
+        "passed": true,
+        "detail": "ok",
+        "strong": true
+      }
+    }
+  },
+  "detail": [
+    {
+      "task_id": "c_gcd",
+      "category": "c_codegen",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 52,
+      "generated_tokens": 56,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "c_gcd",
+      "category": "c_codegen",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 52,
+      "generated_tokens": 56,
+      "decode_tps": 62,
+      "acceptance_pct": 97,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "c_debug_max",
+      "category": "c_debug",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 117,
+      "generated_tokens": 64,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "c_debug_max",
+      "category": "c_debug",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 117,
+      "generated_tokens": 64,
+      "decode_tps": 62,
+      "acceptance_pct": 100,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "cpp_miniqueue",
+      "category": "cpp_codegen",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 90,
+      "generated_tokens": 132,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "cpp_miniqueue",
+      "category": "cpp_codegen",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 90,
+      "generated_tokens": 132,
+      "decode_tps": 60,
+      "acceptance_pct": 96,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "cpp_debug_sorted",
+      "category": "cpp_debug",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 117,
+      "generated_tokens": 64,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "cpp_debug_sorted",
+      "category": "cpp_debug",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 117,
+      "generated_tokens": 64,
+      "decode_tps": 62,
+      "acceptance_pct": 100,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "cpp_debug_odds",
+      "category": "cpp_debug",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 131,
+      "generated_tokens": 72,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "cpp_debug_odds",
+      "category": "cpp_debug",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 131,
+      "generated_tokens": 72,
+      "decode_tps": 62,
+      "acceptance_pct": 100,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "modify_c_api",
+      "category": "c_modify",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 115,
+      "generated_tokens": 66,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "run rc=5 out='' err=?",
+      "strong": true
+    },
+    {
+      "task_id": "modify_c_api",
+      "category": "c_modify",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 115,
+      "generated_tokens": 66,
+      "decode_tps": 61,
+      "acceptance_pct": 98,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "run rc=5 out='' err=?",
+      "strong": true
+    },
+    {
+      "task_id": "py_lru",
+      "category": "py_multistep",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 102,
+      "generated_tokens": 521,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "py_lru",
+      "category": "py_multistep",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 102,
+      "generated_tokens": 495,
+      "decode_tps": 54,
+      "acceptance_pct": 83,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "if_json",
+      "category": "instruction_following",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 65,
+      "generated_tokens": 9,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "answer=401 (expect 399)",
+      "strong": true
+    },
+    {
+      "task_id": "if_json",
+      "category": "instruction_following",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 65,
+      "generated_tokens": 9,
+      "decode_tps": 42,
+      "acceptance_pct": 77,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "answer=409 (expect 399)",
+      "strong": true
+    },
+    {
+      "task_id": "if_result_line",
+      "category": "instruction_following",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 61,
+      "generated_tokens": 200,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last line '$$120 = 2^' is not RESULT: <int>",
+      "strong": true
+    },
+    {
+      "task_id": "if_result_line",
+      "category": "instruction_following",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 61,
+      "generated_tokens": 200,
+      "decode_tps": 60,
+      "acceptance_pct": 96,
+      "fallback": 1,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last line '$$120 = 2^' is not RESULT: <int>",
+      "strong": true
+    },
+    {
+      "task_id": "understand_trace",
+      "category": "code_understanding",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 81,
+      "generated_tokens": 5,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last number 1023 (expect 15)",
+      "strong": true
+    },
+    {
+      "task_id": "understand_trace",
+      "category": "code_understanding",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 81,
+      "generated_tokens": 5,
+      "decode_tps": 32,
+      "acceptance_pct": 66,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last number 1023 (expect 15)",
+      "strong": true
+    },
+    {
+      "task_id": "understand_memo",
+      "category": "code_understanding",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 108,
+      "generated_tokens": 3,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last number 10 (expect 9)",
+      "strong": true
+    },
+    {
+      "task_id": "understand_memo",
+      "category": "code_understanding",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 108,
+      "generated_tokens": 3,
+      "decode_tps": 31,
+      "acceptance_pct": 100,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last number 10 (expect 9)",
+      "strong": true
+    },
+    {
+      "task_id": "reason_words",
+      "category": "multistep_reasoning",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 91,
+      "generated_tokens": 6,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "reply '10:30' (expect 11:06)",
+      "strong": true
+    },
+    {
+      "task_id": "reason_words",
+      "category": "multistep_reasoning",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 91,
+      "generated_tokens": 6,
+      "decode_tps": 40,
+      "acceptance_pct": 100,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "reply '10:30' (expect 11:06)",
+      "strong": true
+    },
+    {
+      "task_id": "reason_graph",
+      "category": "multistep_reasoning",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 82,
+      "generated_tokens": 3,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last number 11 (expect 8)",
+      "strong": true
+    },
+    {
+      "task_id": "reason_graph",
+      "category": "multistep_reasoning",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 82,
+      "generated_tokens": 3,
+      "decode_tps": 15,
+      "acceptance_pct": 50,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": false,
+      "detail": "last number 11 (expect 8)",
+      "strong": true
+    },
+    {
+      "task_id": "py_behavior_refactor",
+      "category": "py_refactor",
+      "config": "mtp0",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 125,
+      "generated_tokens": 56,
+      "decode_tps": 24,
+      "acceptance_pct": 0,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    },
+    {
+      "task_id": "py_behavior_refactor",
+      "category": "py_refactor",
+      "config": "mtp3",
+      "artifact": "out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer",
+      "prompt_tokens": 125,
+      "generated_tokens": 56,
+      "decode_tps": 58,
+      "acceptance_pct": 95,
+      "fallback": 0,
+      "completion": "ok",
+      "verdict": true,
+      "detail": "ok",
+      "strong": true
+    }
+  ]
+}

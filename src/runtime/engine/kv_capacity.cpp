@@ -99,24 +99,24 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
     std::size_t capacity_budget = available_runtime_bytes;
     switch (policy.mode) {
     case KvCapacityMode::Explicit:
-        if (policy.automatic_headroom_bytes != 0) {
-            throw std::invalid_argument("explicit KV capacity must not carry automatic headroom");
+        if (policy.automatic_safety_margin_bytes != 0) {
+            throw std::invalid_argument("explicit KV capacity must not carry an automatic safety margin");
         }
         pages = explicit_page_groups(policy, curve);
         break;
     case KvCapacityMode::Automatic:
-        if (available_runtime_bytes < policy.automatic_headroom_bytes) {
+        if (available_runtime_bytes < policy.automatic_safety_margin_bytes) {
             throw std::invalid_argument(
-                "automatic KV headroom requires " +
-                std::to_string(policy.automatic_headroom_bytes) + " bytes, but only " +
+                "automatic KV safety margin requires " +
+                std::to_string(policy.automatic_safety_margin_bytes) + " bytes, but only " +
                 std::to_string(available_runtime_bytes) + " bytes are available after weights");
         }
-        capacity_budget -= policy.automatic_headroom_bytes;
+        capacity_budget -= policy.automatic_safety_margin_bytes;
         if (capacity_budget < curve.minimum_device_reservation_bytes) {
             throw std::invalid_argument(
                 "minimum Engine runtime reservation requires " +
                 std::to_string(curve.minimum_device_reservation_bytes) + " bytes in addition to " +
-                std::to_string(policy.automatic_headroom_bytes) +
+                std::to_string(policy.automatic_safety_margin_bytes) +
                 " bytes of automatic headroom, but only " +
                 std::to_string(available_runtime_bytes) + " bytes are available after weights");
         }
@@ -171,7 +171,7 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         .bytes_per_additional_main_page_group = curve.bytes_per_additional_main_page_group,
         .runtime_reservation_bytes            = reservation,
         .available_after_weights_bytes        = available_runtime_bytes,
-        .automatic_headroom_bytes             = policy.automatic_headroom_bytes,
+        .automatic_safety_margin_bytes      = policy.automatic_safety_margin_bytes,
         .planned_slack_bytes                  = available_runtime_bytes - reservation,
     };
 }

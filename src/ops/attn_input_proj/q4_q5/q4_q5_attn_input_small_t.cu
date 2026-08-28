@@ -221,9 +221,13 @@ void launch_q5(const Tensor& x, const Weight& weight, Tensor& gate, Tensor& valu
 
 template <class Geometry>
 void launch_geometry(const Tensor& x, const Weight& query_key_weight, const Weight& gate_value_weight,
-                     Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
+                      Tensor& q, Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     launch_q4<Geometry>(x, query_key_weight, q, k, stream);
-    launch_q5<Geometry>(x, gate_value_weight, gate, v, stream);
+    if (gate_value_weight.qtype == QType::Q4G64_F16S) {
+        launch_q4<Geometry>(x, gate_value_weight, gate, v, stream);
+    } else {
+        launch_q5<Geometry>(x, gate_value_weight, gate, v, stream);
+    }
 }
 
 } // namespace

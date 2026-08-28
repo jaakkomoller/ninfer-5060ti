@@ -115,8 +115,8 @@ Main physical page groups = M
 per-allocation logical page capacity = L
 ```
 
-Explicit policy 使用 `M=ceil(K_main/P_main)`。Automatic policy 带有必须保留的 device headroom `R`，在
-权重加载并同步后查询剩余显存 `F`。CLI/server 的 `R` 固定为 1 GiB；Engine policy 可以显式指定该值。
+Explicit policy 使用 `M=ceil(K_main/P_main)`。Automatic policy 带有必须保留的 device safety margin `R`，在
+权重加载并同步后查询剩余显存 `F`。CLI/server 的 `R` 为 32 MiB（16 个 2 MiB driver 粒度）；Engine policy 可以显式指定该值。
 Exact target 用同一个完整 physical candidate builder 得到：
 
 ```text
@@ -133,9 +133,12 @@ persistent 部分直接来自生产 `LayoutBuilder`，workspace 来自生产 sch
 resolver 不维护模型维度或 bytes-per-token 公式，也不做 allocation probing。最终 plan 再由同一 builder
 按 `M` 生成并核对 reservation curve。
 
-`R` 是 capacity solver 刻意不消费的 sizing headroom。CUDA allocator、context 和 module 的物理占用不全
+`R` 是 capacity solver 刻意不消费的 safety margin。CUDA allocator、context 和 module 的物理占用不全
 等同于 arena payload；因此 Instance 与 Graph 完整建立并同步后再次查询实际 free memory，并与 policy、
-planned slack 一起报告。默认 1 GiB 同时吸收这部分差值，并为同一 GPU 上后续的小额占用留下实际余量。
+planned slack 一起报告。默认 32 MiB = 16 个 driver 2 MiB 粒度，只覆盖 reservation 无法计划的后置 driver
+增长（捕获集合之外的 lazy module instantiation，以及跨已计划 cudaMalloc 集合的 allocator/context
+fragmentation）；reservation 本身是精确的（arena 按 driver 计费尺寸保留，module code load 由 CUDA Graph
+allowance 覆盖），因此 margin 从早期的 1 GiB blanket headroom 收缩为该有界残差。
 
 Engine 对外同时报告 configured `max_context` 和 resolved `kv_capacity=M*P_main`。最后一个 physical page
 的 rounding tail 只属于 storage padding，不能让 sequence frontier 超过 `S`。Admission 以 page-group
@@ -1428,8 +1431,8 @@ contiguous-KV reference 只记录当时的 `B=1` paging migration，不是当前
 - `EngineOptions.max_context=S` 是 per-sequence logical ceiling，`EngineOptions.kv_capacity` 是
   `Explicit(K_main)` 或 `Automatic(R)`；令 `L=ceil(S/64)`、`M_min=max(L,max_concurrency)`、
   `M_max=max_concurrency*L`，Explicit 取 `M=ceil(K_main/64)`，Automatic 根据完整 target physical
-  reservation curve 与权重加载后的空闲显存扣除 headroom `R` 后，直接求得区间内最大的 `M`；
-  CLI/server 的 `R` 为 1 GiB；Main 与 DFlash Full 的
+  reservation curve 与权重加载后的空闲显存扣除 safety margin `R` 后，直接求得区间内最大的 `M`；
+  CLI/server 的 `R` 为 32 MiB；Main 与 DFlash Full 的
   per-allocation logical capacity 均为 `L`、physical capacity 均为 `M` pages，MTP 的 logical capacity
   为 `L`、physical capacity 为 `M + max_concurrency*ceil((K_draft-1)/64)` pages，其中 `K_draft` 是
   speculative draft window；Explicit 不满足 `K_main>=S`、任一 policy 的 resolved

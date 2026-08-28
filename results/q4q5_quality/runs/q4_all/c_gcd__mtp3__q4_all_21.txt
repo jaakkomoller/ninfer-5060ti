@@ -1,0 +1,70 @@
+```c
+int gcd(int a, int b) {
+    while (b != 0) {
+        int temp = b;
+        b = a % b;
+        a = temp;
+    }
+    return a;
+}
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.85 GiB     0.000 s
+load        weights                    100.00%     13.85 GiB /      13.85 GiB     5.802 s
+load        engine construction            8.803 s
+load        artifact/materialize           8.007 s
+load        host to device                 5.802 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.86 GiB
+summary     weight H2D                13.85 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.245 s
+generate    decode                         1.059 s
+generate    total                          1.304 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             52
+summary     reused prompt tokens      0
+summary     generated tokens          56
+summary     model elapsed             1.304 s
+summary     prefill speed             212.27 tok/s
+summary     decode speed              51.94 tok/s
+summary     throughput (overall)      42.95 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.85 GiB / 13.85 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        5.46 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        1.49 GiB
+summary     free after startup        1.40 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.85 GiB
+  runtime fixed           77.73 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             1.40 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.94 GiB
+summary     mtp draft window          3
+summary     mtp rounds                14
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        42
+summary     mtp accepted tokens       41
+summary     mtp acceptance rate       97.62%
+summary     mtp acceptance length     3.93 tok/round
+summary     mtp accepted by pos       14,14,13

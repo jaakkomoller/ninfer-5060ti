@@ -1,0 +1,63 @@
+```python
+def positive_sum(items):
+    total = 0
+    for x in items:
+        if x > 0:
+            total += x
+    return total
+
+def process(items):
+    return positive_sum(items) * 2
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      14.96 GiB     0.000 s
+load        weights                    100.00%     14.96 GiB /      14.96 GiB     5.185 s
+load        engine construction            7.855 s
+load        artifact/materialize           7.263 s
+load        host to device                 5.185 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        14.97 GiB
+summary     weight H2D                14.96 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.421 s
+generate    decode                         2.248 s
+generate    total                          2.669 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             125
+summary     reused prompt tokens      0
+summary     generated tokens          56
+summary     model elapsed             2.668 s
+summary     prefill speed             297.25 tok/s
+summary     decode speed              24.47 tok/s
+summary     throughput (overall)      20.99 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          14.96 GiB / 14.96 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        393.06 MiB
+summary     free after startup        305.06 MiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 14.96 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             295.06 MiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      15.05 GiB

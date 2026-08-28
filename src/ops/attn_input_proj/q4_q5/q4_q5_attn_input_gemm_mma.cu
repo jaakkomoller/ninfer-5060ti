@@ -64,9 +64,15 @@ void launch_slice(const Tensor& x, const Weight& query_key_weight, const Weight&
     launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
         full, x, make_job(query_key_weight, 0, query_rows, q),
         make_job(query_key_weight, query_rows, kv_rows, k), stream);
-    launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
-        full, x, make_job(gate_value_weight, 0, query_rows, gate),
-        make_job(gate_value_weight, query_rows, kv_rows, v), stream);
+    if (gate_value_weight.qtype == QType::Q4G64_F16S) {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q4>(
+            full, x, make_job(gate_value_weight, 0, query_rows, gate),
+            make_job(gate_value_weight, query_rows, kv_rows, v), stream);
+    } else {
+        launch_pair<Schedule, RowSplitGroupedMmaCodec::Q5>(
+            full, x, make_job(gate_value_weight, 0, query_rows, gate),
+            make_job(gate_value_weight, query_rows, kv_rows, v), stream);
+    }
 }
 
 template <class Schedule>

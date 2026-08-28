@@ -644,8 +644,9 @@ active used capacity
 Selected speculative backend 的物理 KV pool 虽与 Main Text pool 分离，但容量由同一个 target-specific
 profile 联合规划。设 `S=max_context`、`P` 为 page size、`L=ceil(S/P)`、
 `C=max_concurrency`、`M_min=max(L,C)`、`M_max=C*L`。Explicit policy 从用户 token capacity 得到
-`M=ceil(K_main/P)`；Automatic policy 在权重加载后保留 headroom `R`，从完整 target physical layout 的
-reservation curve 直接求出 `F-R` 可容纳的最大 `M`。CLI/server 使用 `R=1 GiB`，并在完整 startup 后
+`M=ceil(K_main/P)`；Automatic policy 在权重加载后保留 safety margin `R`，从完整 target physical layout 的
+reservation curve 直接求出 `F-R` 可容纳的最大 `M`。CLI/server 使用 `R=32 MiB`（16 个 2 MiB driver 粒度，
+覆盖 reservation 之外的后置 driver 增长），并在完整 startup 后
 报告实际 free memory。Main 与 DFlash 各
 使用 `M` 个 physical page groups，每条
 allocation 的 logical capacity 为 `L`；MTP 使用

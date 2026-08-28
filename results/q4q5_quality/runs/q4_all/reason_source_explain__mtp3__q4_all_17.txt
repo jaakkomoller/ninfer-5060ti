@@ -1,0 +1,101 @@
+### (a) What each public function does
+
+1.  **`__init__(self)`**
+    *   Initializes a new `Index` instance.
+    *   Sets `self.docs` to an empty dictionary (mapping keys to documents).
+    *   Sets `self.sorted_keys` to an empty list (intended to hold keys in sorted order).
+
+2.  **`add(self, key, doc)`**
+    *   Adds a single key-value pair to the index.
+    *   Stores `doc` in `self.docs` under `key`.
+    *   **Recomputes** the entire sorted list of keys by calling `sorted(self.docs)` and assigns it to `self.sorted_keys`.
+    *   *Note:* This is inefficient for large indices because it sorts the entire dictionary every time a single item is added, but it is functionally correct for maintaining a sorted list.
+
+3.  **`merge(self, other)`**
+    *   Intended to merge the contents of another `Index` instance (`other`) into `self`.
+    *   Iterates through the keys in `other.sorted_keys`.
+    *   For each key, it copies the corresponding document from `other.docs` into `self.docs`.
+    *   **Recomputes** the entire sorted list of keys for `self` after *every single insertion*.
+
+---
+
+### (b) The bug in `merge()`
+
+The bug is a **performance bug** (specifically, an algorithmic complexity issue), not a logical correctness bug.
+
+The `merge` function calls `self.sorted_keys = sorted(self.docs)` **inside the loop** for every key being merged.
+
+*   If `other` has $N$ keys, the loop runs $N$ times.
+*   Each call to `sorted(self.docs)` takes $O(M \log M)$ time, where $M$ is the current size of `self.docs`.
+*   As the loop progresses, $M$ increases from its initial size to `initial_size + N`.
+*   The total time complexity becomes roughly:
+    $$ \sum_{i=0}^{N} O((M_0 + i) \log (M_0 + i)) $$
+    This results in **$O(N \cdot M \log M)$** or worse, depending on the initial size $M_0$.
+
+**The fix:** The sorting should happen **once** after all keys have been added, not inside the loop.
+
+**Corrected `merge`:**
+```python
+def merge(self, other):
+    for key in other.sorted_keys:
+        self.docs[key] = other.docs[key]
+    # Sort only once after all insertions are complete
+    self.sorted_keys = sorted(self.docs)
+```
+
+---
+
+### (c) Why the bug occurs
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.85 GiB     0.000 s
+load        weights                    100.00%     13.85 GiB /      13.85 GiB     7.297 s
+load        engine construction           12.695 s
+load        artifact/materialize          11.936 s
+load        host to device                 7.297 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.86 GiB
+summary     weight H2D                13.85 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.001 s
+generate    vision                         0.000 s
+generate    text prefill                   0.576 s
+generate    decode                        14.854 s
+generate    total                         15.481 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             143
+summary     reused prompt tokens      0
+summary     generated tokens          600
+summary     model elapsed             15.430 s
+summary     prefill speed             248.33 tok/s
+summary     decode speed              40.32 tok/s
+summary     throughput (overall)      38.88 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.85 GiB / 13.85 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        1.49 GiB
+summary     free after startup        1.40 GiB
+summary     KV capacity headroom      0 B
+summary     planned slack             1.40 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.94 GiB
+summary     mtp draft window          3
+summary     mtp rounds                195
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        583
+summary     mtp accepted tokens       404
+summary     mtp acceptance rate       69.30%
+summary     mtp acceptance length     3.07 tok/round
+summary     mtp accepted by pos       163,138,103

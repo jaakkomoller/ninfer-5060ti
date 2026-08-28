@@ -1,0 +1,124 @@
+```ini
+# /etc/systemd/system/myapp.service
+#
+# Systemd service unit file for myapp
+#
+# This service runs /usr/local/bin/myapp on port 8080 as the 'myapp' user,
+# restarts on failure with a 5-second delay, and waits for network-online.target.
+
+[Unit]
+# Description: Human-readable description of the service
+Description=My Application Service
+
+# After: Ensures this service starts after network-online.target is reached.
+# network-online.target is a passive target that is reached when the network
+# is considered online (i.e., at least one network interface is up and has an IP address).
+After=network-online.target
+
+# Wants: Creates a weak dependency on network-online.target, ensuring it is
+# pulled in if not already active. This is standard practice for network-dependent services.
+Wants=network-online.target
+
+# ConditionPathExists: Optional safety check to ensure the binary exists before starting.
+# This prevents the service from failing to start if the binary is missing.
+ConditionPathExists=/usr/local/bin/myapp
+
+[Service]
+# Type: Specifies the type of the service. 'simple' is the default and most common,
+# meaning the process is considered started immediately after fork/exec.
+Type=simple
+
+# ExecStart: The command to execute when the service starts.
+# Runs /usr/local/bin/myapp with the --port 8080 argument.
+ExecStart=/usr/local/bin/myapp --port 8080
+
+# User: Specifies the user account under which the service process runs.
+# Running as a dedicated non-root user improves security by limiting the impact of potential vulnerabilities.
+User=myapp
+
+# Group: Specifies the group under which the service process runs.
+# Using a dedicated group provides additional isolation.
+Group=myapp
+
+# Restart: Specifies the restart policy. 'on-failure' means the service will be
+# restarted if it exits with a non-zero exit code, is killed by a signal, or times out.
+# It will NOT restart on clean exit (exit code 0).
+Restart=on-failure
+
+# RestartSec: Specifies the delay (in seconds) before restarting the service after a failure.
+# A 5-second delay prevents rapid restart loops in case of persistent failures.
+RestartSec=5
+
+# StandardOutput: Redirects standard output to the journal for logging.
+StandardOutput=journal
+
+# StandardError: Redirects standard error to the journal for logging.
+StandardError=journal
+
+# WorkingDirectory: Sets the working directory for the service process.
+# Using /tmp or a dedicated directory can help with relative path resolution.
+WorkingDirectory=/tmp
+
+# Environment: Sets environment variables for the service process.
+# You can add any required environment variables here.
+Environment=MYAPP
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.85 GiB     0.000 s
+load        weights                    100.00%     13.85 GiB /      13.85 GiB     7.604 s
+load        engine construction           10.437 s
+load        artifact/materialize           9.682 s
+load        host to device                 7.604 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.86 GiB
+summary     weight H2D                13.85 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.400 s
+generate    decode                        15.031 s
+generate    total                         15.433 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             74
+summary     reused prompt tokens      0
+summary     generated tokens          600
+summary     model elapsed             15.431 s
+summary     prefill speed             184.94 tok/s
+summary     decode speed              39.85 tok/s
+summary     throughput (overall)      38.88 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.85 GiB / 13.85 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        1.49 GiB
+summary     free after startup        1.40 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.85 GiB
+  runtime fixed           77.73 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    4.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             1.40 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.94 GiB
+summary     mtp draft window          3
+summary     mtp rounds                197
+summary     mtp fallback steps        1
+summary     mtp drafted tokens        591
+summary     mtp accepted tokens       401
+summary     mtp acceptance rate       67.85%
+summary     mtp acceptance length     3.04 tok/round
+summary     mtp accepted by pos       176,130,95

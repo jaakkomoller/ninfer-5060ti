@@ -190,8 +190,12 @@ prepared prompt must fit
 the 64-token page size. `--kv-capacity auto` loads the selected weights, measures the remaining GPU
 memory, and directly chooses the largest legal page capacity for the complete enabled runtime
 layout. This includes the selected speculative backend, fixed sequence state, workspace, Vision
-request transient, and CUDA Graph allowance, while leaving the default 1 GiB automatic headroom
-unallocated. It does not probe allocations or resize the pool at request time. The single-request
+request transient, and CUDA Graph allowance, while keeping a 32 MiB automatic safety margin
+(16 driver 2 MiB granularities) for measured post-plan driver growth — lazy CUDA module
+instantiations outside the captured set and allocator fragmentation — unallocated. The margin is
+deliberately small because the reservation is exact: every planned arena is reserved at the
+driver's charged size and the measured module code loads are covered by the CUDA Graph allowance.
+It does not probe allocations or resize the pool at request time. The single-request
 CLI normally leaves the option omitted so it follows
 `--max-context`; the distinction matters primarily to a concurrent Engine or server.
 

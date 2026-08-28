@@ -160,7 +160,7 @@ int main() {
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
                           server.at("memory").at("available_after_weights_bytes") == 1700 &&
                           server.at("memory").at("available_after_startup_bytes") == 180 &&
-                          server.at("memory").at("kv_capacity_headroom_bytes") == 0 &&
+                          server.at("memory").at("kv_capacity_safety_margin_bytes") == 0 &&
                           server.at("memory").at("planned_slack_bytes") == 100 &&
                           server.at("memory").at("cuda_graph_observed_bytes") == 550,
                       "adaptive KV memory ledger missing");

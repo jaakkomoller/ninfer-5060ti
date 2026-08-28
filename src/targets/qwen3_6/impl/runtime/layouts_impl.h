@@ -548,8 +548,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                 .key_dim         = TextConfig::gdn_key_head_dim,
                                 .value_dim       = TextConfig::gdn_value_head_dim,
                             });
+        // The record base must be 256-aligned within the workspace arena. The round region is a
+        // scratch peak, so rounding it up keeps every round pass inside the region, keeps the
+        // base stable across CUDA Graph replays, and costs at most 255 bytes of arena.
         if (round_region % 256 != 0) {
-            throw std::logic_error("speculative round region peak is not record-aligned");
+            round_region = (round_region + 255) & ~static_cast<std::size_t>(255);
         }
         out.replay_records_base = round_region;
         round_region += out.replay_records->payload_bytes();

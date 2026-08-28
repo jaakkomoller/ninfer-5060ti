@@ -34,12 +34,21 @@ enum class KvCapacityMode : std::uint8_t {
     Automatic,
 };
 
-inline constexpr std::size_t kDefaultKvCapacityHeadroomBytes = 1024ULL * 1024ULL * 1024ULL;
+// The automatic KV safety margin. The sequence reservation is exact: every planned arena is
+// reserved at the driver's charged size (next 2 MiB multiple) and the measured lazy CUDA module
+// code loads are covered by the per-batch graph allowance. What remains unplannable is post-plan
+// driver growth: lazy module instantiations outside the measured set (a prefill chunk size other
+// than the captured one, one-off Vision workloads) and allocator/context fragmentation across
+// the planned cudaMalloc set. Sixteen driver granularities (32 MiB) bound both sources. The
+// previous 1 GiB blanket headroom over-provisioned this by ~32x on memory-constrained cards.
+inline constexpr std::size_t kDriverAllocationGranularityBytes = 2ULL * 1024ULL * 1024ULL;
+inline constexpr std::size_t kAutomaticKvSafetyMarginBytes =
+    16ULL * kDriverAllocationGranularityBytes;
 
 struct KvCapacityPolicy {
-    KvCapacityMode mode                  = KvCapacityMode::Explicit;
-    std::uint32_t explicit_tokens        = 2048;
-    std::size_t automatic_headroom_bytes = 0;
+    KvCapacityMode mode                       = KvCapacityMode::Explicit;
+    std::uint32_t explicit_tokens             = 2048;
+    std::size_t automatic_safety_margin_bytes = 0;
 
     [[nodiscard]] static constexpr KvCapacityPolicy
     explicit_capacity(std::uint32_t tokens) noexcept {
@@ -47,8 +56,8 @@ struct KvCapacityPolicy {
     }
 
     [[nodiscard]] static constexpr KvCapacityPolicy
-    automatic(std::size_t headroom_bytes = kDefaultKvCapacityHeadroomBytes) noexcept {
-        return KvCapacityPolicy{KvCapacityMode::Automatic, 0, headroom_bytes};
+    automatic(std::size_t margin_bytes = kAutomaticKvSafetyMarginBytes) noexcept {
+        return KvCapacityPolicy{KvCapacityMode::Automatic, 0, margin_bytes};
     }
 };
 
@@ -415,6 +424,7 @@ struct ArenaMemorySummary {
 
 struct MemorySummary {
     int device                                = 0;
+    std::size_t device_total_bytes            = 0;
     std::uint32_t max_context                 = 0;
     KvCapacityMode kv_capacity_mode           = KvCapacityMode::Explicit;
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
@@ -425,17 +435,17 @@ struct MemorySummary {
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     ArenaMemorySummary request_transient;
-    std::size_t minimum_runtime_reservation_bytes = 0;
-    std::size_t kv_capacity_increment_bytes       = 0;
-    std::size_t runtime_reservation_bytes         = 0;
-    std::size_t available_after_weights_bytes     = 0;
-    std::size_t available_after_startup_bytes     = 0;
-    std::size_t kv_capacity_headroom_bytes        = 0;
-    std::size_t planned_slack_bytes               = 0;
-    std::size_t workspace_logical_peak_bytes      = 0;
-    std::size_t cuda_graph_allowance_bytes        = 0;
-    std::size_t cuda_graph_observed_bytes         = 0;
-    std::size_t kv_payload_bytes                  = 0;
+    std::size_t minimum_runtime_reservation_bytes  = 0;
+    std::size_t kv_capacity_increment_bytes        = 0;
+    std::size_t runtime_reservation_bytes          = 0;
+    std::size_t available_after_weights_bytes      = 0;
+    std::size_t available_after_startup_bytes      = 0;
+    std::size_t kv_capacity_safety_margin_bytes    = 0;
+    std::size_t planned_slack_bytes                = 0;
+    std::size_t workspace_logical_peak_bytes       = 0;
+    std::size_t cuda_graph_allowance_bytes         = 0;
+    std::size_t cuda_graph_observed_bytes          = 0;
+    std::size_t kv_payload_bytes                   = 0;
 };
 
 // Monotonic execution counters plus one boundary-consistent scheduler snapshot. Consumers derive

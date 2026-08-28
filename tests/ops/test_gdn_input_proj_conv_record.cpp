@@ -229,45 +229,52 @@ int run_q4_q5() {
     constexpr std::int32_t kHidden    = 5120;
     constexpr std::int32_t kValueRows = 6144;
     constexpr std::int32_t kZRows     = 6144;
-    DevicePackedWeight qk(
+DevicePackedWeight qk(
         quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 1401U));
     DevicePackedWeight value_z(
         quantized_weight::make_patterned_weight(QType::Q5G64_F16S, 12288, kHidden, 1403U));
+    DevicePackedWeight value_z_q4(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 12288, kHidden, 1407U));
 
     int failures   = 0;
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
-                          std::uint32_t seed) {
+                         std::uint32_t seed, DevicePackedWeight& vz, std::string_view pair =
+                             "Q4/Q5") {
         const std::size_t snapshot_bytes =
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
                 kQueryRows, kKeyRows, kValueRows, batch, width, width);
         const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
             kQueryRows, kKeyRows, kValueRows, batch, width, width);
         return run_case(
-            "Q4/Q5 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
-            kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
-[&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
-                 const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
-                 Tensor& z, WorkspaceArena& workspace) {
-                 ops::gdn_input_proj_conv_snapshot(
-                     x, qk.view(), value_z.view(), conv, state, Tensor{}, valid_columns, initial,
-                     snapshot_base, q, k, v, z, workspace, nullptr);
-             },
-             [&](const Tensor& x, const Tensor& conv, const Tensor& state,
-                 const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
-                 Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
-                 ops::gdn_input_proj_conv_record(x, qk.view(), value_z.view(), conv, state,
-                                                 Tensor{}, valid_columns, initial, record, q, k, v,
-                                                 z, workspace, nullptr);
-             },
-             seed);
+            std::string(pair) + " B=" + std::to_string(batch) + " T=" + std::to_string(width),
+            kHidden, kValueRows, kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,
+            [&](const Tensor& x, const Tensor& conv, Tensor& state, const Tensor& valid_columns,
+                const Tensor& initial, const Tensor& snapshot_base, Tensor& q, Tensor& k, Tensor& v,
+                Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_snapshot(
+                    x, qk.view(), vz.view(), conv, state, Tensor{}, valid_columns, initial,
+                    snapshot_base, q, k, v, z, workspace, nullptr);
+            },
+            [&](const Tensor& x, const Tensor& conv, const Tensor& state,
+                const Tensor& valid_columns, const Tensor& initial, Tensor& record, Tensor& q,
+                Tensor& k, Tensor& v, Tensor& z, WorkspaceArena& workspace) {
+                ops::gdn_input_proj_conv_record(x, qk.view(), vz.view(), conv, state,
+                                                Tensor{}, valid_columns, initial, record, q, k, v,
+                                                z, workspace, nullptr);
+            },
+            seed);
     };
-    failures += run(2, 1, {}, 1411U);
-    failures += run(4, 1, {3}, 1421U);
-    failures += run(7, 1, {5}, 1431U);
-    failures += run(16, 1, {}, 1441U);
-    failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1451U);
+    failures += run(2, 1, {}, 1411U, value_z);
+    failures += run(4, 1, {3}, 1421U, value_z);
+    failures += run(7, 1, {5}, 1431U, value_z);
+    failures += run(16, 1, {}, 1441U, value_z);
+    failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1451U, value_z);
+    failures += run(2, 1, {}, 1461U, value_z_q4, "Q4/Q4");
+    failures += run(4, 1, {3}, 1471U, value_z_q4, "Q4/Q4");
+    failures += run(6, 8, {6, 5, 4, 3, 2, 1, 6, 2}, 1481U, value_z_q4, "Q4/Q4");
     failures += qk.verify_preserved("Q4 record qk weight");
     failures += value_z.verify_preserved("Q5 record value/z weight");
+    failures += value_z_q4.verify_preserved("Q4 record value/z weight");
     return failures;
 }
 

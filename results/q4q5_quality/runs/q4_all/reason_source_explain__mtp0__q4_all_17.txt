@@ -1,0 +1,92 @@
+### (a) What each public function does
+
+1.  **`__init__(self)`**
+    *   Initializes a new `Index` instance.
+    *   Sets `self.docs` to an empty dictionary (mapping keys to documents).
+    *   Sets `self.sorted_keys` to an empty list (maintaining a sorted list of keys for efficient access).
+
+2.  **`add(self, key, doc)`**
+    *   Adds a single key-document pair to the index.
+    *   Updates `self.docs` with the new key and document.
+    *   **Re-sorts** the entire `self.docs` dictionary keys and updates `self.sorted_keys` to reflect the new sorted order.
+    *   *Note:* This is inefficient for large indices because it sorts the entire dictionary every time a single item is added.
+
+3.  **`merge(self, other)`**
+    *   Merges the contents of another `Index` instance (`other`) into the current instance (`self`).
+    *   Iterates through the sorted keys of `other`.
+    *   For each key, copies the corresponding document from `other.docs` into `self.docs`.
+    *   **Re-sorts** the entire `self.docs` dictionary keys and updates `self.sorted_keys` after **each** individual key insertion.
+
+---
+
+### (b) The bug in `merge()`
+
+The bug is a **performance bug** (specifically, an algorithmic inefficiency that leads to quadratic time complexity).
+
+Inside the `merge` loop:
+```python
+for key in other.sorted_keys:
+    self.docs[key] = other.docs[key]
+    self.sorted_keys = sorted(self.docs)  # <-- BUG: Sorting inside the loop
+```
+
+The `sorted(self.docs)` call is executed **once for every key** being merged. If `other` contains $N$ keys, the code performs $N$ full sorts of the growing `self.docs` dictionary.
+
+*   Sorting a dictionary of size $M$ takes $O(M \log M)$ time.
+*   As the loop progresses, $M$ increases from its initial size to `initial_size + N`.
+*   The total time complexity becomes roughly:
+    $$ \sum_{i=0}^{N} O((M_0 + i) \log (M_0 + i)) $$
+    This results in **$O(N^2 \log N)$** behavior in the worst case (when $M_0$ is small relative to $N$), which is extremely slow for large merges.
+
+---
+
+### (c) Why the bug occurs
+
+The bug occurs due to a **misunderstanding of the cost of sorting** and a failure to optimize the merge operation.
+
+1.  **Redundant Work:** The `add()`
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.64 GiB     0.000 s
+load        weights                    100.00%     13.64 GiB /      13.64 GiB     5.972 s
+load        engine construction            9.347 s
+load        artifact/materialize           8.050 s
+load        host to device                 5.972 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.65 GiB
+summary     weight H2D                13.64 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.543 s
+generate    decode                        24.079 s
+generate    total                         24.625 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             output-limit
+summary     prompt tokens             143
+summary     reused prompt tokens      0
+summary     generated tokens          600
+summary     model elapsed             24.622 s
+summary     prefill speed             263.53 tok/s
+summary     decode speed              24.88 tok/s
+summary     throughput (overall)      24.37 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.64 GiB / 13.64 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        1.70 GiB
+summary     free after startup        1.62 GiB
+summary     KV capacity headroom      0 B
+summary     planned slack             1.61 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.73 GiB

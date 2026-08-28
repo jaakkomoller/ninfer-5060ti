@@ -173,6 +173,40 @@ build/apps/ninfer out/qwen3_8_27b_rtx5060ti_q4mtp.ninfer \
   --no-prefix-reuse --no-thinking --greedy --spec mtp --draft-tokens 3
 ```
 
+**Qwen3.8-27B (`groupwise-int`) Q4 Text Weights on RTX 5060 Ti**
+
+The `q4` artifact (`out/qwen3_8_27b_rtx5060ti_q4.ninfer`, 14.44 GiB file; 13.82 GiB resident
+ weights) re-encodes the five Text linear roles (full-attention gate/value and output, GDN value/z
+ and output, MLP down) from Q5G64 to Q4G64 — 1,415,577,600 B less resident weight than the `q4mtp`
+ artifact. Vision, the MTP module, and all state codecs are unchanged; the engine selects the Q4
+ route per weight format, so the other registered identities are unaffected. With INT4 KV, the
+ context ceiling on this card moves from 6,528 tokens (Q5 weights) to:
+
+ | Flags | KV | Max ctx | Prefill tok/s | Decode tok/s | MTP acceptance | Note |
+ |---|---|---:|---:|---:|---:|---|
+ | `--spec mtp --draft-tokens 3` | int4 | **80,384** | 393.9 | 51.9 MTP3 | 100% (3.97 tok/round) | 4,643-ctx predictable prompt, 128 gen, 0 fallbacks |
+ | `--spec mtp --draft-tokens 3` | int4 | 5,120 | 393.9 | 35.2 MTP3 | 58.0% (2.70 tok/round) | 4,822-token code prompt, 128 gen, 0 fallbacks |
+ | (no spec) | int4 | **98,304** | 396.6 | 24.6 MTP0 | — | 4,822-token code prompt, 128 gen |
+
+ The ceilings are 64-token page-group multiples (80,384 = 1,256 groups; 98,304 = 1,536) and are
+ what `--kv-capacity auto` now selects directly (47 MiB / 45 MiB planned slack; the next
+ page group is rejected before upload: MTP3 81,408 requires 1,572,864,000 B plus the 32 MiB
+ safety margin vs 1,603,338,240 B available; MTP0 100,000 requires 1,809,842,176 B vs
+ 1,827,733,504 B). `--kv-capacity auto` derives a 32 MiB safety margin (16 × 2 MiB driver
+ allocation granularity) from measured post-plan driver growth instead of a fixed 1,024 MiB
+ headroom, so no explicit `--kv-capacity` is needed. MTP0 decode is unchanged by the Q4 text
+ roles (24.6 vs 24.3 tok/s on the Q5 artifact) and MTP3 at 100% acceptance exceeds the Q5
+ reference class (51.9 vs 48.4 tok/s). The Q5 `q4mtp` artifact still boots with an explicit
+ `--kv-capacity` at or below its 6,528-token ceiling but no longer fits under
+ `--kv-capacity auto` (179.5 MiB free after weights < minimum runtime reservation).
+ Reproduction:
+
+ ```
+ build/apps/ninfer out/qwen3_8_27b_rtx5060ti_q4.ninfer \
+   --prompt <text> --max-context 80384 --kv-capacity auto --kv-dtype int4 \
+   --prefill-chunk 64 --no-thinking --greedy --spec mtp --draft-tokens 3
+ ```
+
 See [Performance](docs/performance.md) for the full methodology, variability, reproduction command,
 and per-fixture results.
 
@@ -410,10 +444,11 @@ from one to fifteen.
   multi-GPU execution, CPU/GPU offload, or distributed serving.
 - `--max-context` is the logical ceiling of each sequence and is configurable up to the registered
   models' native 262,144-token limit. `--kv-capacity N` explicitly sizes the shared Main Text KV
-  pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable
-  capacity from the memory remaining after weights are loaded while preserving 1 GiB of sizing
-  headroom. Omission defaults to one `--max-context` worth of pages. The resolved pool is fixed at
-  startup and is not divided statically among request lanes.
+pool for all active and retained sequences, while `--kv-capacity auto` selects the largest usable
+capacity from the memory remaining after weights are loaded while preserving a 32 MiB automatic
+safety margin for measured post-plan driver growth. Omission defaults to one `--max-context` worth
+of pages. The resolved pool is fixed at
+startup and is not divided statically among request lanes.
 - Tool calls are parsed and returned to the client; NInfer does not execute tools.
 - The C++ headers are used by the in-tree applications and are not distributed as an installed SDK.
 

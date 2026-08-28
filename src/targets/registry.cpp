@@ -34,9 +34,9 @@ void validate_options(const EngineOptions& options) {
         if (options.kv_capacity.explicit_tokens == 0) {
             throw std::invalid_argument("Engine explicit kv_capacity must be nonzero");
         }
-        if (options.kv_capacity.automatic_headroom_bytes != 0) {
+        if (options.kv_capacity.automatic_safety_margin_bytes != 0) {
             throw std::invalid_argument(
-                "Engine explicit kv_capacity must not carry automatic headroom");
+                "Engine explicit kv_capacity must not carry an automatic safety margin");
         }
         break;
     case KvCapacityMode::Automatic:

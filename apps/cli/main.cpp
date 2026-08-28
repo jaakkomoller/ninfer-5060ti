@@ -153,6 +153,33 @@ void print_load_summary(const ninfer::LoadSummary& load, double wall_seconds) {
                  std::to_string(load.tensor_count) + " / " + std::to_string(load.resource_count));
 }
 
+void print_gpu_memory(const ninfer::MemorySummary& memory) {
+    auto line = [](std::string_view label, const std::string& value) {
+        std::cerr << "  " << std::left << std::setw(24) << label << value << "\n";
+    };
+    const bool automatic = memory.kv_capacity_mode == ninfer::KvCapacityMode::Automatic;
+    std::cerr << "GPU memory:\n";
+    line("total", format_bytes(memory.device_total_bytes));
+    line("weights", format_bytes(memory.weights.capacity_bytes));
+    line("runtime fixed", format_bytes(memory.sequence.capacity_bytes));
+    line("workspace", format_bytes(memory.workspace.capacity_bytes));
+    if (memory.request_transient.capacity_bytes > 0) {
+        line("request transient", format_bytes(memory.request_transient.capacity_bytes));
+    }
+    line("CUDA graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
+    if (automatic) {
+        line("safety margin", format_bytes(memory.kv_capacity_safety_margin_bytes));
+        line("available for KV",
+             format_bytes(memory.available_after_weights_bytes -
+                          memory.kv_capacity_safety_margin_bytes));
+    }
+    line("selected KV capacity",
+         std::to_string(memory.kv_capacity) + " tokens (" +
+             std::to_string(memory.kv_capacity_page_groups) + " / " +
+             std::to_string(memory.kv_capacity_max_page_groups) + " page groups)");
+    line("selected context", std::to_string(memory.max_context));
+}
+
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
                               const ninfer::MemorySummary& memory) {
@@ -195,7 +222,7 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("runtime reservation", format_bytes(memory.runtime_reservation_bytes));
     print_metric("free after weights", format_bytes(memory.available_after_weights_bytes));
     print_metric("free after startup", format_bytes(memory.available_after_startup_bytes));
-    print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
+    print_gpu_memory(memory);
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph memory", format_bytes(memory.cuda_graph_observed_bytes) + " / " +
                                           format_bytes(memory.cuda_graph_allowance_bytes));

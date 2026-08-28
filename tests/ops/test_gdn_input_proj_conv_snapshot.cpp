@@ -524,6 +524,12 @@ int run_q4_q5() {
         const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
         failures += run_q4_q5_case(query_key, value_z_weight, tokens, initial_slot);
     }
+    DevicePackedWeight value_z_weight_q4(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 12288, kHidden, 623U));
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6}) {
+        const std::int32_t initial_slot = tokens == 5 ? 0 : tokens + 1;
+        failures += run_q4_q5_case(query_key, value_z_weight_q4, tokens, initial_slot);
+    }
     constexpr std::int32_t kValueRows    = 6144;
     constexpr std::int32_t kZRows        = 6144;
     constexpr std::int32_t kChannels     = 10240;

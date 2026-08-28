@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace ninfer;
@@ -36,7 +37,7 @@ int verify_output_range(std::string_view label, const GuardedBf16Tensor& output,
 }
 
 int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weight,
-                   std::int32_t tokens) {
+                   std::int32_t tokens, std::string_view pair_label = "Q4/Q5") {
     constexpr std::int32_t kHidden      = 5120;
     constexpr std::int32_t kQkRows      = 4096;
     constexpr std::int32_t kValueRows   = 6144;
@@ -53,7 +54,7 @@ int run_q4_q5_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_we
     ops::gdn_input_proj(x, query_key.view(), value_z_weight.view(), output, z_output, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " Q4/Q5 A16 T=" + std::to_string(tokens);
+    const std::string suffix = " " + std::string(pair_label) + " A16 T=" + std::to_string(tokens);
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
@@ -79,6 +80,19 @@ int run_q4_q5() {
     int failures = 0;
     for (const std::int32_t tokens : {1, 2, 16, 17}) {
         failures += run_q4_q5_case(query_key, value_z_weight, tokens);
+    }
+    return failures;
+}
+
+int run_q4_q4() {
+    constexpr std::int32_t kHidden = 5120;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 4096, kHidden, 421U));
+    DevicePackedWeight value_z_weight(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, 12288, kHidden, 427U));
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 8, 16, 17}) {
+        failures += run_q4_q5_case(query_key, value_z_weight, tokens, "Q4/Q4");
     }
     return failures;
 }
@@ -322,6 +336,7 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    failures += run_q4_q4();
     failures += run_w8();
     failures += run_nvfp4();
     failures += run_fp8();

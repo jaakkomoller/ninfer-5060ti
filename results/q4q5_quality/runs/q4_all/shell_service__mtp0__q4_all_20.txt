@@ -1,0 +1,104 @@
+```ini
+# /etc/systemd/system/myapp.service
+#
+# Systemd service unit file for myapp
+#
+# This service runs /usr/local/bin/myapp on port 8080 as the 'myapp' user,
+# restarts on failure with a 5-second delay, and starts after network-online.target.
+
+[Unit]
+# Description: Human-readable description of the service, shown in systemctl status
+Description=My Application Service
+
+# After: Specifies that this service should be started after network-online.target is reached.
+# This ensures the network is fully up before the application starts, which is important
+# for services that depend on network connectivity (e.g., binding to a port or making outbound connections).
+After=network-online.target
+
+# Wants: Creates a weak dependency on network-online.target, ensuring it is pulled in
+# if not already active. This is a best practice for network-dependent services.
+Wants=network-online.target
+
+[Service]
+# Type: Specifies the type of the service. 'simple' is the default and most common type,
+# where the service is considered started as soon as the main process is forked.
+Type=simple
+
+# User: Runs the service as the unprivileged user 'myapp' instead of root.
+# This follows the principle of least privilege for security.
+User=myapp
+
+# ExecStart: The command to execute when the service starts.
+# This runs the myapp binary with the --port 8080 argument.
+ExecStart=/usr/local/bin/myapp --port 8080
+
+# Restart: Specifies the condition under which the service should be restarted.
+# 'on-failure' means the service will be restarted if it exits with a non-zero exit code,
+# is killed by a signal, or fails to start.
+Restart=on-failure
+
+# RestartSec: The delay in seconds before restarting the service after a failure.
+# A 5-second delay prevents rapid restart loops if the service is crashing repeatedly.
+RestartSec=5
+
+# WorkingDirectory: Sets the working directory for the service process.
+# This is optional but good practice to ensure relative paths in the application work as expected.
+WorkingDirectory=/usr/local
+
+[Install]
+# WantedBy: Specifies the target that this service should be started by.
+# 'multi-user.target' is the standard target for normal system operation (non-graphical).
+WantedBy=multi-user.target
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.64 GiB     0.000 s
+load        weights                    100.00%     13.64 GiB /      13.64 GiB     6.392 s
+load        engine construction            9.034 s
+load        artifact/materialize           8.396 s
+load        host to device                 6.392 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.65 GiB
+summary     weight H2D                13.64 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.335 s
+generate    decode                        20.945 s
+generate    total                         21.281 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             74
+summary     reused prompt tokens      0
+summary     generated tokens          521
+summary     model elapsed             21.279 s
+summary     prefill speed             221.20 tok/s
+summary     decode speed              24.83 tok/s
+summary     throughput (overall)      24.48 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.64 GiB / 13.64 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        1.70 GiB
+summary     free after startup        1.62 GiB
+GPU memory:
+  total                   15.49 GiB
+  weights                 13.64 GiB
+  runtime fixed           73.53 MiB
+  workspace               10.79 MiB
+  CUDA graph allowance    12.00 MiB
+  selected KV capacity    1024 tokens (16 / 16 page groups)
+  selected context        1024
+summary     planned slack             1.61 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.73 GiB

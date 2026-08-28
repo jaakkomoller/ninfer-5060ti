@@ -1,0 +1,83 @@
+```python
+import csv
+
+
+def read_data(filename: str) -> list[dict[str, str]]:
+    """Read a CSV file and return a list of dictionaries."""
+    with open(filename, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        return list(reader)
+
+
+def compute_average_score(data: list[dict[str, str]]) -> float:
+    """Compute the average score from the data."""
+    if not data:
+        return 0.0
+    total = sum(float(row['score']) for row in data)
+    return total / len(data)
+
+
+def get_names_above_average(data: list[dict[str, str]], average: float) -> list[str]:
+    """Return names of entries whose score is above the average."""
+    return [row['name'] for row in data if float(row['score']) > average]
+
+
+def main():
+    data = read_data('data.csv')
+    if not data:
+        print("No data found.")
+        return
+    average = compute_average_score(data)
+    names = get_names_above_average(data, average)
+    for name in names:
+        print(name)
+
+
+if __name__ == '__main__':
+    main()
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.64 GiB     0.000 s
+load        weights                    100.00%     13.64 GiB /      13.64 GiB     7.356 s
+load        engine construction           10.206 s
+load        artifact/materialize           9.429 s
+load        host to device                 7.356 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.65 GiB
+summary     weight H2D                13.64 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.314 s
+generate    decode                        10.846 s
+generate    total                         11.161 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             71
+summary     reused prompt tokens      0
+summary     generated tokens          271
+summary     model elapsed             11.160 s
+summary     prefill speed             226.38 tok/s
+summary     decode speed              24.89 tok/s
+summary     throughput (overall)      24.28 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.64 GiB / 13.64 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        10.79 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        1.70 GiB
+summary     free after startup        1.62 GiB
+summary     KV capacity headroom      0 B
+summary     planned slack             1.61 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.73 GiB

@@ -180,6 +180,10 @@ add_library(ninfer_ops STATIC
   ops/linear_add/fp8/fp8_linear_add_small_t.cu
   ops/linear_add/fp8/fp8_linear_add_a8.cu
   ops/linear_add/fp8/fp8_linear_add_plan.cpp
+  ops/linear_add/q4/q4_linear_add_gemm_mma.cu
+  ops/linear_add/q4/q4_linear_add_gemm_simt.cu
+  ops/linear_add/q4/q4_linear_add_gemv.cu
+  ops/linear_add/q4/q4_linear_add_plan.cpp
   ops/linear_add/q5/q5_linear_add_gemm_mma.cu
   ops/linear_add/q5/q5_linear_add_gemm_simt.cu
   ops/linear_add/q5/q5_linear_add_gemv.cu

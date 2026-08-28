@@ -578,14 +578,18 @@ sequence's logical ceiling; the latter sizes the shared Main Text KV pool used b
 requests and retained prefixes. Both are represented with 64-token pages internally, while a
 sequence can never cross the exact `--max-context` frontier. `--kv-capacity N` requests an explicit
 capacity; `--kv-capacity auto` chooses the largest legal capacity that fits the memory remaining
-after weights are loaded while keeping 1 GiB of sizing headroom. When omitted it follows
+after weights are loaded while keeping a 32 MiB automatic safety margin (16 driver 2 MiB
+granularities) for measured post-plan driver growth — lazy CUDA module instantiations outside the
+captured set and allocator fragmentation. The margin is small because the reservation is exact:
+planned arenas are reserved at the driver's charged size and measured module code loads are covered
+by the CUDA Graph allowance. When omitted it follows
 `--max-context`, preserving one full-length request's capacity. The shared pool is fixed at startup
 and is not divided evenly among request lanes.
 
 Automatic sizing evaluates the complete target runtime layout for the chosen concurrency, KV
 dtype, speculative backend, draft window, Vision setting, workspace, and CUDA Graph allowance. It
 uses a direct page-capacity calculation rather than allocation probing. Startup reports the policy,
-resolved capacity, runtime reservation, free memory after weights, automatic headroom, planned
+resolved capacity, runtime reservation, free memory after weights, automatic safety margin, planned
 slack, actual free memory after complete startup, and observed Graph memory. An explicit capacity
 is never silently reduced, and neither policy permits request-time pool growth.
 

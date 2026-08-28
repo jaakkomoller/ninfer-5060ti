@@ -1,12 +1,17 @@
 """Persistent-object contract for the complete Qwen3.8-27B artifact.
 
 The graph and all non-vocabulary storage roles are identical to the registered
-Qwen3.6-27B groupwise artifact.  The embedding and full output head use the W8
-format already supported by the 27B runtime.
+Qwen3.6-27B groupwise artifact.  The embedding and full output head use the Q6
+and Q4 formats supported by the 27B runtime.
 
 The MTP transformer tensors are quantized with a smaller-than-upstream format
 mix for the RTX 5060 Ti 16 GB path; the upstream W8 representation is preserved
 on targets that do not need this compression.
+
+The five residual/gate text projection roles are stored as Q4G64_F16S instead
+of the upstream Q5G64_F16S for the RTX 5060 Ti 16 GB path; the ~1350 MiB of
+resident weight this frees raises the context ceiling from ~6K to ~83K tokens
+while keeping the INT4 KV and MTP3 decode paths.
 """
 
 from __future__ import annotations
@@ -65,8 +70,27 @@ def _rtx5060ti_mtp(spec: TensorSpec) -> TensorSpec:
     return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, target)
 
 
+# RTX 5060 Ti-specific text weight format mix. The Qwen3.6-27B inventory
+# declares the five residual/gate text projection roles as Q5G64_F16S; the
+# RTX 5060 Ti 16 GB path stores them as Q4G64_F16S. Each entry is selected to
+# match a Q4G64_F16S dispatch case in the runtime.
+_TEXT_Q4_SUFFIXES = (
+    "attention/gate_value",
+    "attention/output",
+    "gdn/value_z",
+    "gdn/output",
+    "mlp/down",
+)
+
+
+def _rtx5060ti_text_q4(spec: TensorSpec) -> TensorSpec:
+    if spec.name.startswith("text/layers/") and spec.name.endswith(_TEXT_Q4_SUFFIXES):
+        return qwen3_6_inventory.tensor_spec(spec.name, spec.shape, Q4)
+    return spec
+
+
 TEXT_CORE_TENSOR_SPECS = tuple(
-    _w8_vocabulary_endpoint(spec)
+    _rtx5060ti_text_q4(_w8_vocabulary_endpoint(spec))
     for spec in qwen3_6_inventory.TEXT_CORE_TENSOR_SPECS
 )
 DRAFT_HEAD_TENSOR_SPECS = qwen3_6_inventory.DRAFT_HEAD_TENSOR_SPECS

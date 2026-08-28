@@ -215,8 +215,8 @@ int main() {
     const ServeOptions automatic = parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto"});
     failures += check(automatic.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
                           automatic.kv_capacity.explicit_tokens == 0 &&
-                          automatic.kv_capacity.automatic_headroom_bytes ==
-                              ninfer::kDefaultKvCapacityHeadroomBytes,
+                          automatic.kv_capacity.automatic_safety_margin_bytes ==
+                              ninfer::kAutomaticKvSafetyMarginBytes,
                       "--kv-capacity auto did not select automatic sizing");
 
     const ServeOptions logged = parse({"ninfer-serve", "model.ninfer", "--request-log-jsonl",

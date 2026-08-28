@@ -1,0 +1,84 @@
+```python
+from typing import List
+
+
+def two_sum(nums: List[int], target: int) -> List[int]:
+    """
+    Given a list of integers and a target sum, return the indices of the two
+    numbers that add up to the target.
+
+    Uses a hash map to achieve O(n) time complexity.
+
+    Args:
+        nums: A list of integers.
+        target: The target sum to find.
+
+    Returns:
+        A list containing the two indices whose corresponding values sum to target.
+
+    Example:
+        >>> two_sum([2, 7, 11, 15], 9)
+        [0, 1]
+    """
+    seen: dict[int, int] = {}
+    for i, num in enumerate(nums):
+        complement = target - num
+        if complement in seen:
+            return [seen[complement], i]
+        seen[num] = i
+    # The problem guarantees exactly one solution, so this line is never reached.
+    return []
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.85 GiB     0.000 s
+load        weights                    100.00%     13.85 GiB /      13.85 GiB     6.404 s
+load        engine construction            9.396 s
+load        artifact/materialize           8.453 s
+load        host to device                 6.404 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.86 GiB
+summary     weight H2D                13.85 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         783 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.262 s
+generate    decode                         4.739 s
+generate    total                          5.002 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             66
+summary     reused prompt tokens      0
+summary     generated tokens          225
+summary     model elapsed             5.001 s
+summary     prefill speed             251.84 tok/s
+summary     decode speed              47.27 tok/s
+summary     throughput (overall)      44.99 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.85 GiB / 13.85 GiB
+summary     gpu sequence used         77.73 MiB / 77.73 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          35.19 MiB
+summary     gpu workspace peak        7.39 MiB / 10.79 MiB
+summary     runtime reservation       94.00 MiB
+summary     free after weights        1.49 GiB
+summary     free after startup        1.40 GiB
+summary     KV capacity headroom      0 B
+summary     planned slack             1.40 GiB
+summary     CUDA Graph memory         2.00 MiB / 4.00 MiB
+summary     planned device total      13.94 GiB
+summary     mtp draft window          3
+summary     mtp rounds                63
+summary     mtp fallback steps        0
+summary     mtp drafted tokens        189
+summary     mtp accepted tokens       161
+summary     mtp acceptance rate       85.19%
+summary     mtp acceptance length     3.56 tok/round
+summary     mtp accepted by pos       59,53,49

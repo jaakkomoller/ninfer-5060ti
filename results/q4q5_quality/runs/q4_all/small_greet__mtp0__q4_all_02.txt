@@ -1,0 +1,61 @@
+```typescript
+/**
+ * Generates a greeting message for the given name.
+ *
+ * @param name - The name to include in the greeting.
+ * @returns A string in the format 'Hello, {name}!'.
+ *
+ * @example
+ * ```ts
+ * greet('Alice'); // 'Hello, Alice!'
+ * ```
+ */
+function greet(name: string): string {
+  return `Hello, ${name}!`;
+}
+```
+
+[stderr]
+phase       detail                      elapsed/progress
+load        weights                      0.00%           0 B /      13.64 GiB     0.000 s
+load        weights                    100.00%     13.64 GiB /      13.64 GiB     5.813 s
+load        engine construction            8.794 s
+load        artifact/materialize           7.835 s
+load        host to device                 5.813 s
+summary     target                    qwen3_8_27b
+summary     weights                   groupwise-int
+summary     artifact file read        13.65 GiB
+summary     weight H2D                13.64 GiB
+summary     pinned staging peak       256.00 MiB
+summary     tensors/resources         771 / 6
+prepare     render/preprocess              0.000 s
+generate    vision                         0.000 s
+generate    text prefill                   0.228 s
+generate    decode                         3.970 s
+generate    total                          4.199 s
+summary     sampling                  greedy (temperature 0)
+summary     finish reason             stop-token
+summary     prompt tokens             47
+summary     reused prompt tokens      0
+summary     generated tokens          100
+summary     model elapsed             4.198 s
+summary     prefill speed             206.28 tok/s
+summary     decode speed              24.94 tok/s
+summary     throughput (overall)      23.82 tok/s
+summary     device                    0
+summary     max context               1024
+summary     KV capacity policy        explicit
+summary     KV capacity               1024
+summary     KV page groups            16 / 16
+summary     gpu weights used          13.64 GiB / 13.64 GiB
+summary     gpu sequence used         73.53 MiB / 73.53 MiB
+summary     kv cache dtype            int8-group64
+summary     kv cache payload          33.00 MiB
+summary     gpu workspace peak        4.89 MiB / 10.79 MiB
+summary     runtime reservation       98.00 MiB
+summary     free after weights        1.70 GiB
+summary     free after startup        1.62 GiB
+summary     KV capacity headroom      0 B
+summary     planned slack             1.61 GiB
+summary     CUDA Graph memory         2.00 MiB / 12.00 MiB
+summary     planned device total      13.73 GiB

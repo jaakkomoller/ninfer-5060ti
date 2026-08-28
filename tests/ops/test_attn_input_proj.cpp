@@ -99,6 +99,21 @@ int run_q4_q5() {
     return failures;
 }
 
+int run_q4_q4() {
+    constexpr std::int32_t kHidden = 5120;
+    constexpr std::int32_t kParent = 7168;
+    DevicePackedWeight query_key(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 111U));
+    DevicePackedWeight gate_value(
+        quantized_weight::make_patterned_weight(QType::Q4G64_F16S, kParent, kHidden, 113U));
+
+    int failures = 0;
+    for (const std::int32_t tokens : {1, 2, 3, 8, 16, 17, 21}) {
+        failures += run_q4_q5_case(query_key, gate_value, tokens);
+    }
+    return failures;
+}
+
 std::vector<double> bf16_attention_oracle(const HostWeight& weight,
                                           std::span<const float> activation) {
     std::vector<double> result(static_cast<std::size_t>(weight.n));
@@ -496,6 +511,7 @@ int main() {
 
     int failures = 0;
     failures += run_q4_q5();
+    failures += run_q4_q4();
     failures += run_bf16_target();
     failures += run_nvfp4_target();
     failures += run_fp8_target();
