@@ -430,6 +430,19 @@ int test_official_chat_template() {
                 "</IMPORTANT>\n\nbe exact<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n"),
         "tools system block differs from official tojson rendering");
 
+    // jinja's `|tojson` is htmlsafe + ensure_ascii: `<>&'` become \uXXXX and non-ASCII is
+    // ASCII-escaped. The tool block must reproduce that byte-for-byte.
+    fi::ChatRenderOptions tools_esc = no_generation;
+    tools_esc.tool_jsons.push_back(
+        R"({"type":"function","function":{"name":"edit_file","description":"Read <path> & write 'x' café","parameters":{"type":"object"}}})");
+    const std::string tools_esc_rendered =
+        render_chat_text({chat_message(ninfer::ChatRole::User, "hi")}, tools_esc);
+    failures += check(
+        tools_esc_rendered.find(
+            R"tool({"type": "function", "function": {"name": "edit_file", "description": "Read \u003cpath\u003e \u0026 write \u0027x\u0027 caf\u00e9", "parameters": {"type": "object"}}})tool") !=
+            std::string::npos,
+        "tool tojson does not match official htmlsafe/ensure_ascii escaping");
+
     failures += check(throws_invalid_argument([&] {
                           (void)render_chat({chat_message(ninfer::ChatRole::System, "only")},
                                             no_generation);

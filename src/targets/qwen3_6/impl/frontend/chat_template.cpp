@@ -168,19 +168,37 @@ std::string tojson_text(const OrderedJson& value) {
         std::size_t index    = 0;
         for (auto it = value.begin(); it != value.end(); ++it, ++index) {
             if (index != 0) { rendered += ", "; }
-            rendered += OrderedJson(it.key()).dump();
+            rendered += OrderedJson(it.key()).dump(-1, ' ', true);
             rendered += ": ";
             rendered += tojson_text(it.value());
         }
         rendered += "}";
         return rendered;
     }
-    return value.dump();
+    return value.dump(-1, ' ', true);
+}
+
+// Mirror jinja2's `|tojson` (htmlsafe_json_dumps on top of ensure_ascii JSON): the
+// serialization escapes non-ASCII as \uXXXX (handled by dump(..., ensure_ascii=true))
+// and additionally escapes the four HTML-sensitive characters so the tool block is
+// byte-identical to the official template's rendering.
+std::string htmlsafe_json_escape(std::string text) {
+    const std::pair<char, std::string_view> escapes[] = {
+        {'&', "\\u0026"}, {'<', "\\u003c"}, {'>', "\\u003e"}, {'\'', "\\u0027"}};
+    for (const auto& [from, to] : escapes) {
+        std::string out;
+        out.reserve(text.size());
+        for (char c : text) {
+            if (c == from) { out += to; } else { out += c; }
+        }
+        text = std::move(out);
+    }
+    return text;
 }
 
 std::string parameter_text(const OrderedJson& value) {
     if (value.is_string()) { return value.get<std::string>(); }
-    return tojson_text(value);
+    return htmlsafe_json_escape(tojson_text(value));
 }
 
 std::string render_tool_call(const ToolCall& call, bool allow_empty_arguments) {
@@ -219,7 +237,7 @@ std::string render_tools_system_block(const std::vector<std::string>& tool_jsons
     rendered += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     for (const std::string& tool : tool_jsons) {
         rendered += "\n";
-        rendered += tojson_text(OrderedJson::parse(tool));
+        rendered += htmlsafe_json_escape(tojson_text(OrderedJson::parse(tool)));
     }
     rendered += "\n</tools>";
     rendered += std::string(kToolInstructions);
